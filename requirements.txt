@@ -1,2 +1,6 @@
 gymnasium==1.2.1
 matplotlib==3.10.6
+numpy==1.26.4
+torchdata==0.7.1
+PyYAML==6.0.3
+pydantic==2.11.9
