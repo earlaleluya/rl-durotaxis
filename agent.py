@@ -24,7 +24,128 @@ class Topology:
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
         
-    
+
+
+
+    def act(self):
+        """This method still simulates the sample actions to be taken, which based on random choice of either spawn or delete."""
+        all_nodes = self.get_all_nodes()
+        sample_actions = {node_id: random.choice(['spawn', 'delete']) for node_id in all_nodes}
+        
+        # Separate actions into spawn and delete
+        spawn_actions = {node_id: action for node_id, action in sample_actions.items() if action == 'spawn'}
+        delete_actions = {node_id: action for node_id, action in sample_actions.items() if action == 'delete'}
+        # Process spawns first (no index shifting issues)
+        for node_id in spawn_actions:
+            '''gamma, alpha, noise, theta are learnable parameters.'''
+            self.spawn(node_id, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0)
+        # Process deletions in REVERSE ORDER (highest index first)
+        # This prevents index shifting from affecting subsequent deletions
+        delete_node_ids = sorted(delete_actions.keys(), reverse=True)
+        for node_id in delete_node_ids:
+            self.delete(node_id)
+        return sample_actions 
+
+
+
+
+    def get_all_nodes(self):
+        """Return a list of all node IDs in the graph."""
+        return self.graph.nodes().tolist()
+
+
+
+    def spawn(self, curr_node_id, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0):
+        """
+        Spawns a new node from curr_node_id in the direction theta, at a distance determined by the Hill equation.
+        Adds the new node to the graph and connects curr_node_id to the new node.
+        """
+        r = self._hill_equation(curr_node_id, gamma, alpha, noise)
+        # Get current node position
+        curr_pos = self.graph.ndata['pos'][curr_node_id].numpy()
+        # Compute new node position
+        x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
+        new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
+        # Store current positions before adding node
+        current_positions = self.graph.ndata['pos']
+        # Add new node to graph
+        self.graph.add_nodes(1)
+        # Update position data by concatenating the new coordinate
+        updated_positions = torch.cat([current_positions, new_node_coord.unsqueeze(0)], dim=0)
+        self.graph.ndata['pos'] = updated_positions
+        # Get the NEW node ID (after adding the node)
+        new_node_id = self.graph.num_nodes() - 1  
+        # Add edge from curr_node_id to new_node_id
+        self.graph.add_edges(curr_node_id, new_node_id)
+        return new_node_id
+
+
+
+    def _hill_equation(self, node_id, gamma, alpha, noise):
+        """
+        Calculates the Hill equation value for a given node in the graph.
+
+        The Hill equation models the response of a system to a stimulus, commonly used in biochemistry
+        to describe ligand binding. In this context, it computes a value based on the node's position,
+        substrate intensity, and provided parameters.
+
+        Args:
+            node_id (int): The identifier of the node in the graph.
+            gamma (float): The maximum response or scaling factor.
+            alpha (float): The affinity constant or threshold parameter.
+            noise (float): An additive noise term to introduce stochasticity.
+
+        Returns:
+            float: The computed Hill equation value for the specified node.
+        """
+        node_pos = self.graph.ndata['pos'][node_id].numpy()
+        node_intensity = self.substrate.get_intensity(node_pos)
+        return gamma * (1 / (1 + (alpha / node_intensity)**2)) + noise
+
+
+
+    def delete(self, curr_node_id):
+        """
+        Deletes a node from the graph and reconnects its predecessors to its successors.
+
+        Args:
+            curr_node_id (int): The ID of the node to be deleted.
+
+        Process:
+            - Finds all predecessor and successor nodes of the specified node.
+            - Removes the node from the graph.
+            - Adjusts the indices of remaining nodes to account for the removal.
+            - Connects each predecessor to each successor to maintain graph connectivity.
+
+        Note:
+            After node removal, indices of nodes greater than curr_node_id are decremented by 1.
+        """
+        # Find predecessors and successors of the current node
+        predecessors = self.graph.predecessors(curr_node_id).tolist()
+        successors = self.graph.successors(curr_node_id).tolist()
+        # Remove the current node
+        self.graph = dgl.remove_nodes(self.graph, curr_node_id)
+        # After removal, node indices shift down for nodes after curr_node_id
+        # Adjust indices for successors and predecessors
+        def adjust_idx(idx):
+            return idx if idx < curr_node_id else idx - 1
+        adjusted_predecessors = [adjust_idx(p) for p in predecessors]
+        adjusted_successors = [adjust_idx(s) for s in successors]
+        # Connect each predecessor to each successor
+        for p in adjusted_predecessors:
+            for s in adjusted_successors:
+                self.graph.add_edges(p, s)
+
+
+
+
+    def try_show(self, g):
+        G = g.to_networkx()
+        nx.draw(G, pos=g.ndata['pos'], with_labels=True, node_color='lightgreen', node_size=500, font_size=16)
+        plt.show()
+
+
+
     def compute_centroid(self):
         """Compute the centroid (center of mass) of all nodes"""
         centroid = torch.mean(self.graph.ndata['pos'], dim=0)
@@ -88,8 +209,8 @@ class Topology:
         y_max = self.substrate.height
         # Randomize coordinates
         coordinates = torch.stack([
-            torch.rand(init_num_nodes) * x_max,      # x-coordinates
-            torch.rand(init_num_nodes) * y_max       # y-coordinates
+            torch.rand(init_num_nodes, dtype=torch.float32) * x_max,  # x-coordinates
+            torch.rand(init_num_nodes, dtype=torch.float32) * y_max   # y-coordinates
         ], dim=1)
         # Sort nodes by x-coordinate
         x_coords = coordinates[:, 0]
@@ -203,6 +324,14 @@ if __name__ == '__main__':
    
     agent = Topology(substrate=substrate_linear)      
 
-    for i in range(1,10):
-        agent.reset(init_num_nodes=i*10, init_bin=0.05*i)
+
+
+    agent.reset(init_num_nodes=100, init_bin=0.1)
+    for i in range(1,20):
         agent.show(highlight_outmost=True)
+        agent.act()
+
+
+    # Keep the last figure window open
+    plt.ioff()  # Turn off interactive mode
+    plt.show()  # Blocking show to keep window open
