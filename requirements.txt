@@ -4,3 +4,4 @@ numpy==1.26.4
 torchdata==0.7.1
 PyYAML==6.0.3
 pydantic==2.11.9
+torch_geometric==2.6.1
