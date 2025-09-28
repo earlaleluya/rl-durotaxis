@@ -21,17 +21,15 @@ class Substrate:
 
 
     def create(self, kind, m=0.05, b=1.0):
-        """
-        Creates a new signal matrix based on the specified kind (linear or exponential).
-        """
-        x_coords = np.arange(self.width)
+        """Creates a new signal matrix based on the specified kind (linear or exponential)."""
+        x_coords = np.arange(self.width) 
         if kind == 'linear':
             self.signal_matrix = self._create_linear(x_coords, m, b)
         elif kind == 'exponential':
             self.signal_matrix = self._create_exponential(x_coords, m, b)
         else:
             raise ValueError("Invalid substrate kind. Choose 'linear' or 'exponential'.")
-
+   
 
     def _create_linear(self, x_coords, m, b):
         """Vectorized creation of a linear gradient."""
@@ -43,6 +41,14 @@ class Substrate:
         """Vectorized creation of an exponential gradient."""
         gradient = b * np.exp(m * x_coords)
         return np.tile(gradient, (self.height, 1))
+    
+
+    def get_intensity(self, pos):
+        """Returns the intensity value at the specified position in the signal matrix."""
+        x, y = pos
+        x, y = int(x), int(y)
+        return self.signal_matrix[y][x]
+
 
     def show(self):
         """Display the signal matrix as a heatmap."""
