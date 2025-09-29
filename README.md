@@ -44,7 +44,7 @@ pip install  dgl -f https://data.dgl.ai/wheels/cu121/repo.html
 ```bash
 pip install -r requirements.txt
 ```
-
+Note: Installing in CPU might cause compilation warning, consider using WSL.
 
 
 # Action space
