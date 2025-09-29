@@ -1,8 +1,7 @@
 import torch
 import torch.nn.functional as F
-import dgl # Import DGL
+import dgl 
 from scipy.spatial import ConvexHull
-import numpy as np
 
 
 class GraphEmbedding:
@@ -87,6 +86,7 @@ class GraphEmbedding:
         }
         
         return state
+
 
     def _get_node_features(self, include_substrate=True):
         """
