@@ -14,8 +14,13 @@ conda create -n durotaxis python=3.12
 conda activate durotaxis
 ```
 
-### Install PyTorch with CUDA
-The supported deep learning frameworks of DGL are:
+### Install PyTorch 
+If you wish to use CPU for PyTorch, use the command:
+```bash
+pip install torch=2.2.1
+```
+
+If your computer has NVIDIA CUDA support, the supported deep learning frameworks of DGL are:
 * CUDA 11.8 and 12.1 (Make sure to install first the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local).)
 * [PyTorch](https://pytorch.org/get-started/locally/) 2.1.0+
 ```bash
