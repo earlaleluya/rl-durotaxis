@@ -317,6 +317,7 @@ class Topology:
 
 
 
+
 if __name__ == '__main__':
     
     substrate_linear = Substrate((600, 400))
