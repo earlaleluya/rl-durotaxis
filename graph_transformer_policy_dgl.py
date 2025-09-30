@@ -354,7 +354,7 @@ class TopologyPolicyAgent:
 
 
 if __name__ == '__main__':
-    from agent import Topology
+    from topology import Topology
     from substrate import Substrate
     from embedding_dgl import GraphEmbedding
     

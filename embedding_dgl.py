@@ -358,7 +358,7 @@ class GraphEmbedding:
 
 
 if __name__ == '__main__':
-    from agent import Topology
+    from topology import Topology
     from substrate import Substrate
     
     # Create substrate and topology
