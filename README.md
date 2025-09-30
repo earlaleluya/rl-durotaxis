@@ -50,8 +50,7 @@ There might be some issues with library compatability. If you are using Windows,
 ```bash
 conda create -n durotaxis python=3.12.11
 conda activate durotaxis
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-pip install dgl -f https://data.dgl.ai/wheels/cu121/repo.html
+pip install torch==2.4.0 stable-baselines3 dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
 pip install -r requirements.txt
 ```
 
