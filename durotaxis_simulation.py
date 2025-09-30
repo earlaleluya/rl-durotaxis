@@ -9,6 +9,7 @@ from topology import Topology
 from substrate import Substrate
 from embedding_dgl import GraphEmbedding
 from graph_transformer_policy_dgl import GraphTransformerEncoder, GraphPolicyNetwork, TopologyPolicyAgent
+from observation_strategies import get_observation_strategy_6_lightweight
 
 
 class DurotaxisEnv(gym.Env):
@@ -26,7 +27,8 @@ class DurotaxisEnv(gym.Env):
                  max_nodes=50,
                  max_steps=1000,
                  embedding_dim=64,
-                 render_mode=None):
+                 render_mode=None,
+                 policy_agent=None):
         super().__init__()
         
         # Environment parameters
@@ -61,6 +63,30 @@ class DurotaxisEnv(gym.Env):
         # 4. Rendering
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
+        
+        # Create policy network for enhanced observations
+        if policy_agent is not None:
+            self.observation_policy = policy_agent.policy
+        else:
+            # Create a separate encoder just for observations
+            node_dim = embedding_dim  # From your embedding
+            graph_dim = embedding_dim  # From your embedding
+            encoder = GraphTransformerEncoder(
+                node_dim=node_dim,
+                graph_dim=graph_dim, 
+                hidden_dim=128,
+                num_layers=2
+            )
+            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=128)
+
+        # Update observation space for Strategy 6
+        obs_dim = 128 * 5  # hidden_dim * 5 (graph + mean + std + min + max)
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf, 
+            shape=(obs_dim,),
+            dtype=np.float32
+        )
 
     def _setup_environment(self):
         """Initialize substrate, topology, embedding, and policy components."""
@@ -134,7 +160,13 @@ class DurotaxisEnv(gym.Env):
         
         # Get new state
         new_state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
-        observation = new_state['graph_embedding'].numpy().astype(np.float32)
+        
+        # Strategy 6: Enhanced observation using policy network
+        observation = get_observation_strategy_6_lightweight(
+            new_state, 
+            self.observation_policy, 
+            device='cpu'
+        )
         
         # Calculate reward
         reward = self._calculate_reward(prev_state, new_state, executed_actions)
