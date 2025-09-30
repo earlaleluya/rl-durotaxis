@@ -44,8 +44,16 @@ pip install  dgl -f https://data.dgl.ai/wheels/cu121/repo.html
 ```bash
 pip install -r requirements.txt
 ```
-Note: Installing in CPU might cause compilation warning, consider using WSL.
 
+### Installation in WSL
+There might be some issues with library compatability. If you are using Windows, I suggest that you create environment in WSL.
+```bash
+conda create -n durotaxis python=3.12.11
+conda activate durotaxis
+pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+pip install dgl -f https://data.dgl.ai/wheels/cu121/repo.html
+pip install -r requirements.txt
+```
 
 # Action space
 Investigate if we can use "topology".
