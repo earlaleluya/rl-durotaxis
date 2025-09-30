@@ -27,6 +27,7 @@ class DurotaxisEnv(gym.Env):
                  max_nodes=50,
                  max_steps=1000,
                  embedding_dim=64,
+                 hidden_dim=128,  
                  render_mode=None,
                  policy_agent=None):
         super().__init__()
@@ -39,6 +40,7 @@ class DurotaxisEnv(gym.Env):
         self.max_nodes = max_nodes
         self.max_steps = max_steps
         self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim 
         self.current_step = 0
         
         # 1. Action Space
@@ -74,13 +76,13 @@ class DurotaxisEnv(gym.Env):
             encoder = GraphTransformerEncoder(
                 node_dim=node_dim,
                 graph_dim=graph_dim, 
-                hidden_dim=128,
+                hidden_dim=self.hidden_dim,  # Use instance variable
                 num_layers=2
             )
-            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=128)
+            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim)  # Use instance variable
 
         # Update observation space for Strategy 6
-        obs_dim = 128 * 5  # hidden_dim * 5 (graph + mean + std + min + max)
+        obs_dim = self.hidden_dim * 5  # hidden_dim * 5 (graph + mean + std + min + max)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf, 
@@ -119,13 +121,13 @@ class DurotaxisEnv(gym.Env):
         encoder = GraphTransformerEncoder(
             node_dim=node_dim,
             graph_dim=graph_dim,
-            hidden_dim=128,
+            hidden_dim=self.hidden_dim,
             num_layers=2,
             num_heads=4,
             dropout=0.1
         )
         
-        policy = GraphPolicyNetwork(encoder, hidden_dim=128, noise_scale=0.1)
+        policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim, noise_scale=0.1)
         
         # Create policy agent
         self.policy_agent = TopologyPolicyAgent(self.topology, self.embedding, policy)
@@ -141,9 +143,10 @@ class DurotaxisEnv(gym.Env):
         # Store previous state for reward calculation
         prev_state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
         prev_num_nodes = prev_state['num_nodes']
-        prev_num_edges = prev_state['num_edges']
         
-        # TODO to add sigma for the exploration-exploitation strategy, use `deterministic` for the logic changes
+        # Get previous DGL graph 
+        prev_dgl = self.embedding.to_dgl(embedding_dim=self.embedding_dim)
+        
         # Execute actions using the policy network
         if self.policy_agent is not None and prev_num_nodes > 0:
             try:
@@ -161,6 +164,9 @@ class DurotaxisEnv(gym.Env):
         # Get new state
         new_state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
         
+        # Get next DGL graph
+        next_dgl = self.embedding.to_dgl(embedding_dim=self.embedding_dim)
+        
         # Strategy 6: Enhanced observation using policy network
         observation = get_observation_strategy_6_lightweight(
             new_state, 
@@ -168,8 +174,8 @@ class DurotaxisEnv(gym.Env):
             device='cpu'
         )
         
-        # Calculate reward
-        reward = self._calculate_reward(prev_state, new_state, executed_actions)
+        # Calculate reward with DGL graphs
+        reward = self._calculate_reward(prev_state, new_state, executed_actions, prev_dgl, next_dgl)
         
         # Check termination conditions
         terminated = self._check_terminated(new_state)
@@ -186,19 +192,56 @@ class DurotaxisEnv(gym.Env):
         
         return observation, reward, terminated, truncated, info
 
-    def _calculate_reward(self, prev_state, new_state, actions):
+    def _calculate_reward(self, prev_state, new_state, actions, prev_dgl=None, next_dgl=None):
         """
         Calculate reward based on topology evolution and substrate exploration.
+        Now includes DGL graph analysis for more sophisticated reward calculation.
         """
         reward = 0.0
         
         # Basic survival reward
         reward += 0.1
         
-        # Reward for maintaining connectivity
-        if new_state['num_nodes'] > 1:
-            density = new_state['num_edges'] / (new_state['num_nodes'] * (new_state['num_nodes'] - 1))
-            reward += density * 2.0
+        # DGL-based reward calculations
+        if prev_dgl is not None and next_dgl is not None:
+            # Example: Calculate graph-based metrics using DGL
+            import dgl
+            
+            # Connectivity analysis
+            if next_dgl.num_nodes() > 1:
+                # Graph density
+                density = next_dgl.num_edges() / (next_dgl.num_nodes() * (next_dgl.num_nodes() - 1))
+                reward += density * 2.0
+                
+                # Clustering coefficient (if available)
+                try:
+                    # You can add more sophisticated graph metrics here
+                    # Example: average clustering coefficient, betweenness centrality, etc.
+                    pass
+                except:
+                    pass
+            
+            # Structural changes reward
+            if prev_dgl.num_nodes() > 0:
+                # Reward for growth
+                node_growth = next_dgl.num_nodes() - prev_dgl.num_nodes()
+                edge_growth = next_dgl.num_edges() - prev_dgl.num_edges()
+                
+                # Moderate growth is good
+                if 0 <= node_growth <= 2:
+                    reward += node_growth * 0.5
+                elif node_growth > 2:
+                    reward -= (node_growth - 2) * 0.3  # Penalty for too rapid growth
+                
+                if edge_growth > 0:
+                    reward += edge_growth * 0.2
+        
+        # Fallback to original reward if DGL graphs not available
+        else:
+            # Reward for maintaining connectivity
+            if new_state['num_nodes'] > 1:
+                density = new_state['num_edges'] / (new_state['num_nodes'] * (new_state['num_nodes'] - 1))
+                reward += density * 2.0
         
         # Reward for substrate exploration (using graph features)
         graph_features = new_state['graph_features']
@@ -309,6 +352,7 @@ if __name__ == '__main__':
         max_nodes=30,
         max_steps=100,
         embedding_dim=64,
+        hidden_dim=128,
         render_mode="human"
     )
     
@@ -372,6 +416,7 @@ if __name__ == '__main__':
         init_num_nodes=8,
         max_steps=50,
         embedding_dim=128,
+        hidden_dim=128,
         render_mode="human"
     )
     

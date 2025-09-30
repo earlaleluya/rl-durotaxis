@@ -5,6 +5,7 @@ Each strategy has different implications for learning and performance.
 
 import numpy as np
 import torch
+import dgl
 
 def get_observation_strategy_1_graph_only(new_state):
     """
