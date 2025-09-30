@@ -286,29 +286,6 @@ class GraphPolicyNetwork(nn.Module):
             
         return params[0].item(), params[1].item(), params[2].item(), params[3].item()
 
-    # TODO verify if to delete
-    # @staticmethod
-    # def compute_new_node_position(
-    #     parent_pos: torch.Tensor,
-    #     gamma: torch.Tensor,
-    #     alpha: torch.Tensor,
-    #     noise: torch.Tensor,
-    #     theta: torch.Tensor,
-    #     distance_scale: float = 1.0,
-    # ) -> torch.Tensor:
-    #     magnitude = distance_scale * (gamma * alpha + noise) # TODO use agent.hill_equation
-    #     dx = magnitude * torch.cos(theta)
-    #     dy = magnitude * torch.sin(theta)
-
-    #     if parent_pos.shape[-1] == 2:
-    #         offset = torch.stack([dx, dy], dim=-1)
-    #         return parent_pos + offset
-    #     elif parent_pos.shape[-1] == 3:
-    #         dz = torch.zeros_like(dx)
-    #         offset = torch.stack([dx, dy, dz], dim=-1)
-    #         return parent_pos + offset
-    #     else:
-    #         raise ValueError("parent_pos must have last dim 2 or 3.")
 
 
 class TopologyPolicyAgent:
