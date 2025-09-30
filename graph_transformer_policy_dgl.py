@@ -15,14 +15,22 @@ class GraphTransformerEncoder(nn.Module):
 
     def __init__(
         self,
-        in_dim: int,
+        node_dim: int,
+        graph_dim: int,
         hidden_dim: int = 128,
         num_layers: int = 3,
         num_heads: int = 4,
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.input_lin = nn.Linear(in_dim, hidden_dim)
+        
+        # Node feature processing
+        self.node_input_lin = nn.Linear(node_dim, hidden_dim)
+        
+        # Graph feature processing
+        self.graph_input_lin = nn.Linear(graph_dim, hidden_dim)
+        
+        # GAT layers
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
 
@@ -34,47 +42,74 @@ class GraphTransformerEncoder(nn.Module):
                 feat_drop=dropout,
                 attn_drop=dropout,
                 residual=True,
-                activation=None,  # add ReLU after LN
-                allow_zero_in_degree=True,  # Fix: Allow nodes with 0 in-degree
+                activation=None,
+                allow_zero_in_degree=True,
             )
             self.layers.append(conv)
             self.norms.append(nn.LayerNorm(hidden_dim))
 
         self.dropout = nn.Dropout(dropout)
+        
+        # Graph-level fusion
+        self.graph_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # Concat pooled nodes + graph features
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
 
-    def forward(self, g: dgl.DGLGraph, node_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, g: dgl.DGLGraph, node_feats: torch.Tensor, graph_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            g: DGLGraph
-            node_feats: [num_nodes, in_dim]
+            g: DGLGraph (can be None if using pre-computed embeddings)
+            node_feats: [num_nodes, node_dim]
+            graph_feats: [graph_dim]
 
         Returns:
-            graph_emb: [batch_size, hidden_dim]
-            node_emb: [num_nodes, hidden_dim]
+            graph_emb: [hidden_dim] - Enhanced with both node pooling and graph features
+            node_emb: [num_nodes, hidden_dim] - Context-aware node embeddings
         """
         # Handle empty graphs
         if node_feats.shape[0] == 0:
-            return torch.zeros(1, self.input_lin.out_features), torch.empty(0, self.input_lin.out_features)
+            empty_graph_emb = self.graph_input_lin(graph_feats).squeeze(0)
+            return empty_graph_emb, torch.empty(0, self.node_input_lin.out_features)
         
-        # Add self-loops to handle isolated nodes (alternative fix)
-        g = dgl.add_self_loop(g)
+        # Process node features
+        h = self.node_input_lin(node_feats)
         
-        h = self.input_lin(node_feats)
-        for conv, ln in zip(self.layers, self.norms):
-            h_new = conv(g, h).flatten(1)  # concat heads
-            h = ln(h + self.dropout(h_new))
-            h = F.relu(h)
+        # Process graph features
+        graph_h = self.graph_input_lin(graph_feats.unsqueeze(0))  # [1, hidden_dim]
+        
+        # If we have a graph structure, apply GAT layers
+        if g is not None and g.num_edges() > 0:
+            # Add self-loops to handle isolated nodes
+            g = dgl.add_self_loop(g)
+            
+            # Apply GAT layers
+            for conv, ln in zip(self.layers, self.norms):
+                h_new = conv(g, h).flatten(1)  # concat heads
+                h = ln(h + self.dropout(h_new))
+                h = F.relu(h)
+        else:
+            # No graph structure - just apply MLPs to node features
+            for i, (conv, ln) in enumerate(zip(self.layers, self.norms)):
+                # Skip GAT and just apply normalization and activation
+                h_new = h  # No graph convolution
+                h = ln(h + self.dropout(h_new))
+                h = F.relu(h)
 
-        with g.local_scope():
-            g.ndata["h"] = h
-            graph_emb = dgl.mean_nodes(g, "h")  # [batch_size, hidden_dim]
+        # Create graph embedding by combining pooled nodes + graph features
+        pooled_nodes = torch.mean(h, dim=0, keepdim=True)  # [1, hidden_dim]
+        
+        # Fuse pooled node features with graph-level features
+        combined = torch.cat([pooled_nodes, graph_h], dim=-1)  # [1, hidden_dim * 2]
+        graph_emb = self.graph_fusion(combined).squeeze(0)  # [hidden_dim]
 
         return graph_emb, h
 
 
 class GraphPolicyNetwork(nn.Module):
     """
-    Policy network on top of GraphTransformerEncoder (DGL).
+    Policy network on top of GraphTransformerEncoder (DGL) that uses full embedding state (graph-level and)
     Per node, outputs:
       - spawn/delete logits (matching topology actions)
       - spawn params: gamma, alpha, noise, theta (matching topology.spawn parameters)
@@ -85,29 +120,29 @@ class GraphPolicyNetwork(nn.Module):
         self.encoder = encoder
         self.noise_scale = noise_scale
 
+        # Node-level MLP (enhanced with graph context)
         self.node_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),  # Node features + graph context
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
 
-        # Action heads: spawn vs delete (matching topology.act() format)
+        # Action heads
         self.action_head = nn.Linear(hidden_dim, 2)  # [spawn_logit, delete_logit]
         
-        # Spawn parameter heads (matching topology.spawn signature)
-        self.gamma_head = nn.Linear(hidden_dim, 1)   # gamma parameter
-        self.alpha_head = nn.Linear(hidden_dim, 1)   # alpha parameter  
-        self.noise_head = nn.Linear(hidden_dim, 1)   # noise parameter
-        self.theta_head = nn.Linear(hidden_dim, 1)   # theta (direction) parameter
+        # Spawn parameter heads
+        self.gamma_head = nn.Linear(hidden_dim, 1)
+        self.alpha_head = nn.Linear(hidden_dim, 1)
+        self.noise_head = nn.Linear(hidden_dim, 1)
+        self.theta_head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, g: dgl.DGLGraph, node_feats: torch.Tensor, deterministic: bool = False, max_gamma: float = 5.0, max_alpha: float = 2.0, max_noise: float = 1.0) -> Dict[str, torch.Tensor]:
+    def forward(self, state_dict: Dict[str, torch.Tensor], deterministic: bool = False, max_gamma: float = 5.0, max_alpha: float = 2.0, max_noise: float = 1.0) -> Dict[str, torch.Tensor]:
         """
-        Forward pass returning action probabilities and spawn parameters.
+        Forward pass using full embedding state.
         
         Args:
-            g: DGL graph from topology
-            node_feats: Node features from embedding
+            state_dict: Full state from embedding.get_state_embedding()
             deterministic: Whether to sample or use deterministic actions
             max_gamma: Upper bound for gamma parameter
             max_alpha: Upper bound for alpha parameter
@@ -116,7 +151,23 @@ class GraphPolicyNetwork(nn.Module):
         Returns:
             Dictionary with action logits, probabilities, and spawn parameters
         """
-        graph_emb, node_emb = self.encoder(g, node_feats)
+        # Extract components from state
+        node_embeddings = state_dict['node_embeddings']
+        graph_embedding = state_dict['graph_embedding']
+        edge_index = state_dict['edge_index']
+        
+        # Create DGL graph from edge index if edges exist
+        g = None
+        if isinstance(edge_index, torch.Tensor) and edge_index.shape[1] > 0:
+            src, dst = edge_index[0], edge_index[1]
+            g = dgl.graph((src, dst), num_nodes=node_embeddings.shape[0])
+        
+        # Get enhanced embeddings from encoder
+        graph_emb, node_emb = self.encoder(
+            g=g,
+            node_feats=node_embeddings,
+            graph_feats=graph_embedding
+        )
         
         # Handle empty graphs
         if node_emb.shape[0] == 0:
@@ -132,7 +183,12 @@ class GraphPolicyNetwork(nn.Module):
                 "theta": torch.empty(0),
             }
         
-        h = self.node_mlp(node_emb)
+        # Broadcast graph embedding to all nodes for context
+        graph_context = graph_emb.unsqueeze(0).repeat(node_emb.shape[0], 1)
+        
+        # Combine node embeddings with graph context
+        combined_features = torch.cat([node_emb, graph_context], dim=-1)
+        h = self.node_mlp(combined_features)
 
         # Action logits: [num_nodes, 2] where [:, 0] = spawn, [:, 1] = delete
         action_logits = self.action_head(h)
@@ -176,9 +232,9 @@ class GraphPolicyNetwork(nn.Module):
         spawn_params_sample = spawn_params_mean + spawn_params_noise
         
         # Clamp to valid ranges
-        spawn_params_sample[..., 0] = torch.clamp(spawn_params_sample[..., 0], 0.1, 10.0)  # gamma
-        spawn_params_sample[..., 1] = torch.clamp(spawn_params_sample[..., 1], 0.1, 5.0)   # alpha
-        spawn_params_sample[..., 2] = torch.clamp(spawn_params_sample[..., 2], 0.0, 2.0)   # noise
+        spawn_params_sample[..., 0] = torch.clamp(spawn_params_sample[..., 0], 0.1, max_gamma * 2)  # gamma
+        spawn_params_sample[..., 1] = torch.clamp(spawn_params_sample[..., 1], 0.1, max_alpha * 2)   # alpha
+        spawn_params_sample[..., 2] = torch.clamp(spawn_params_sample[..., 2], 0.0, max_noise * 2)   # noise
         spawn_params_sample[..., 3] = torch.clamp(spawn_params_sample[..., 3], -math.pi, math.pi)  # theta
         
         out["spawn_params_sample"] = spawn_params_sample
@@ -257,7 +313,7 @@ class GraphPolicyNetwork(nn.Module):
 
 class TopologyPolicyAgent:
     """
-    Agent that combines our topology with the graph transformer policy.
+    Agent that combines our topology with the graph transformer policy. Also, it uses full embedding state.
     """
     
     def __init__(self, topology, embedding, policy_network):
@@ -272,21 +328,21 @@ class TopologyPolicyAgent:
         Returns:
             Tuple of (actions_dict, spawn_params_dict)
         """
-        # Get current state embedding
-        dgl_graph = self.embedding.to_dgl(embedding_dim=embedding_dim)
+        # Get FULL state embedding (not just DGL graph)
+        state = self.embedding.get_state_embedding(embedding_dim=embedding_dim)
         
-        if dgl_graph.num_nodes() == 0:
+        if state['num_nodes'] == 0:
             return {}, {}
         
-        # Forward pass through policy
-        policy_output = self.policy(dgl_graph, dgl_graph.ndata['x'], deterministic=deterministic)
+        # Forward pass through policy using full state
+        policy_output = self.policy(state, deterministic=deterministic)
         
         # Convert to topology actions
         actions = self.policy.get_topology_actions(policy_output, deterministic)
         
         # Get spawn parameters for each node
         spawn_params = {}
-        for node_id in range(dgl_graph.num_nodes()):
+        for node_id in range(state['num_nodes']):
             spawn_params[node_id] = self.policy.get_spawn_parameters(policy_output, node_id, deterministic)
             
         return actions, spawn_params
@@ -339,52 +395,95 @@ if __name__ == '__main__':
     
     print(f"Initial topology: {topology.graph.num_nodes()} nodes, {topology.graph.num_edges()} edges")
     
-    # Get the DGL graph with embeddings 
-    dgl_graph = embedding.to_dgl(embedding_dim=64)
-    node_features = dgl_graph.ndata['x']  
+    # Get FULL embedding state (not just DGL graph)
+    state = embedding.get_state_embedding(embedding_dim=64)
     
-    print(f"DGL graph from embedding: {dgl_graph.num_nodes()} nodes, {dgl_graph.num_edges()} edges")
-    print(f"Node features shape from embedding: {node_features.shape}")
+    print(f"Full embedding state:")
+    print(f"  Node embeddings shape: {state['node_embeddings'].shape}")
+    print(f"  Graph embedding shape: {state['graph_embedding'].shape}")
+    print(f"  Node features shape: {state['node_features'].shape}")
+    print(f"  Graph features shape: {state['graph_features'].shape}")
     
+    # Safe edge handling
+    edge_index = state['edge_index']
+    if isinstance(edge_index, torch.Tensor):
+        print(f"  Edge index shape: {edge_index.shape}")
+    else:
+        print(f"  Edge index type: {type(edge_index)} (likely empty graph)")
     
-    # Create policy network (using the correct input dimension from embedding)
-    feature_dim = node_features.shape[1] if node_features.shape[0] > 0 else 64
-    encoder = GraphTransformerEncoder(in_dim=feature_dim, hidden_dim=128, num_layers=2)
+    edge_attr = state['edge_attr']
+    if isinstance(edge_attr, torch.Tensor):
+        print(f"  Edge attributes shape: {edge_attr.shape}")
+    else:
+        print(f"  Edge attributes type: {type(edge_attr)} (likely empty graph)")
+    
+    print(f"  Number of nodes: {state['num_nodes']}")
+    print(f"  Number of edges: {state['num_edges']}")
+    
+    # Create enhanced policy network using both node and graph dimensions
+    node_dim = state['node_embeddings'].shape[1] if state['num_nodes'] > 0 else 64
+    graph_dim = state['graph_embedding'].shape[0]
+    
+    print(f"Creating encoder with node_dim={node_dim}, graph_dim={graph_dim}")
+    
+    encoder = GraphTransformerEncoder(
+        node_dim=node_dim, 
+        graph_dim=graph_dim, 
+        hidden_dim=128, 
+        num_layers=2
+    )
     policy = GraphPolicyNetwork(encoder, hidden_dim=128)
     
-    # Test with actual graph and features
-    if dgl_graph.num_nodes() > 0:
-        print("Testing policy with the topology...")
-        policy_output = policy(dgl_graph, node_features, deterministic=False)
+    # Test with full state
+    if state['num_nodes'] > 0:
+        print("Testing policy with full embedding state...")
+        policy_output = policy(state, deterministic=False)
         
         print(f"Policy output shapes:")
         print(f"  Action logits: {policy_output['action_logits'].shape}")
         print(f"  Spawn probabilities: {policy_output['spawn_prob'].shape}")
-        print(f"  Delete probabilities: {policy_output['delete_prob'].shape}")
-        print(f"  Spawn parameters sample: {policy_output['spawn_params_sample'].shape}")
+        print(f"  Enhanced graph embedding: {policy_output['graph_emb'].shape}")
         
-        # Show actual values
-        print(f"Spawn probabilities: {policy_output['spawn_prob']}")
-        print(f"Delete probabilities: {policy_output['delete_prob']}")
-        print(f"Gamma values: {policy_output['gamma']}")
-        print(f"Alpha values: {policy_output['alpha']}")
-        print(f"Graph embedding: {policy_output['graph_emb'].shape}")
+        print(f"Values:")
+        print(f"  Spawn probabilities: {policy_output['spawn_prob']}")
+        print(f"  Delete probabilities: {policy_output['delete_prob']}")
+        print(f"  Gamma values: {policy_output['gamma']}")
+        print(f"  Alpha values: {policy_output['alpha']}")
+        print(f"  Theta values: {policy_output['theta']}")
     else:
         print("No nodes in topology - skipping policy test")
     
-    # Create and test the agent
-    print("\nCreating and testing policy agent...")
+    # Create and test enhanced agent
+    print("\nCreating enhanced policy agent...")
     agent = TopologyPolicyAgent(topology, embedding, policy)
     
     # Test policy-based actions
     actions, spawn_params = agent.get_policy_actions(embedding_dim=64, deterministic=True)
     print(f"Policy actions: {actions}")
-    print(f"Spawn parameters for node 0: {spawn_params.get(0, 'N/A')}")
+    if len(spawn_params) > 0:
+        print(f"Sample spawn parameters for node 0: {spawn_params.get(0, 'N/A')}")
     
     # Execute actions
     print("\nExecuting policy actions...")
     executed_actions = agent.act_with_policy(embedding_dim=64, deterministic=False)
     print(f"Executed actions: {executed_actions}")
     print(f"Final topology: {topology.graph.num_nodes()} nodes, {topology.graph.num_edges()} edges")
+    
+    # Test a few action cycles to see graph evolution
+    print("\nTesting multiple action cycles:")
+    for i in range(3):
+        print(f"\n--- Cycle {i+1} ---")
+        before_nodes = topology.graph.num_nodes()
+        before_edges = topology.graph.num_edges()
+        
+        executed_actions = agent.act_with_policy(embedding_dim=64, deterministic=False)
+        
+        after_nodes = topology.graph.num_nodes()
+        after_edges = topology.graph.num_edges()
+        
+        print(f"Before: {before_nodes} nodes, {before_edges} edges")
+        print(f"Actions: {executed_actions}")
+        print(f"After: {after_nodes} nodes, {after_edges} edges")
+        print(f"Change: {after_nodes - before_nodes:+d} nodes, {after_edges - before_edges:+d} edges")
     
     print("\nIntegration test completed successfully! 🚀")
