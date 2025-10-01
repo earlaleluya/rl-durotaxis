@@ -46,6 +46,12 @@ pip install -r requirements.txt
 ```
 
 ### Installation in WSL
+Prepare your WSL first.
+```bash
+wsl.exe --install Ubuntu-24.04
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash ~/Miniconda3-latest-Linux-x86_64.sh
+```
 There might be some issues with library compatability. If you are using Windows, I suggest that you create environment in WSL.
 ```bash
 conda create -n durotaxis python=3.12.11
