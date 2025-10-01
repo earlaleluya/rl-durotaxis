@@ -102,13 +102,21 @@ class Topology:
         # Compute new node position
         x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
         new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
-        # Store current positions before adding node
+        # Store current positions and new_node flags before adding node
         current_positions = self.graph.ndata['pos']
+        current_new_node_flags = self.graph.ndata['new_node']
+        
         # Add new node to graph
         self.graph.add_nodes(1)
+        
         # Update position data by concatenating the new coordinate
         updated_positions = torch.cat([current_positions, new_node_coord.unsqueeze(0)], dim=0)
         self.graph.ndata['pos'] = updated_positions
+        
+        # Update new_node flags: existing nodes remain 0, new node gets 1
+        new_node_flag = torch.tensor([1.0], dtype=torch.float32)  # New node is flagged as 1
+        updated_new_node_flags = torch.cat([current_new_node_flags, new_node_flag], dim=0)
+        self.graph.ndata['new_node'] = updated_new_node_flags
         # Get the NEW node ID (after adding the node)
         new_node_id = self.graph.num_nodes() - 1  
         # Add edge from curr_node_id to new_node_id
@@ -152,6 +160,7 @@ class Topology:
             - Removes the node from the graph.
             - Adjusts the indices of remaining nodes to account for the removal.
             - Connects each predecessor to each successor to maintain graph connectivity.
+            - Preserves new_node flags for remaining nodes.
 
         Note:
             After node removal, indices of nodes greater than curr_node_id are decremented by 1.
@@ -159,8 +168,22 @@ class Topology:
         # Find predecessors and successors of the current node
         predecessors = self.graph.predecessors(curr_node_id).tolist()
         successors = self.graph.successors(curr_node_id).tolist()
+        
+        # Store new_node flags before removal (if they exist)
+        if 'new_node' in self.graph.ndata:
+            new_node_flags = self.graph.ndata['new_node'].clone()
+        
         # Remove the current node
         self.graph = dgl.remove_nodes(self.graph, curr_node_id)
+        
+        # Restore new_node flags for remaining nodes (excluding deleted node)
+        if 'new_node' in self.graph.ndata:
+            remaining_flags = torch.cat([
+                new_node_flags[:curr_node_id],
+                new_node_flags[curr_node_id+1:]
+            ])
+            self.graph.ndata['new_node'] = remaining_flags
+        
         # After removal, node indices shift down for nodes after curr_node_id
         # Adjust indices for successors and predecessors
         def adjust_idx(idx):
@@ -257,6 +280,10 @@ class Topology:
         # Create a directed graph with these edges
         g = dgl.graph((src, dst), num_nodes=init_num_nodes)
         g.ndata['pos'] = coordinates
+        
+        # Initialize new_node flags (all nodes are "old" after reset)
+        g.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
+        
         self.graph = g
         return g
 
