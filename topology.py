@@ -20,6 +20,7 @@ class Topology:
     
     def __init__(self, dgl_graph=None, substrate=None):
         self.substrate = substrate
+        self._next_persistent_id = 0  # Global counter for unique persistent IDs
         self.graph = dgl_graph if dgl_graph is not None else self.reset()
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
@@ -102,9 +103,10 @@ class Topology:
         # Compute new node position
         x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
         new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
-        # Store current positions and new_node flags before adding node
+        # Store current data before adding new node
         current_positions = self.graph.ndata['pos']
         current_new_node_flags = self.graph.ndata['new_node']
+        current_persistent_ids = self.graph.ndata.get('persistent_id', torch.arange(self.graph.num_nodes(), dtype=torch.long))
         
         # Add new node to graph
         self.graph.add_nodes(1)
@@ -117,6 +119,13 @@ class Topology:
         new_node_flag = torch.tensor([1.0], dtype=torch.float32)  # New node is flagged as 1
         updated_new_node_flags = torch.cat([current_new_node_flags, new_node_flag], dim=0)
         self.graph.ndata['new_node'] = updated_new_node_flags
+        
+        # Update persistent IDs: preserve existing IDs, assign new unique ID to new node
+        new_persistent_id = torch.tensor([self._next_persistent_id], dtype=torch.long)
+        updated_persistent_ids = torch.cat([current_persistent_ids, new_persistent_id], dim=0)
+        self.graph.ndata['persistent_id'] = updated_persistent_ids
+        self._next_persistent_id += 1  # Increment for next new node
+        
         # Get the NEW node ID (after adding the node)
         new_node_id = self.graph.num_nodes() - 1  
         # Add edge from curr_node_id to new_node_id
@@ -173,6 +182,10 @@ class Topology:
         if 'new_node' in self.graph.ndata:
             new_node_flags = self.graph.ndata['new_node'].clone()
         
+        # Store persistent IDs before removal (if they exist)
+        if 'persistent_id' in self.graph.ndata:
+            persistent_ids = self.graph.ndata['persistent_id'].clone()
+        
         # Remove the current node
         self.graph = dgl.remove_nodes(self.graph, curr_node_id)
         
@@ -183,6 +196,14 @@ class Topology:
                 new_node_flags[curr_node_id+1:]
             ])
             self.graph.ndata['new_node'] = remaining_flags
+        
+        # Restore persistent IDs for remaining nodes (excluding deleted node)
+        if 'persistent_id' in self.graph.ndata:
+            remaining_persistent_ids = torch.cat([
+                persistent_ids[:curr_node_id],
+                persistent_ids[curr_node_id+1:]
+            ])
+            self.graph.ndata['persistent_id'] = remaining_persistent_ids
         
         # After removal, node indices shift down for nodes after curr_node_id
         # Adjust indices for successors and predecessors
@@ -283,6 +304,11 @@ class Topology:
         
         # Initialize new_node flags (all nodes are "old" after reset)
         g.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
+        
+        # Initialize persistent IDs for tracking nodes across deletions
+        persistent_ids = torch.arange(init_num_nodes, dtype=torch.long)
+        g.ndata['persistent_id'] = persistent_ids
+        self._next_persistent_id = init_num_nodes  # Next available ID
         
         self.graph = g
         return g

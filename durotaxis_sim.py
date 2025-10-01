@@ -455,16 +455,48 @@ class DurotaxisEnv(gym.Env):
                     x_movement = node_x - prev_x
                     node_reward += x_movement * 0.01  # Reward rightward movement
                 
-                # 2. Substrate intensity rewards
+                # 2. Dequeued topology comparison reward
+                if self.dequeued_topology is not None:
+                    # Get node's persistent ID for reliable tracking
+                    node_persistent_id = self._get_node_persistent_id(i)
+                    
+                    # Check if this node was present in the dequeued topology using persistent ID
+                    if node_persistent_id is not None:
+                        node_was_in_dequeued = self._check_persistent_id_in_topology(node_persistent_id, self.dequeued_topology)
+                    else:
+                        # Fallback to spatial matching if persistent IDs not available
+                        node_was_in_dequeued = self._node_exists_in_topology(node_x, node_y, self.dequeued_topology)
+                    
+                    if node_was_in_dequeued:
+                        # Compute average substrate intensity of all nodes in current topology
+                        current_intensities = []
+                        for j in range(num_nodes):
+                            if len(node_features[j]) > 2:
+                                current_intensities.append(node_features[j][2].item())
+                        
+                        if current_intensities:
+                            avg_intensity = sum(current_intensities) / len(current_intensities)
+                            current_node_intensity = node_features[i][2].item() if len(node_features[i]) > 2 else 0.0
+                            
+                            if current_node_intensity < avg_intensity:
+                                node_reward -= 5.0  # Penalty for being below average
+                                print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -5.0)")
+                            else:
+                                node_reward += 0.01  # Basic survival reward
+                                print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +0.01)")
+
+                # 3. Substrate intensity rewards
                 if len(node_features[i]) > 2: 
                     substrate_intensity = node_features[i][2].item()
-                    node_reward += substrate_intensity * 0.05  # Reward higher stiffness areas                # 3. Boundary position rewards
+                    node_reward += substrate_intensity * 0.05  # Reward higher stiffness areas                
+                
+                # 4. Boundary position rewards
                 if len(node_features[i]) > 7:  # Assuming boundary flag is at index 7
                     is_boundary = node_features[i][7].item()
                     if is_boundary > 0.5:  # Node is on boundary
                         node_reward += 0.1  # Small bonus for frontier nodes
                 
-                # 4. Positional penalties (avoid substrate edges)
+                # 5. Positional penalties (avoid substrate edges)
                 substrate_width = self.substrate.width
                 substrate_height = self.substrate.height
                 
@@ -588,6 +620,166 @@ class DurotaxisEnv(gym.Env):
                                           f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
         
         return spawn_reward
+
+    def _node_exists_in_topology(self, node_x, node_y, topology, tolerance=None):
+        """
+        Check if a node with similar position exists in the given topology.
+        Now uses persistent IDs for reliable tracking instead of spatial proximity.
+        
+        Args:
+            node_x, node_y: Current node position (still used for fallback)
+            topology: Topology object to search in
+            tolerance: Maximum distance to consider nodes as "same" (fallback only)
+            
+        Returns:
+            bool: True if a similar node exists in the topology
+        """
+        if topology is None:
+            return False
+            
+        try:
+            # Method 1: Use persistent IDs if available (preferred method)
+            current_persistent_ids = self.topology.graph.ndata.get('persistent_id', None)
+            dequeued_persistent_ids = topology.graph.ndata.get('persistent_id', None)
+            
+            if current_persistent_ids is not None and dequeued_persistent_ids is not None:
+                # Find current node's persistent ID by position matching
+                current_positions = self.topology.graph.ndata['pos']
+                current_node_persistent_id = None
+                
+                for i, pos in enumerate(current_positions):
+                    curr_x, curr_y = pos[0].item(), pos[1].item()
+                    if abs(curr_x - node_x) < 0.01 and abs(curr_y - node_y) < 0.01:  # Very tight match for same node
+                        current_node_persistent_id = current_persistent_ids[i].item()
+                        break
+                
+                if current_node_persistent_id is not None:
+                    # Check if this persistent ID exists in dequeued topology
+                    for pid in dequeued_persistent_ids:
+                        if pid.item() == current_node_persistent_id:
+                            return True
+                    return False
+            
+            # Method 2: Fallback to spatial proximity (original method)
+            print("⚠️ Falling back to spatial matching (persistent IDs not available)")
+            
+            # Calculate adaptive tolerance based on substrate and environment characteristics
+            if tolerance is None:
+                tolerance = self._calculate_adaptive_tolerance()
+            
+            # Get node positions from the topology
+            if hasattr(topology, 'graph') and topology.graph.num_nodes() > 0:
+                positions = topology.graph.ndata.get('pos', None)
+                if positions is not None:
+                    for pos in positions:
+                        dequeued_x, dequeued_y = pos[0].item(), pos[1].item()
+                        distance = ((node_x - dequeued_x)**2 + (node_y - dequeued_y)**2)**0.5
+                        if distance <= tolerance:
+                            return True
+            return False
+            
+        except Exception as e:
+            print(f"Error checking node existence in topology: {e}")
+            return False
+
+    def _calculate_adaptive_tolerance(self):
+        """
+        Calculate adaptive tolerance for node matching based on substrate characteristics.
+        
+        Returns:
+            float: Adaptive tolerance value
+        """
+        # Base tolerance factors
+        base_tolerance = 2.0
+        
+        # Factor 1: Substrate gradient steepness
+        # For linear gradients: y = mx + b, steeper slope (larger |m|) = more movement
+        if hasattr(self.substrate_params, 'get'):
+            slope = abs(self.substrate_params.get('m', 0.01))
+        elif isinstance(self.substrate_params, dict):
+            slope = abs(self.substrate_params.get('m', 0.01))
+        else:
+            slope = 0.01  # Default slope
+        
+        # Adjust tolerance based on slope: steeper slope = larger tolerance
+        slope_factor = max(1.0, slope * 100)  # Scale slope to reasonable range
+        
+        # Factor 2: Substrate size - larger substrates may need larger tolerances
+        substrate_diagonal = (self.substrate_size[0]**2 + self.substrate_size[1]**2)**0.5
+        size_factor = max(1.0, substrate_diagonal / 500)  # Normalize by reference size
+        
+        # Factor 3: Delta time - more steps between comparisons = more potential movement
+        time_factor = max(1.0, self.delta_time / 3.0)  # Normalize by default delta_time
+        
+        # Factor 4: Current step - nodes might move more early in episode
+        if self.current_step > 0:
+            step_factor = max(0.5, 1.0 - (self.current_step / self.max_steps) * 0.3)
+        else:
+            step_factor = 1.0
+        
+        # Combine factors
+        adaptive_tolerance = base_tolerance * slope_factor * size_factor * time_factor * step_factor
+        
+        # Clamp to reasonable bounds
+        adaptive_tolerance = max(0.5, min(adaptive_tolerance, 10.0))
+        
+        # Debug output (can be removed in production)
+        if hasattr(self, '_tolerance_debug_counter'):
+            self._tolerance_debug_counter += 1
+        else:
+            self._tolerance_debug_counter = 1
+        
+        if self._tolerance_debug_counter <= 3:  # Only print first few times
+            print(f"🎯 Adaptive tolerance: {adaptive_tolerance:.2f} "
+                  f"(slope_factor: {slope_factor:.2f}, size_factor: {size_factor:.2f}, "
+                  f"time_factor: {time_factor:.2f}, step_factor: {step_factor:.2f})")
+        
+        return adaptive_tolerance
+
+    def _get_node_persistent_id(self, node_idx):
+        """
+        Get the persistent ID for a node at the given index.
+        
+        Args:
+            node_idx: Current index of the node in the graph
+            
+        Returns:
+            int or None: Persistent ID of the node, or None if not available
+        """
+        try:
+            if hasattr(self.topology, 'graph') and 'persistent_id' in self.topology.graph.ndata:
+                persistent_ids = self.topology.graph.ndata['persistent_id']
+                if node_idx < len(persistent_ids):
+                    return persistent_ids[node_idx].item()
+            return None
+        except Exception as e:
+            print(f"Error getting persistent ID for node {node_idx}: {e}")
+            return None
+
+    def _check_persistent_id_in_topology(self, persistent_id, topology):
+        """
+        Check if a persistent ID exists in the given topology.
+        
+        Args:
+            persistent_id: The persistent ID to search for
+            topology: Topology object to search in
+            
+        Returns:
+            bool: True if the persistent ID exists in the topology
+        """
+        try:
+            if topology is None or persistent_id is None:
+                return False
+                
+            if hasattr(topology, 'graph') and 'persistent_id' in topology.graph.ndata:
+                dequeued_persistent_ids = topology.graph.ndata['persistent_id']
+                for pid in dequeued_persistent_ids:
+                    if pid.item() == persistent_id:
+                        return True
+            return False
+        except Exception as e:
+            print(f"Error checking persistent ID {persistent_id} in topology: {e}")
+            return False
 
     def _reset_new_node_flags(self):
         """
