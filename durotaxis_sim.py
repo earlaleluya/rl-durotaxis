@@ -29,6 +29,7 @@ class DurotaxisEnv(gym.Env):
                  max_steps=1000,
                  embedding_dim=64,
                  hidden_dim=128,  
+                 delta_time=3,
                  render_mode=None,
                  policy_agent=None):
         super().__init__()
@@ -42,7 +43,13 @@ class DurotaxisEnv(gym.Env):
         self.max_steps = max_steps
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim 
+        self.delta_time = delta_time
         self.current_step = 0
+        
+        # Centroid tracking for fail termination
+        self.centroid_history = []  # Store centroid x-coordinates
+        self.consecutive_left_moves = 0  # Count consecutive leftward moves
+        self.fail_threshold = 2 * self.delta_time  # Threshold for fail termination
         
         # 1. Action Space
         # Since the agent uses graph_transformer_policy_dgl.act_with_policy(),
@@ -51,7 +58,7 @@ class DurotaxisEnv(gym.Env):
         self.action_space = spaces.Discrete(1)  # Dummy action - actual actions come from policy network
 
         # 2. Observation Space
-        # The observation space uses encoder_out from GraphPolicyNetwork (GraphInputEncoder output).
+        # The observation space uses output from GraphInputEncoder directly.
         # Shape: [num_nodes+1, out_dim] where first element is graph token, rest are node embeddings
         max_nodes_plus_graph = self.max_nodes + 1  # +1 for graph token
         encoder_out_dim = 64  # Default out_dim from GraphInputEncoder
@@ -71,17 +78,12 @@ class DurotaxisEnv(gym.Env):
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
         
-        # Create policy network for encoder-based observations
-        if policy_agent is not None:
-            self.observation_policy = policy_agent.policy
-        else:
-            # Create a separate encoder for observations
-            encoder = GraphInputEncoder(
-                hidden_dim=self.hidden_dim,
-                out_dim=64,  # This matches encoder_out_dim above
-                num_layers=4
-            )
-            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim, noise_scale=0.1)
+        # Create GraphInputEncoder for observations
+        self.observation_encoder = GraphInputEncoder(
+            hidden_dim=self.hidden_dim,
+            out_dim=64,  # This matches encoder_out_dim above
+            num_layers=4
+        )
 
         # Store encoder output dimension for observation processing
         self.encoder_out_dim = 64
@@ -122,22 +124,43 @@ class DurotaxisEnv(gym.Env):
 
     def _get_encoder_observation(self, state):
         """
-        Get observation from GraphPolicyNetwork encoder_out with semantic pooling.
+        Get observation from GraphInputEncoder output with semantic pooling.
         
         Args:
             state: State dictionary from state_extractor.get_state_features()
             
         Returns:
-            np.ndarray: Fixed-size observation vector from encoder_out
+            np.ndarray: Fixed-size observation vector from encoder output
             
         Note:
             Uses semantic pooling when num_nodes > max_nodes to preserve representative
             nodes based on their features rather than arbitrary truncation.
         """
         try:
-            # Get policy output which includes encoder_out
-            policy_output = self.observation_policy(state, deterministic=True)
-            encoder_out = policy_output['encoder_out']  # Shape: [num_nodes+1, out_dim]
+            # Extract components from state
+            node_features = state['node_features']
+            graph_features = state['graph_features']
+            edge_features = state['edge_attr']
+            edge_index = state['edge_index']
+            
+            # Convert edge_index from DGL tuple format to PyG tensor format if needed
+            if isinstance(edge_index, tuple):
+                src, dst = edge_index
+                edge_index_tensor = torch.stack([src, dst], dim=0)  # [2, num_edges]
+            else:
+                edge_index_tensor = edge_index
+            
+            # Handle empty graphs
+            if node_features.shape[0] == 0:
+                return np.zeros((self.max_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
+            
+            # Get encoder output directly
+            encoder_out = self.observation_encoder(
+                graph_features=graph_features,
+                node_features=node_features,
+                edge_features=edge_features,
+                edge_index=edge_index_tensor
+            )  # Shape: [num_nodes+1, out_dim]
             
             # Check for potential information reduction
             actual_nodes = encoder_out.shape[0] - 1  # -1 for graph token
@@ -327,9 +350,10 @@ class DurotaxisEnv(gym.Env):
         # Store previous state for reward calculation
         prev_state = self.state_extractor.get_state_features(include_substrate=True)
         prev_num_nodes = prev_state['num_nodes']
-        
-        # Get previous DGL graph 
-        prev_dgl = self.state_extractor.to_dgl(embedding_dim=self.embedding_dim)
+
+        # Get previous topology
+        prev_topology = prev_state['topology']
+
         
         # Execute actions using the policy network
         if self.policy_agent is not None and prev_num_nodes > 0:
@@ -348,14 +372,14 @@ class DurotaxisEnv(gym.Env):
         # Get new state
         new_state = self.state_extractor.get_state_features(include_substrate=True)
         
-        # Get next DGL graph
-        next_dgl = self.state_extractor.to_dgl(embedding_dim=self.embedding_dim)
-        
+        # Get next topology
+        next_topology = new_state['topology']
+
         # Get observation from GraphInputEncoder output
         observation = self._get_encoder_observation(new_state)
         
-        # Calculate reward with DGL graphs
-        reward = self._calculate_reward(prev_state, new_state, executed_actions, prev_dgl, next_dgl)
+        # TODO Calculate reward (simplified version without DGL graphs)
+        reward = self._calculate_reward(prev_state, new_state, executed_actions)
         
         # Check termination conditions
         terminated = self._check_terminated(new_state)
@@ -448,14 +472,48 @@ class DurotaxisEnv(gym.Env):
 
     def _check_terminated(self, state):
         """Check if the episode should terminate."""
-        # Terminate if no nodes left
+        # Terminate if no nodes left ('fail termination')
         if state['num_nodes'] == 0:
             return True
         
-        # Terminate if too many nodes
-        if state['num_nodes'] > self.max_nodes:
-            return True
+        # Terminate if graph's centroid keeps going left consequently for 2*self.delta_time times ('fail termination')
+        if state['num_nodes'] > 0:
+            # Get current centroid x-coordinate directly from graph_features
+            centroid_x = state['graph_features'][3].item()
             
+            # Update centroid history
+            self.centroid_history.append(centroid_x)
+            
+            # Check for consecutive leftward movement
+            if len(self.centroid_history) >= 2:
+                current_centroid = self.centroid_history[-1]
+                previous_centroid = self.centroid_history[-2]
+                
+                if current_centroid < previous_centroid:  # Moving left
+                    self.consecutive_left_moves += 1
+                else:  # Not moving left (right, same, or first step)
+                    self.consecutive_left_moves = 0
+                
+                # Check fail termination condition
+                if self.consecutive_left_moves >= self.fail_threshold:
+                    print(f"❌ Episode terminated: Centroid moved left {self.consecutive_left_moves} consecutive times (threshold: {self.fail_threshold})")
+                    print(f"   Current centroid: {current_centroid:.2f}, Previous: {previous_centroid:.2f}")
+                    return True
+
+        # Terminate if one node from the graph reaches the rightmost location ('success termination')
+        if state['num_nodes'] > 0:
+            # Get substrate width to determine rightmost position
+            substrate_width = self.substrate.width
+            rightmost_x = substrate_width - 1  # Rightmost valid x-coordinate
+            
+            # Check each node's x-position (first element of node_features)
+            node_features = state['node_features']
+            for i in range(state['num_nodes']):
+                node_x = node_features[i][0].item()  # x-coordinate
+                if node_x >= rightmost_x:
+                    print(f"🎯 Episode terminated: Node {i} reached rightmost location (x={node_x:.2f} >= {rightmost_x})")
+                    return True
+        
         return False
 
     def reset(self, seed=None, options=None):
@@ -464,6 +522,10 @@ class DurotaxisEnv(gym.Env):
         
         # Reset step counter
         self.current_step = 0
+        
+        # Reset centroid tracking for fail termination
+        self.centroid_history = []
+        self.consecutive_left_moves = 0
         
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)
@@ -568,7 +630,7 @@ if __name__ == '__main__':
     # the high-level environment dynamics while the graph transformer policy
     # handles the low-level graph actions
     
-    try:
+    try: 
         # Create a simple policy that works with the environment
         model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4)
         
