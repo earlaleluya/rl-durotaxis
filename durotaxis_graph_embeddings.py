@@ -7,8 +7,9 @@ from stable_baselines3 import DQN, PPO
 
 from topology import Topology
 from substrate import Substrate
-from embedding_dgl import GraphEmbedding
-from graph_transformer_policy_dgl import GraphTransformerEncoder, GraphPolicyNetwork, TopologyPolicyAgent
+from state import TopologyState
+from encoder_graph_embeddings import GraphTransformerEncoder, GraphPolicyNetwork, TopologyPolicyAgent
+from observation_strategies import get_observation_strategy_6_lightweight
 
 
 class DurotaxisEnv(gym.Env):
@@ -26,7 +27,9 @@ class DurotaxisEnv(gym.Env):
                  max_nodes=50,
                  max_steps=1000,
                  embedding_dim=64,
-                 render_mode=None):
+                 hidden_dim=128,  
+                 render_mode=None,
+                 policy_agent=None):
         super().__init__()
         
         # Environment parameters
@@ -37,6 +40,7 @@ class DurotaxisEnv(gym.Env):
         self.max_nodes = max_nodes
         self.max_steps = max_steps
         self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim 
         self.current_step = 0
         
         # 1. Action Space
@@ -46,7 +50,7 @@ class DurotaxisEnv(gym.Env):
         self.action_space = spaces.Discrete(1)  # Dummy action - actual actions come from policy network
 
         # 2. Observation Space
-        # The observation space accommodates graph embeddings from the GraphEmbedding class.
+        # The observation space accommodates graph embeddings from the TopologyState class.
         # Since graph size is dynamic, we use a fixed-size embedding representation.
         self.observation_space = spaces.Box(
             low=-np.inf, 
@@ -61,9 +65,33 @@ class DurotaxisEnv(gym.Env):
         # 4. Rendering
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
+        
+        # Create policy network for enhanced observations
+        if policy_agent is not None:
+            self.observation_policy = policy_agent.policy
+        else:
+            # Create a separate encoder just for observations
+            node_dim = embedding_dim  # From your embedding
+            graph_dim = embedding_dim  # From your embedding
+            encoder = GraphTransformerEncoder(
+                node_dim=node_dim,
+                graph_dim=graph_dim, 
+                hidden_dim=self.hidden_dim,  # Use instance variable
+                num_layers=2
+            )
+            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim)  # Use instance variable
+
+        # Update observation space for Strategy 6
+        obs_dim = self.hidden_dim * 5  # hidden_dim * 5 (graph + mean + std + min + max)
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf, 
+            shape=(obs_dim,),
+            dtype=np.float32
+        )
 
     def _setup_environment(self):
-        """Initialize substrate, topology, embedding, and policy components."""
+        """Initialize substrate, topology, state extractor, and policy components."""
         # Create substrate
         self.substrate = Substrate(self.substrate_size)
         self.substrate.create(self.substrate_type, **self.substrate_params)
@@ -71,8 +99,8 @@ class DurotaxisEnv(gym.Env):
         # Create topology
         self.topology = Topology(substrate=self.substrate)
         
-        # Create embedding system
-        self.embedding = GraphEmbedding(self.topology)
+        # Create state extractor
+        self.state_extractor = TopologyState(self.topology)
         
         # Initialize policy network (will be set up after first reset)
         self.policy_agent = None
@@ -84,7 +112,7 @@ class DurotaxisEnv(gym.Env):
             return
             
         # Get initial state to determine dimensions
-        state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+        state = self.state_extractor.get_state_features(include_substrate=True)
         
         node_dim = state['node_embeddings'].shape[1] if state['num_nodes'] > 0 else self.embedding_dim
         graph_dim = state['graph_embedding'].shape[0]
@@ -93,13 +121,13 @@ class DurotaxisEnv(gym.Env):
         encoder = GraphTransformerEncoder(
             node_dim=node_dim,
             graph_dim=graph_dim,
-            hidden_dim=128,
+            hidden_dim=self.hidden_dim,
             num_layers=2,
             num_heads=4,
             dropout=0.1
         )
         
-        policy = GraphPolicyNetwork(encoder, hidden_dim=128, noise_scale=0.1)
+        policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim, noise_scale=0.1)
         
         # Create policy agent
         self.policy_agent = TopologyPolicyAgent(self.topology, self.embedding, policy)
@@ -113,11 +141,12 @@ class DurotaxisEnv(gym.Env):
         self.current_step += 1
         
         # Store previous state for reward calculation
-        prev_state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+        prev_state = self.state_extractor.get_state_features(include_substrate=True)
         prev_num_nodes = prev_state['num_nodes']
-        prev_num_edges = prev_state['num_edges']
         
-        # TODO to add sigma for the exploration-exploitation strategy, use `deterministic` for the logic changes
+        # Get previous DGL graph 
+        prev_dgl = self.state_extractor.to_dgl()
+        
         # Execute actions using the policy network
         if self.policy_agent is not None and prev_num_nodes > 0:
             try:
@@ -133,11 +162,20 @@ class DurotaxisEnv(gym.Env):
             executed_actions = self.topology.act()
         
         # Get new state
-        new_state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
-        observation = new_state['graph_embedding'].numpy().astype(np.float32)
+        new_state = self.state_extractor.get_state_features(include_substrate=True)
         
-        # Calculate reward
-        reward = self._calculate_reward(prev_state, new_state, executed_actions)
+        # Get next DGL graph
+        next_dgl = self.state_extractor.to_dgl()
+        
+        # Strategy 6: Enhanced observation using policy network
+        observation = get_observation_strategy_6_lightweight(
+            new_state, 
+            self.observation_policy, 
+            device='cpu'
+        )
+        
+        # Calculate reward with DGL graphs
+        reward = self._calculate_reward(prev_state, new_state, executed_actions, prev_dgl, next_dgl)
         
         # Check termination conditions
         terminated = self._check_terminated(new_state)
@@ -154,19 +192,56 @@ class DurotaxisEnv(gym.Env):
         
         return observation, reward, terminated, truncated, info
 
-    def _calculate_reward(self, prev_state, new_state, actions):
+    def _calculate_reward(self, prev_state, new_state, actions, prev_dgl=None, next_dgl=None):
         """
         Calculate reward based on topology evolution and substrate exploration.
+        Now includes DGL graph analysis for more sophisticated reward calculation.
         """
         reward = 0.0
         
         # Basic survival reward
         reward += 0.1
         
-        # Reward for maintaining connectivity
-        if new_state['num_nodes'] > 1:
-            density = new_state['num_edges'] / (new_state['num_nodes'] * (new_state['num_nodes'] - 1))
-            reward += density * 2.0
+        # DGL-based reward calculations
+        if prev_dgl is not None and next_dgl is not None:
+            # Example: Calculate graph-based metrics using DGL
+            import dgl
+            
+            # Connectivity analysis
+            if next_dgl.num_nodes() > 1:
+                # Graph density
+                density = next_dgl.num_edges() / (next_dgl.num_nodes() * (next_dgl.num_nodes() - 1))
+                reward += density * 2.0
+                
+                # Clustering coefficient (if available)
+                try:
+                    # You can add more sophisticated graph metrics here
+                    # Example: average clustering coefficient, betweenness centrality, etc.
+                    pass
+                except:
+                    pass
+            
+            # Structural changes reward
+            if prev_dgl.num_nodes() > 0:
+                # Reward for growth
+                node_growth = next_dgl.num_nodes() - prev_dgl.num_nodes()
+                edge_growth = next_dgl.num_edges() - prev_dgl.num_edges()
+                
+                # Moderate growth is good
+                if 0 <= node_growth <= 2:
+                    reward += node_growth * 0.5
+                elif node_growth > 2:
+                    reward -= (node_growth - 2) * 0.3  # Penalty for too rapid growth
+                
+                if edge_growth > 0:
+                    reward += edge_growth * 0.2
+        
+        # Fallback to original reward if DGL graphs not available
+        else:
+            # Reward for maintaining connectivity
+            if new_state['num_nodes'] > 1:
+                density = new_state['num_edges'] / (new_state['num_nodes'] * (new_state['num_nodes'] - 1))
+                reward += density * 2.0
         
         # Reward for substrate exploration (using graph features)
         graph_features = new_state['graph_features']
@@ -217,7 +292,7 @@ class DurotaxisEnv(gym.Env):
         self._initialize_policy()
         
         # Get initial observation
-        state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+        state = self.state_extractor.get_state_features(include_substrate=True)
         observation = state['graph_embedding'].numpy().astype(np.float32)
         
         info = {
@@ -232,7 +307,7 @@ class DurotaxisEnv(gym.Env):
     def render(self):
         """Render the current state of the environment."""
         if self.render_mode == "human":
-            state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+            state = self.state_extractor.get_state_features(include_substrate=True)
             print(f"Step {self.current_step}: {state['num_nodes']} nodes, {state['num_edges']} edges")
             
             # Optional: visualize the topology
@@ -277,6 +352,7 @@ if __name__ == '__main__':
         max_nodes=30,
         max_steps=100,
         embedding_dim=64,
+        hidden_dim=128,
         render_mode="human"
     )
     
@@ -340,6 +416,7 @@ if __name__ == '__main__':
         init_num_nodes=8,
         max_steps=50,
         embedding_dim=128,
+        hidden_dim=128,
         render_mode="human"
     )
     

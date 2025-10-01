@@ -47,6 +47,14 @@ class Substrate:
         """Returns the intensity value at the specified position in the signal matrix."""
         x, y = pos
         x, y = int(x), int(y)
+        
+        # Bounds checking to prevent index errors
+        height, width = self.signal_matrix.shape
+        
+        # Clamp coordinates to valid range
+        x = max(0, min(x, width - 1))
+        y = max(0, min(y, height - 1))
+        
         return self.signal_matrix[y][x]
 
 

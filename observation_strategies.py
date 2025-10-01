@@ -5,10 +5,11 @@ Each strategy has different implications for learning and performance.
 
 import numpy as np
 import torch
+import dgl
 
 def get_observation_strategy_1_graph_only(new_state):
     """
-    Strategy 1: Graph embedding only (CURRENT)
+    Strategy 1: Graph embedding only 
     
     Pros:
     - Fixed size, works with all RL algorithms
@@ -165,18 +166,133 @@ def get_observation_strategy_5_attention_based(new_state, top_k=10):
     return np.concatenate([graph_emb, important_nodes.flatten()])
 
 
+def get_observation_strategy_6_attention_based_statistical(new_state, policy_network, device='cpu'):
+    """
+    Strategy 6: Enhanced graph embedding + statistical node features from GraphPolicyNetwork.
+    
+    Uses the GraphPolicyNetwork's forward pass to get:
+    - Enhanced graph_emb (fusion of pooled nodes + graph features)  
+    - Statistical summaries of processed node_emb (context-aware node features)
+    
+    Args:
+        new_state: Full state from state_extractor.get_state_features()
+        policy_network: Your GraphPolicyNetwork instance
+        device: torch device
+        
+    Returns:
+        np.ndarray: [graph_emb + node_stats] shape: [hidden_dim + hidden_dim*4]
+    """
+    
+    # Convert state to tensors if needed
+    if isinstance(new_state['node_embeddings'], np.ndarray):
+        for key in ['node_embeddings', 'graph_embedding']:
+            if key in new_state:
+                new_state[key] = torch.from_numpy(new_state[key]).to(device)
+    
+    # Get enhanced embeddings from policy network
+    with torch.no_grad():
+        policy_output = policy_network(new_state, deterministic=True)
+        
+        # Extract enhanced features
+        graph_emb = policy_output['graph_emb']  # [hidden_dim] - Enhanced graph representation
+        node_emb = policy_output['node_emb']    # [num_nodes, hidden_dim] - Context-aware nodes
+    
+    # Convert graph embedding to numpy
+    graph_features = graph_emb.cpu().numpy().astype(np.float32)
+    
+    # Handle empty graphs
+    if node_emb.shape[0] == 0:
+        # Return just graph embedding padded to expected size
+        expected_node_stats_size = graph_emb.shape[0] * 4  # mean + std + min + max
+        padding = np.zeros(expected_node_stats_size, dtype=np.float32)
+        return np.concatenate([graph_features, padding])
+    
+    # Calculate statistical summaries of enhanced node embeddings
+    node_emb_np = node_emb.cpu().numpy().astype(np.float32)
+    
+    node_stats = np.concatenate([
+        np.mean(node_emb_np, axis=0),      # Average enhanced node properties
+        np.std(node_emb_np, axis=0),       # Variability in enhanced features  
+        np.min(node_emb_np, axis=0),       # Minimum enhanced values
+        np.max(node_emb_np, axis=0),       # Maximum enhanced values
+    ])
+    
+    # Combine enhanced graph embedding with node statistics
+    observation = np.concatenate([graph_features, node_stats])
+    
+    return observation
+
+
+def get_observation_strategy_6_lightweight(new_state, policy_network, device='cpu'):
+    """
+    Strategy 6 Lightweight: Only uses the encoder part (no policy heads).
+    More efficient for observation generation.
+    """
+    
+    # Convert state to tensors if needed  
+    if isinstance(new_state['node_embeddings'], np.ndarray):
+        for key in ['node_embeddings', 'graph_embedding']:
+            if key in new_state:
+                new_state[key] = torch.from_numpy(new_state[key]).to(device)
+    
+    # Extract components from state
+    node_embeddings = new_state['node_embeddings']
+    graph_embedding = new_state['graph_embedding']
+    edge_index = new_state['edge_index']
+    
+    # Create DGL graph from edge index if edges exist
+    g = None
+    if isinstance(edge_index, torch.Tensor) and edge_index.shape[1] > 0:
+        src, dst = edge_index[0], edge_index[1]
+        g = dgl.graph((src, dst), num_nodes=node_embeddings.shape[0])
+    
+    # Get enhanced embeddings from encoder only (more efficient)
+    with torch.no_grad():
+        graph_emb, node_emb = policy_network.encoder(
+            g=g,
+            node_feats=node_embeddings,
+            graph_feats=graph_embedding
+        )
+    
+    # Convert to numpy
+    graph_features = graph_emb.cpu().numpy().astype(np.float32)
+    
+    # Handle empty graphs
+    if node_emb.shape[0] == 0:
+        expected_node_stats_size = graph_emb.shape[0] * 4
+        padding = np.zeros(expected_node_stats_size, dtype=np.float32)
+        return np.concatenate([graph_features, padding])
+    
+    # Statistical summaries of enhanced node embeddings
+    node_emb_np = node_emb.cpu().numpy().astype(np.float32)
+    
+    node_stats = np.concatenate([
+        np.mean(node_emb_np, axis=0),
+        np.std(node_emb_np, axis=0), 
+        np.min(node_emb_np, axis=0),
+        np.max(node_emb_np, axis=0),
+    ])
+    
+    return np.concatenate([graph_features, node_stats])
+
+
 # Observation space shapes for each strategy
-def get_observation_space_shapes(embedding_dim=64, max_nodes=20):
+def get_observation_space_shapes(embedding_dim=64, max_nodes=20, hidden_dim=128):
     """
-    Calculate observation space shapes for each strategy.
+    Returns observation space shapes for each strategy.
     """
-    return {
-        'strategy_1_graph_only': (embedding_dim,),
-        'strategy_2_padded_nodes': (max_nodes * embedding_dim,),
-        'strategy_3_combined': (embedding_dim + max_nodes * embedding_dim,),
-        'strategy_4_statistical': (embedding_dim + 4 * embedding_dim,),  # graph + 4 stats
-        'strategy_5_attention': (embedding_dim + max_nodes * embedding_dim,),
+    
+    shapes = {
+        "strategy_1_graph_only": (embedding_dim,),                    # 64
+        "strategy_2_padded_nodes": (max_nodes * embedding_dim,),      # 1280
+        "strategy_3_combined": (embedding_dim + max_nodes * embedding_dim,),  # 1344
+        "strategy_4_statistical": (embedding_dim * 5,),              # 320 
+        "strategy_5_attention_based": (embedding_dim + max_nodes * embedding_dim,),  # 1344
+        "strategy_6_attention_based_statistical": (hidden_dim * 5,), # 640 (128 * 5)
+        "strategy_6_lightweight": (hidden_dim * 5,),                 # 640 (128 * 5)
     }
+    
+    return shapes
 
 
 if __name__ == "__main__":

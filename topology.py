@@ -18,12 +18,11 @@ import numpy as np
 
 class Topology:
     
-    def __init__(self, graph=None, substrate=None):
+    def __init__(self, dgl_graph=None, substrate=None):
         self.substrate = substrate
-        self.graph = graph if graph is not None else self.reset()
+        self.graph = dgl_graph if dgl_graph is not None else self.reset()
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
-        
 
 
 
@@ -52,6 +51,43 @@ class Topology:
     def get_all_nodes(self):
         """Return a list of all node IDs in the graph."""
         return self.graph.nodes().tolist()
+
+
+    def get_substrate_intensities(self):
+        """
+        Get substrate intensity values for all nodes in the graph.
+        
+        Returns
+        -------
+        torch.Tensor : Substrate intensities [num_nodes, 1]
+        """
+        if self.substrate is None:
+            return torch.empty(0, 1, dtype=torch.float32)
+        
+        positions = self.graph.ndata['pos']
+        num_nodes = positions.shape[0]
+        
+        if num_nodes == 0:
+            return torch.empty(0, 1, dtype=torch.float32)
+        
+        intensities = []
+        substrate_shape = self.substrate.signal_matrix.shape if hasattr(self.substrate, 'signal_matrix') else (0, 0)
+        
+        for i in range(num_nodes):
+            pos = positions[i].numpy()
+            
+            # Debug: Check if position is out of bounds
+            x, y = int(pos[0]), int(pos[1])
+            if (x < 0 or y < 0 or 
+                (substrate_shape[1] > 0 and x >= substrate_shape[1]) or 
+                (substrate_shape[0] > 0 and y >= substrate_shape[0])):
+                print(f"⚠️ Node {i} position out of bounds: ({x}, {y}) vs substrate shape {substrate_shape}")
+            
+            intensity = self.substrate.get_intensity(pos)
+            intensities.append(intensity)
+        
+        substrate_features = torch.tensor(intensities, dtype=torch.float32).unsqueeze(1)
+        return substrate_features    
 
 
 
