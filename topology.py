@@ -23,7 +23,6 @@ class Topology:
         self.graph = graph if graph is not None else self.reset()
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
-        
 
 
 
@@ -52,6 +51,33 @@ class Topology:
     def get_all_nodes(self):
         """Return a list of all node IDs in the graph."""
         return self.graph.nodes().tolist()
+
+
+    def get_substrate_intensities(self):
+        """
+        Get substrate intensity values for all nodes in the graph.
+        
+        Returns
+        -------
+        torch.Tensor : Substrate intensities [num_nodes, 1]
+        """
+        if self.substrate is None:
+            return torch.empty(0, 1, dtype=torch.float32)
+        
+        positions = self.graph.ndata['pos']
+        num_nodes = positions.shape[0]
+        
+        if num_nodes == 0:
+            return torch.empty(0, 1, dtype=torch.float32)
+        
+        intensities = []
+        for i in range(num_nodes):
+            pos = positions[i].numpy()
+            intensity = self.substrate.get_intensity(pos)
+            intensities.append(intensity)
+        
+        substrate_features = torch.tensor(intensities, dtype=torch.float32).unsqueeze(1)
+        return substrate_features    
 
 
 

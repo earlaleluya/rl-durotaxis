@@ -82,7 +82,8 @@ class GraphEmbedding:
             'graph_features': graph_features,            # Shape: [graph_feature_dim]
             'node_features': node_features,              # Shape: [num_nodes, node_feature_dim]
             'num_nodes': self.graph.num_nodes(),
-            'num_edges': self.graph.num_edges()
+            'num_edges': self.graph.num_edges(),
+            'topology': self.topology()
         }
         
         return state
@@ -106,14 +107,10 @@ class GraphEmbedding:
         features.append(positions) # [x, y] coordinates
         
         if include_substrate and self.substrate is not None:
-            # Substrate intensity at each node position
-            intensities = []
-            for i in range(num_nodes):
-                pos = positions[i].numpy()
-                intensity = self.substrate.get_intensity(pos)
-                intensities.append(intensity)
-            substrate_features = torch.tensor(intensities, dtype=torch.float32).unsqueeze(1)
+            # Use the topology's method to get substrate intensities
+            substrate_features = self.topology.get_substrate_intensities()
             features.append(substrate_features)
+
         
         # Topological features
         degrees = self._get_node_degrees()
@@ -170,7 +167,7 @@ class GraphEmbedding:
         
         Returns
         -------
-        torch.Tensor : Graph feature vector
+        torch.Tensor : Graph feature vector with Size([feature_dim])
         """
         positions = self.graph.ndata['pos']
         
