@@ -7,7 +7,7 @@ from stable_baselines3 import DQN, PPO
 
 from topology import Topology
 from substrate import Substrate
-from embedding_dgl import GraphEmbedding
+from state_graph_embedding import GraphEmbedding
 from encoder_graph_embeddings import GraphTransformerEncoder, GraphPolicyNetwork, TopologyPolicyAgent
 from observation_strategies import get_observation_strategy_6_lightweight
 

@@ -514,7 +514,7 @@ if __name__ == '__main__':
     try:
         from topology import Topology
         from substrate import Substrate
-        from embedding_dgl import GraphEmbedding
+        from state_graph_embedding import GraphEmbedding
         
         print("\nTesting with real topology data...")
         

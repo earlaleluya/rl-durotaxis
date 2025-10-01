@@ -7,7 +7,7 @@ from stable_baselines3 import DQN, PPO
 
 from topology import Topology
 from substrate import Substrate
-from embedding_dgl import GraphEmbedding
+from state_graph_embedding import GraphEmbedding
 from encoder_graph_features import GraphInputEncoder, GraphPolicyNetwork, TopologyPolicyAgent
 
 
@@ -78,9 +78,9 @@ class DurotaxisEnv(gym.Env):
             encoder = GraphInputEncoder(
                 hidden_dim=self.hidden_dim,
                 out_dim=64,  # This matches encoder_out_dim above
-                num_layers=2
+                num_layers=4
             )
-            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim)
+            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim, noise_scale=0.1)
 
         # Store encoder output dimension for observation processing
         self.encoder_out_dim = 64
@@ -110,7 +110,7 @@ class DurotaxisEnv(gym.Env):
         encoder = GraphInputEncoder(
             hidden_dim=self.hidden_dim,
             out_dim=64,
-            num_layers=3
+            num_layers=4
         )
         
         policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim, noise_scale=0.1)
@@ -316,7 +316,6 @@ class DurotaxisEnv(gym.Env):
             return indices
 
 
-    # TODO review step
     def step(self, action):
         """
         Execute one time step using the graph transformer policy.

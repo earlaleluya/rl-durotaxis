@@ -18,9 +18,9 @@ import numpy as np
 
 class Topology:
     
-    def __init__(self, graph=None, substrate=None):
+    def __init__(self, dgl_graph=None, substrate=None):
         self.substrate = substrate
-        self.graph = graph if graph is not None else self.reset()
+        self.graph = dgl_graph if dgl_graph is not None else self.reset()
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
 
