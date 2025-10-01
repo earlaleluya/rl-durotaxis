@@ -30,6 +30,7 @@ class DurotaxisEnv(gym.Env):
                  embedding_dim=64,
                  hidden_dim=128,  
                  delta_time=3,
+                 delta_intensity=2.50,  
                  render_mode=None,
                  policy_agent=None):
         super().__init__()
@@ -44,12 +45,21 @@ class DurotaxisEnv(gym.Env):
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim 
         self.delta_time = delta_time
+        self.delta_intensity = delta_intensity  
         self.current_step = 0
         
         # Centroid tracking for fail termination
         self.centroid_history = []  # Store centroid x-coordinates
         self.consecutive_left_moves = 0  # Count consecutive leftward moves
         self.fail_threshold = 2 * self.delta_time  # Threshold for fail termination
+
+        # Topology tracking for substrate intensity comparison
+        self.topology_history = []
+        self.dequeued_topology = None  # Store the most recently dequeued topology
+        
+        # Node-level reward tracking
+        self.prev_node_positions = []  # Store previous node positions for movement rewards
+        self.last_reward_breakdown = None  # Store detailed reward information
         
         # 1. Action Space
         # Since the agent uses graph_transformer_policy_dgl.act_with_policy(),
@@ -350,10 +360,12 @@ class DurotaxisEnv(gym.Env):
         # Store previous state for reward calculation
         prev_state = self.state_extractor.get_state_features(include_substrate=True)
         prev_num_nodes = prev_state['num_nodes']
-
-        # Get previous topology
-        prev_topology = prev_state['topology']
-
+        
+        # Enqueue previous topology to history (maintain max capacity of delta_time)
+        self.topology_history.append(prev_state['topology'])
+        if len(self.topology_history) > self.delta_time:
+            # Dequeue the oldest topology to maintain capacity
+            self.dequeued_topology = self.topology_history.pop(0)  # Remove from front (FIFO)
         
         # Execute actions using the policy network
         if self.policy_agent is not None and prev_num_nodes > 0:
@@ -372,14 +384,14 @@ class DurotaxisEnv(gym.Env):
         # Get new state
         new_state = self.state_extractor.get_state_features(include_substrate=True)
         
-        # Get next topology
-        next_topology = new_state['topology']
-
         # Get observation from GraphInputEncoder output
         observation = self._get_encoder_observation(new_state)
         
-        # TODO Calculate reward (simplified version without DGL graphs)
+        # Calculate reward 
         reward = self._calculate_reward(prev_state, new_state, executed_actions)
+        
+        # Reset new_node flags after reward calculation (they've served their purpose)
+        self._reset_new_node_flags()
         
         # Check termination conditions
         terminated = self._check_terminated(new_state)
@@ -391,84 +403,200 @@ class DurotaxisEnv(gym.Env):
             'num_edges': new_state['num_edges'],
             'actions_taken': len(executed_actions),
             'step': self.current_step,
-            'policy_initialized': self._policy_initialized
+            'policy_initialized': self._policy_initialized,
+            'reward_breakdown': self.last_reward_breakdown  # Detailed reward information
         }
         
         return observation, reward, terminated, truncated, info
 
-    def _calculate_reward(self, prev_state, new_state, actions, prev_dgl=None, next_dgl=None):
+    def _calculate_reward(self, prev_state, new_state, actions):
         """
         Calculate reward based on topology evolution and substrate exploration.
-        Now includes DGL graph analysis for more sophisticated reward calculation.
+        Returns scalar reward (graph-level + aggregated node-level).
         """
-        reward = 0.0
+        # Initialize reward components
+        graph_reward = 0.0
+        node_rewards = []
         
-        # Basic survival reward
-        reward += 0.1
+        # === GRAPH-LEVEL REWARDS ===
         
-        # DGL-based reward calculations
-        if prev_dgl is not None and next_dgl is not None:
-            # Example: Calculate graph-based metrics using DGL
-            import dgl
-            
-            # Connectivity analysis
-            if next_dgl.num_nodes() > 1:
-                # Graph density
-                density = next_dgl.num_edges() / (next_dgl.num_nodes() * (next_dgl.num_nodes() - 1))
-                reward += density * 2.0
-                
-                # Clustering coefficient (if available)
-                try:
-                    # You can add more sophisticated graph metrics here
-                    # Example: average clustering coefficient, betweenness centrality, etc.
-                    pass
-                except:
-                    pass
-            
-            # Structural changes reward
-            if prev_dgl.num_nodes() > 0:
-                # Reward for growth
-                node_growth = next_dgl.num_nodes() - prev_dgl.num_nodes()
-                edge_growth = next_dgl.num_edges() - prev_dgl.num_edges()
-                
-                # Moderate growth is good
-                if 0 <= node_growth <= 2:
-                    reward += node_growth * 0.5
-                elif node_growth > 2:
-                    reward -= (node_growth - 2) * 0.3  # Penalty for too rapid growth
-                
-                if edge_growth > 0:
-                    reward += edge_growth * 0.2
-        
-        # Fallback to original reward if DGL graphs not available
-        else:
-            # Reward for maintaining connectivity
-            if new_state['num_nodes'] > 1:
-                density = new_state['num_edges'] / (new_state['num_nodes'] * (new_state['num_nodes'] - 1))
-                reward += density * 2.0
-        
-        # Reward for substrate exploration (using graph features)
-        graph_features = new_state['graph_features']
-        if len(graph_features) > 10:  # Ensure we have enough features
-            # Reward based on spatial coverage (bbox area)
-            bbox_area = graph_features[10].item() if len(graph_features) > 10 else 0.0
-            reward += bbox_area * 0.01
-            
-            # Reward based on convex hull area
-            hull_area = graph_features[-2].item() if len(graph_features) > 12 else 0.0
-            reward += hull_area * 0.005
-        
-        # Penalty for too many or too few nodes
+        # Penalty for too many (N > Nc) or too few nodes (N < 2)
         num_nodes = new_state['num_nodes']
         if num_nodes < 2:
-            reward -= 5.0  # Strong penalty for losing all connectivity
+            graph_reward -= 5.0  # Strong penalty for losing all connectivity
         elif num_nodes > self.max_nodes:
-            reward -= 2.0  # Penalty for excessive growth
-        
+            graph_reward -= 10.0  # Penalty for excessive growth, N > Nc
+        else:
+            graph_reward += 0.01 # Basic survival reward
+
         # Small reward for taking actions (encourages exploration)
-        reward += len(actions) * 0.05
+        graph_reward += len(actions) * 0.005
         
-        return reward
+        # === SPAWN REWARD: Durotaxis-based spawning ===
+        spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
+        graph_reward += spawn_reward
+        
+        
+        # === NODE-LEVEL REWARDS ===
+        
+        if num_nodes > 0:
+            node_features = new_state['node_features']
+            
+            for i in range(num_nodes):
+                node_reward = 0.0
+                
+                # 1. Position-based rewards (durotaxis progression)
+                node_x = node_features[i][0].item()  # x-coordinate
+                node_y = node_features[i][1].item()  # y-coordinate
+                
+                # Reward for moving rightward (positive durotaxis)
+                if hasattr(self, 'prev_node_positions') and i < len(self.prev_node_positions):
+                    prev_x = self.prev_node_positions[i][0]
+                    x_movement = node_x - prev_x
+                    node_reward += x_movement * 0.01  # Reward rightward movement
+                
+                # 2. Substrate intensity rewards
+                if len(node_features[i]) > 2: 
+                    substrate_intensity = node_features[i][2].item()
+                    node_reward += substrate_intensity * 0.05  # Reward higher stiffness areas                # 3. Boundary position rewards
+                if len(node_features[i]) > 7:  # Assuming boundary flag is at index 7
+                    is_boundary = node_features[i][7].item()
+                    if is_boundary > 0.5:  # Node is on boundary
+                        node_reward += 0.1  # Small bonus for frontier nodes
+                
+                # 4. Positional penalties (avoid substrate edges)
+                substrate_width = self.substrate.width
+                substrate_height = self.substrate.height
+                
+                # Penalty for being too close to left edge (opposite of durotaxis)
+                if node_x < substrate_width * 0.1:
+                    node_reward -= 0.2
+                
+                # Penalty for being too close to top/bottom edges
+                if node_y < substrate_height * 0.1 or node_y > substrate_height * 0.9:
+                    node_reward -= 0.1
+                
+                node_rewards.append(node_reward)
+            
+            # Store current positions for next step
+            self.prev_node_positions = [(node_features[i][0].item(), node_features[i][1].item()) 
+                                       for i in range(num_nodes)]
+        
+        # === COMBINE REWARDS ===
+        
+        # Aggregate node rewards (you can use different strategies)
+        if node_rewards:
+            # Strategy 1: Simple sum
+            total_node_reward = sum(node_rewards)
+            
+            # Strategy 2: Average (uncomment to use)
+            # total_node_reward = sum(node_rewards) / len(node_rewards)
+            
+            # Strategy 3: Weighted combination (uncomment to use)
+            # total_node_reward = sum(node_rewards) * (num_nodes / self.max_nodes)
+        else:
+            total_node_reward = 0.0
+        
+        # Final combined reward
+        total_reward = graph_reward + total_node_reward
+        
+        # Store detailed reward information for analysis
+        self.last_reward_breakdown = {
+            'total_reward': total_reward,
+            'graph_reward': graph_reward,
+            'spawn_reward': spawn_reward,
+            'node_rewards': node_rewards,
+            'total_node_reward': total_node_reward,
+            'num_nodes': num_nodes
+        }
+        
+        return total_reward
+
+    def _calculate_spawn_reward(self, prev_state, new_state, actions):
+        """
+        Calculate reward for durotaxis-based spawning.
+        
+        Reward rule: If a node spawns a new node and the substrate intensity 
+        of the new node is >= delta_intensity higher than the spawning node,
+        then reward += 1.0
+        
+        Args:
+            prev_state: Previous topology state
+            new_state: Current topology state  
+            actions: Actions taken (should include spawn actions)
+            
+        Returns:
+            float: Spawn reward (1.0 per qualifying spawn, 0.0 otherwise)
+        """
+        spawn_reward = 0.0
+        
+        # Get node features from both states
+        new_node_features = new_state['node_features']
+        new_num_nodes = new_state['num_nodes']
+        
+        if new_num_nodes == 0:
+            return spawn_reward
+        
+        # Use new_node flag to identify newly spawned nodes
+        # The new_node flag is the last feature in the node feature vector
+        for node_idx in range(new_num_nodes):
+            if node_idx < len(new_node_features):
+                node_feature_vector = new_node_features[node_idx]
+                
+                # Check if this is a newly spawned node (new_node flag = 1.0)
+                if len(node_feature_vector) > 0:
+                    new_node_flag = node_feature_vector[-1].item()  # Last feature is new_node flag
+                    
+                    if new_node_flag == 1.0:  # This is a newly spawned node
+                        # Get substrate intensity (3rd feature, index 2)
+                        if len(node_feature_vector) > 2:
+                            new_node_intensity = node_feature_vector[2].item()
+                            
+                            # Find parent node from previous state by checking actions
+                            # For now, we'll use spatial proximity as backup
+                            best_parent_intensity = None
+                            min_distance = float('inf')
+                            
+                            new_node_pos = node_feature_vector[:2]  # x, y coordinates
+                            
+                            # Check against previous state nodes
+                            if 'node_features' in prev_state:
+                                prev_node_features = prev_state['node_features']
+                                for prev_idx, prev_node in enumerate(prev_node_features):
+                                    if len(prev_node) > 2:
+                                        prev_node_pos = prev_node[:2]
+                                        distance = ((new_node_pos[0] - prev_node_pos[0])**2 + 
+                                                   (new_node_pos[1] - prev_node_pos[1])**2)**0.5
+                                        
+                                        if distance < min_distance:
+                                            min_distance = distance
+                                            best_parent_intensity = prev_node[2].item()
+                            
+                            # Check spawn reward condition
+                            if best_parent_intensity is not None:
+                                intensity_difference = new_node_intensity - best_parent_intensity
+                                
+                                if intensity_difference >= self.delta_intensity:
+                                    spawn_reward += 1.0
+                                    print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
+                                          f"Parent intensity: {best_parent_intensity:.3f}, "
+                                          f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
+                                else:
+                                    spawn_reward -= 1.0
+                                    print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
+                                          f"Parent intensity: {best_parent_intensity:.3f}, "
+                                          f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
+        
+        return spawn_reward
+
+    def _reset_new_node_flags(self):
+        """
+        Reset all new_node flags to 0.0 after reward calculation.
+        This ensures that nodes are only considered "new" for one step.
+        """
+        if hasattr(self.topology, 'graph') and 'new_node' in self.topology.graph.ndata:
+            num_nodes = self.topology.graph.num_nodes()
+            self.topology.graph.ndata['new_node'] = torch.zeros(num_nodes, dtype=torch.float32)
 
     def _check_terminated(self, state):
         """Check if the episode should terminate."""
@@ -516,6 +644,73 @@ class DurotaxisEnv(gym.Env):
         
         return False
 
+    def get_topology_history(self):
+        """
+        Get the current topology history queue.
+        
+        Returns:
+            list: List of previous topologies (max length = delta_time)
+                 Index 0 = oldest, Index -1 = most recent
+        """
+        return self.topology_history.copy()  # Return a copy to prevent external modification
+
+    def get_topology_history_length(self):
+        """Get the current length of topology history queue."""
+        return len(self.topology_history)
+
+    def get_dequeued_topology(self):
+        """
+        Get the most recently dequeued topology.
+        
+        Returns:
+            Topology or None: The topology that was most recently removed from 
+                            the queue, or None if no topology has been dequeued yet
+        """
+        return self.dequeued_topology
+
+    def get_node_rewards(self):
+        """
+        Get the individual node rewards from the last step.
+        
+        Returns:
+            list: List of individual node rewards, empty if no rewards calculated yet
+        """
+        if self.last_reward_breakdown:
+            return self.last_reward_breakdown['node_rewards']
+        return []
+
+    def get_reward_breakdown(self):
+        """
+        Get the complete reward breakdown from the last step.
+        
+        Returns:
+            dict: Dictionary containing detailed reward information
+        """
+        return self.last_reward_breakdown if self.last_reward_breakdown else {}
+
+    def get_average_node_reward(self):
+        """
+        Get the average node reward from the last step.
+        
+        Returns:
+            float: Average node reward, 0.0 if no nodes
+        """
+        node_rewards = self.get_node_rewards()
+        if node_rewards:
+            return sum(node_rewards) / len(node_rewards)
+        return 0.0
+
+    def get_spawn_reward(self):
+        """
+        Get the spawn reward from the last step.
+        
+        Returns:
+            float: Spawn reward, 0.0 if no qualifying spawns
+        """
+        if self.last_reward_breakdown:
+            return self.last_reward_breakdown.get('spawn_reward', 0.0)
+        return 0.0
+
     def reset(self, seed=None, options=None):
         """Reset the environment to initial state."""
         super().reset(seed=seed)
@@ -526,6 +721,14 @@ class DurotaxisEnv(gym.Env):
         # Reset centroid tracking for fail termination
         self.centroid_history = []
         self.consecutive_left_moves = 0
+        
+        # Reset topology history
+        self.topology_history = []
+        self.dequeued_topology = None
+        
+        # Reset node-level reward tracking
+        self.prev_node_positions = []
+        self.last_reward_breakdown = None
         
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)

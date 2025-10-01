@@ -12,7 +12,7 @@ class GraphInputEncoder(nn.Module):
     
     This encoder processes graph-structured data representing cellular topology with:
     - Graph-level features (14 dimensions): Global properties [num_nodes, num_edges, density, centroid_x, centroid_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y, bbow_width, bbox_height, bbox_area, hull_area, avg_degree]
-    - Node-level features (8 dimensions): Per-cell properties [node_x, node_y, substrate_intensity, in_degree, out_degree, centrality, centroid_distance, is_boundary]  
+    - Node-level features (9 dimensions): Per-cell properties [node_x, node_y, substrate_intensity, in_degree, out_degree, centrality, centroid_distance, is_boundary, new_node_flag]  
     - Edge-level features (3 dimensions): Connection properties [distances, direction_norm_x, direction_norm_y]
     
     Architecture:
@@ -58,7 +58,7 @@ class GraphInputEncoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
         # Node projection
-        self.node_proj = nn.Linear(8, hidden_dim)
+        self.node_proj = nn.Linear(9, hidden_dim)
         # Edge projection
         self.edge_mlp = nn.Sequential(
             nn.Linear(3, hidden_dim),

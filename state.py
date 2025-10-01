@@ -80,21 +80,6 @@ class TopologyState:
         
         return state
 
-    def to_dgl(self, embedding_dim=None):
-        """
-        Backward compatibility method to return the DGL graph.
-        
-        Parameters
-        ----------
-        embedding_dim : int, optional
-            Ignored for backward compatibility
-            
-        Returns
-        -------
-        dgl.DGLGraph : The DGL graph from topology
-        """
-        return self.graph
-
     def _get_node_features(self, include_substrate=True):
         """
         Extract node-level features for each node in the graph.
@@ -109,6 +94,7 @@ class TopologyState:
             - Centrality measure
             - Distance from graph centroid
             - Boundary flag (convex hull membership)
+            - New node flag (1.0 if newly spawned, 0.0 if existing)
         """
         positions = self.graph.ndata['pos']
         num_nodes = positions.shape[0]
@@ -139,6 +125,14 @@ class TopologyState:
         # 6. Boundary membership
         boundary_flags = self._get_boundary_flags()
         features.append(boundary_flags)
+        
+        # 7. New node flag
+        if 'new_node' in self.graph.ndata:
+            new_node_flags = self.graph.ndata['new_node'].unsqueeze(1)
+        else:
+            # Default to all zeros if new_node flag not initialized
+            new_node_flags = torch.zeros(num_nodes, 1, dtype=torch.float32)
+        features.append(new_node_flags)
         
         return torch.cat(features, dim=1)
 
