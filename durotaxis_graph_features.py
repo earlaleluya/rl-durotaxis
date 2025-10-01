@@ -8,8 +8,8 @@ from stable_baselines3 import DQN, PPO
 from topology import Topology
 from substrate import Substrate
 from embedding_dgl import GraphEmbedding
-from graph_transformer_policy_dgl import GraphTransformerEncoder, GraphPolicyNetwork, TopologyPolicyAgent
-from observation_strategies import get_observation_strategy_6_lightweight
+from encoder_graph_features import GraphInputEncoder, GraphPolicyNetwork, TopologyPolicyAgent
+
 
 
 class DurotaxisEnv(gym.Env):
@@ -50,12 +50,16 @@ class DurotaxisEnv(gym.Env):
         self.action_space = spaces.Discrete(1)  # Dummy action - actual actions come from policy network
 
         # 2. Observation Space
-        # The observation space accommodates graph embeddings from the GraphEmbedding class.
-        # Since graph size is dynamic, we use a fixed-size embedding representation.
+        # The observation space uses encoder_out from GraphPolicyNetwork (GraphInputEncoder output).
+        # Shape: [num_nodes+1, out_dim] where first element is graph token, rest are node embeddings
+        max_nodes_plus_graph = self.max_nodes + 1  # +1 for graph token
+        encoder_out_dim = 64  # Default out_dim from GraphInputEncoder
+        obs_dim = max_nodes_plus_graph * encoder_out_dim
+        
         self.observation_space = spaces.Box(
             low=-np.inf, 
             high=np.inf, 
-            shape=(self.embedding_dim,), 
+            shape=(obs_dim,), 
             dtype=np.float32
         )
         
@@ -66,29 +70,20 @@ class DurotaxisEnv(gym.Env):
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
         
-        # Create policy network for enhanced observations
+        # Create policy network for encoder-based observations
         if policy_agent is not None:
             self.observation_policy = policy_agent.policy
         else:
-            # Create a separate encoder just for observations
-            node_dim = embedding_dim  # From your embedding
-            graph_dim = embedding_dim  # From your embedding
-            encoder = GraphTransformerEncoder(
-                node_dim=node_dim,
-                graph_dim=graph_dim, 
-                hidden_dim=self.hidden_dim,  # Use instance variable
+            # Create a separate encoder for observations
+            encoder = GraphInputEncoder(
+                hidden_dim=self.hidden_dim,
+                out_dim=64,  # This matches encoder_out_dim above
                 num_layers=2
             )
-            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim)  # Use instance variable
+            self.observation_policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim)
 
-        # Update observation space for Strategy 6
-        obs_dim = self.hidden_dim * 5  # hidden_dim * 5 (graph + mean + std + min + max)
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf, 
-            shape=(obs_dim,),
-            dtype=np.float32
-        )
+        # Store encoder output dimension for observation processing
+        self.encoder_out_dim = 64
 
     def _setup_environment(self):
         """Initialize substrate, topology, embedding, and policy components."""
@@ -111,20 +106,11 @@ class DurotaxisEnv(gym.Env):
         if self._policy_initialized:
             return
             
-        # Get initial state to determine dimensions
-        state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
-        
-        node_dim = state['node_embeddings'].shape[1] if state['num_nodes'] > 0 else self.embedding_dim
-        graph_dim = state['graph_embedding'].shape[0]
-        
-        # Create policy network
-        encoder = GraphTransformerEncoder(
-            node_dim=node_dim,
-            graph_dim=graph_dim,
+        # Create policy network using GraphInputEncoder
+        encoder = GraphInputEncoder(
             hidden_dim=self.hidden_dim,
-            num_layers=2,
-            num_heads=4,
-            dropout=0.1
+            out_dim=64,
+            num_layers=3
         )
         
         policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim, noise_scale=0.1)
@@ -132,6 +118,202 @@ class DurotaxisEnv(gym.Env):
         # Create policy agent
         self.policy_agent = TopologyPolicyAgent(self.topology, self.embedding, policy)
         self._policy_initialized = True
+
+    def _get_encoder_observation(self, state):
+        """
+        Get observation from GraphPolicyNetwork encoder_out with semantic pooling.
+        
+        Args:
+            state: State dictionary from embedding.get_state_embedding()
+            
+        Returns:
+            np.ndarray: Fixed-size observation vector from encoder_out
+            
+        Note:
+            Uses semantic pooling when num_nodes > max_nodes to preserve representative
+            nodes based on their features rather than arbitrary truncation.
+        """
+        try:
+            # Get policy output which includes encoder_out
+            policy_output = self.observation_policy(state, deterministic=True)
+            encoder_out = policy_output['encoder_out']  # Shape: [num_nodes+1, out_dim]
+            
+            # Check for potential information reduction
+            actual_nodes = encoder_out.shape[0] - 1  # -1 for graph token
+            max_size = (self.max_nodes + 1) * self.encoder_out_dim
+            
+            if actual_nodes <= self.max_nodes:
+                # Normal case: no pooling needed
+                print(f"✅ No pooling needed: {actual_nodes} nodes ≤ {self.max_nodes} max_nodes")
+                encoder_flat = encoder_out.flatten().detach().cpu().numpy()
+                
+                # Pad with zeros if smaller than max size
+                padded = np.zeros(max_size, dtype=np.float32)
+                padded[:len(encoder_flat)] = encoder_flat
+                return padded
+            
+            else:
+                # 🧠 SEMANTIC POOLING: Intelligently select representative nodes
+                print(f"🧠 Applying semantic pooling: {actual_nodes} nodes > {self.max_nodes} max_nodes")
+                
+                graph_token = encoder_out[0:1]  # [1, out_dim] - Always preserve graph token
+                node_embeddings = encoder_out[1:]  # [actual_nodes, out_dim]
+                
+                # Extract semantic features for clustering
+                selected_indices = self._semantic_node_selection(
+                    node_embeddings, 
+                    state, 
+                    target_count=self.max_nodes
+                )
+                
+                # Select representative nodes
+                selected_nodes = node_embeddings[selected_indices]
+                
+                # Combine graph token with selected nodes
+                pooled_embeddings = torch.cat([graph_token, selected_nodes], dim=0)
+                
+                print(f"  📊 Pooling results:")
+                print(f"    - Original nodes: {actual_nodes}")
+                print(f"    - Selected nodes: {len(selected_indices)}")
+                print(f"    - Selected indices: {sorted(selected_indices.tolist())}")
+                print(f"    - Information preserved: {len(selected_indices)/actual_nodes*100:.1f}%")
+                
+                # Flatten and pad to fixed size
+                pooled_flat = pooled_embeddings.flatten().detach().cpu().numpy()
+                padded = np.zeros(max_size, dtype=np.float32)
+                padded[:len(pooled_flat)] = pooled_flat
+                
+                return padded
+                
+        except Exception as e:
+            print(f"Error getting encoder observation: {e}")
+            # Fallback to zero observation
+            return np.zeros((self.max_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
+
+    def _semantic_node_selection(self, node_embeddings, state, target_count):
+        """
+        Intelligently select representative nodes using semantic features.
+        
+        Args:
+            node_embeddings: [num_nodes, out_dim] tensor of node embeddings
+            state: State dictionary with node features
+            target_count: Number of nodes to select
+            
+        Returns:
+            torch.Tensor: Indices of selected nodes
+        """
+        import torch
+        import numpy as np
+        from sklearn.cluster import KMeans
+        
+        num_nodes = node_embeddings.shape[0]
+        
+        try:
+            # Strategy 1: Use raw node features for semantic clustering
+            node_features = state['node_features']  # [num_nodes, 8] - rich feature set
+            
+            if node_features.shape[0] != num_nodes:
+                # Fallback to uniform sampling if feature mismatch
+                print(f"    ⚠️ Feature mismatch, using uniform sampling")
+                indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long)
+                return indices
+            
+            # Convert to numpy for clustering
+            features_np = node_features.detach().cpu().numpy()
+            
+            # Strategy 2: Multi-criteria semantic selection
+            selected_indices = []
+            
+            # A. Spatial diversity (based on position features - first 2 dims)
+            if features_np.shape[1] >= 2:
+                positions = features_np[:, :2]  # x, y coordinates
+                spatial_clusters = min(target_count // 3, 8)  # 1/3 for spatial diversity
+                
+                if spatial_clusters > 1:
+                    try:
+                        kmeans_spatial = KMeans(n_clusters=spatial_clusters, random_state=42, n_init=10)
+                        spatial_labels = kmeans_spatial.fit_predict(positions)
+                        
+                        # Select one representative from each spatial cluster
+                        for cluster_id in range(spatial_clusters):
+                            cluster_nodes = np.where(spatial_labels == cluster_id)[0]
+                            if len(cluster_nodes) > 0:
+                                # Choose node closest to cluster centroid
+                                centroid = kmeans_spatial.cluster_centers_[cluster_id]
+                                distances = np.linalg.norm(positions[cluster_nodes] - centroid, axis=1)
+                                best_idx = cluster_nodes[np.argmin(distances)]
+                                selected_indices.append(best_idx)
+                        
+                        print(f"    🗺️ Spatial clustering: {len(selected_indices)} nodes from {spatial_clusters} regions")
+                    except:
+                        pass
+            
+            # B. Feature diversity (based on all features)
+            remaining_slots = target_count - len(selected_indices)
+            if remaining_slots > 0:
+                # Select nodes not already chosen
+                available_indices = list(set(range(num_nodes)) - set(selected_indices))
+                
+                if len(available_indices) > remaining_slots:
+                    try:
+                        # Cluster remaining nodes by feature similarity
+                        available_features = features_np[available_indices]
+                        feature_clusters = min(remaining_slots, len(available_indices))
+                        
+                        if feature_clusters > 1:
+                            kmeans_features = KMeans(n_clusters=feature_clusters, random_state=42, n_init=10)
+                            feature_labels = kmeans_features.fit_predict(available_features)
+                            
+                            # Select representative from each feature cluster
+                            for cluster_id in range(feature_clusters):
+                                cluster_mask = (feature_labels == cluster_id)
+                                if np.any(cluster_mask):
+                                    cluster_indices = np.array(available_indices)[cluster_mask]
+                                    # Choose node closest to cluster centroid
+                                    centroid = kmeans_features.cluster_centers_[cluster_id]
+                                    distances = np.linalg.norm(available_features[cluster_mask] - centroid, axis=1)
+                                    best_local_idx = np.argmin(distances)
+                                    best_global_idx = cluster_indices[best_local_idx]
+                                    selected_indices.append(best_global_idx)
+                            
+                            print(f"    🎯 Feature clustering: +{len(selected_indices) - len(selected_indices[:spatial_clusters if 'spatial_clusters' in locals() else 0])} diverse nodes")
+                        else:
+                            # Just take the available nodes
+                            selected_indices.extend(available_indices[:remaining_slots])
+                    except Exception as e:
+                        print(f"    ⚠️ Feature clustering failed: {e}")
+                        # Fallback: uniform sampling from remaining
+                        selected_indices.extend(available_indices[:remaining_slots])
+                else:
+                    # Take all remaining nodes
+                    selected_indices.extend(available_indices)
+            
+            # C. Fill remaining slots with uniform sampling if needed
+            if len(selected_indices) < target_count:
+                available_indices = list(set(range(num_nodes)) - set(selected_indices))
+                remaining_needed = target_count - len(selected_indices)
+                
+                if available_indices:
+                    # Uniform sampling from remaining
+                    step = max(1, len(available_indices) // remaining_needed)
+                    additional = available_indices[::step][:remaining_needed]
+                    selected_indices.extend(additional)
+                    print(f"    📐 Uniform fill: +{len(additional)} nodes to reach target")
+            
+            # Ensure we don't exceed target count
+            selected_indices = selected_indices[:target_count]
+            
+            # Sort indices for consistent ordering
+            selected_indices = sorted(selected_indices)
+            
+            return torch.tensor(selected_indices, dtype=torch.long)
+            
+        except Exception as e:
+            print(f"    ❌ Semantic selection failed: {e}")
+            # Fallback to uniform sampling
+            indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long)
+            print(f"    🔄 Fallback to uniform sampling: {target_count} nodes")
+            return indices
 
     def step(self, action):
         """
@@ -167,12 +349,8 @@ class DurotaxisEnv(gym.Env):
         # Get next DGL graph
         next_dgl = self.embedding.to_dgl(embedding_dim=self.embedding_dim)
         
-        # Strategy 6: Enhanced observation using policy network
-        observation = get_observation_strategy_6_lightweight(
-            new_state, 
-            self.observation_policy, 
-            device='cpu'
-        )
+        # Get observation from GraphInputEncoder output
+        observation = self._get_encoder_observation(new_state)
         
         # Calculate reward with DGL graphs
         reward = self._calculate_reward(prev_state, new_state, executed_actions, prev_dgl, next_dgl)
@@ -291,9 +469,11 @@ class DurotaxisEnv(gym.Env):
         # Initialize policy if not done yet
         self._initialize_policy()
         
-        # Get initial observation
+        # Get initial observation using encoder_out
         state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
-        observation = state['graph_embedding'].numpy().astype(np.float32)
+        
+        # Get observation from GraphInputEncoder output
+        observation = self._get_encoder_observation(state)
         
         info = {
             'num_nodes': state['num_nodes'],

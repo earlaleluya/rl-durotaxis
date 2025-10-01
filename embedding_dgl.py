@@ -83,7 +83,7 @@ class GraphEmbedding:
             'node_features': node_features,              # Shape: [num_nodes, node_feature_dim]
             'num_nodes': self.graph.num_nodes(),
             'num_edges': self.graph.num_edges(),
-            'topology': self.topology()
+            'topology': self.topology
         }
         
         return state
@@ -180,44 +180,49 @@ class GraphEmbedding:
         
         features.extend([num_nodes, num_edges, density])
         
-        # Spatial statistics
-        centroid = torch.mean(positions, dim=0)
-        features.append(centroid)
-        
-        # Bounding box
+        # Spatial statistics - ensure all are 1D tensors
         if num_nodes > 0:
-            bbox_min = torch.min(positions, dim=0)[0]
-            bbox_max = torch.max(positions, dim=0)[0]
-            bbox_size = bbox_max - bbox_min
-            bbox_area = torch.prod(bbox_size) if len(bbox_size) > 1 else bbox_size[0]
+            centroid = torch.mean(positions, dim=0)  # [2] for 2D positions
+            # Bounding box
+            bbox_min = torch.min(positions, dim=0)[0]  # [2]
+            bbox_max = torch.max(positions, dim=0)[0]  # [2]
+            bbox_size = bbox_max - bbox_min  # [2]
+            bbox_area = torch.prod(bbox_size) if len(bbox_size) > 1 else bbox_size[0]  # scalar
+            bbox_area = bbox_area.unsqueeze(0) if bbox_area.dim() == 0 else bbox_area  # [1]
         else:
+            centroid = torch.zeros(2)
             bbox_min = torch.zeros(2)
             bbox_max = torch.zeros(2)
             bbox_size = torch.zeros(2)
-            bbox_area = torch.tensor(0.0)
+            bbox_area = torch.zeros(1)
         
-        features.extend([bbox_min, bbox_max, bbox_size, bbox_area.unsqueeze(0)])
+        # Add all spatial features - concatenate vectors properly
+        features.append(centroid)  # [2]
+        features.append(bbox_min)  # [2]
+        features.append(bbox_max)  # [2]
+        features.append(bbox_size)  # [2]
+        features.append(bbox_area)  # [1]
         
         # Convex hull area (if possible)
         try:
             if num_nodes >= 3:
                 hull = ConvexHull(positions.numpy())
-                hull_area = torch.tensor([hull.volume], dtype=torch.float32)  # 'volume' is area in 2D
+                hull_area = torch.tensor([hull.volume], dtype=torch.float32)  # [1]
             else:
-                hull_area = torch.tensor([0.0])
+                hull_area = torch.tensor([0.0])  # [1]
         except:
-            hull_area = torch.tensor([0.0])
+            hull_area = torch.tensor([0.0])  # [1]
         
         features.append(hull_area)
         
         # Average node degree
         if num_nodes > 0:
             degrees = self._get_node_degrees()
-            avg_degree = torch.mean(degrees)
+            avg_degree = torch.mean(degrees).unsqueeze(0)  # [1]
         else:
-            avg_degree = torch.tensor([0.0])
+            avg_degree = torch.tensor([0.0])  # [1]
         
-        features.append(avg_degree.unsqueeze(0))
+        features.append(avg_degree)
         
         return torch.cat(features, dim=0)
 
