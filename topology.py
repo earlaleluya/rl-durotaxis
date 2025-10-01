@@ -71,8 +71,18 @@ class Topology:
             return torch.empty(0, 1, dtype=torch.float32)
         
         intensities = []
+        substrate_shape = self.substrate.signal_matrix.shape if hasattr(self.substrate, 'signal_matrix') else (0, 0)
+        
         for i in range(num_nodes):
             pos = positions[i].numpy()
+            
+            # Debug: Check if position is out of bounds
+            x, y = int(pos[0]), int(pos[1])
+            if (x < 0 or y < 0 or 
+                (substrate_shape[1] > 0 and x >= substrate_shape[1]) or 
+                (substrate_shape[0] > 0 and y >= substrate_shape[0])):
+                print(f"⚠️ Node {i} position out of bounds: ({x}, {y}) vs substrate shape {substrate_shape}")
+            
             intensity = self.substrate.get_intensity(pos)
             intensities.append(intensity)
         

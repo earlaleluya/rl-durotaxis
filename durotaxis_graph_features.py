@@ -315,6 +315,8 @@ class DurotaxisEnv(gym.Env):
             print(f"    🔄 Fallback to uniform sampling: {target_count} nodes")
             return indices
 
+
+    # TODO review step
     def step(self, action):
         """
         Execute one time step using the graph transformer policy.
