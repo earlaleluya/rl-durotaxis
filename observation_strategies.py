@@ -175,7 +175,7 @@ def get_observation_strategy_6_attention_based_statistical(new_state, policy_net
     - Statistical summaries of processed node_emb (context-aware node features)
     
     Args:
-        new_state: Full state from embedding.get_state_embedding()
+        new_state: Full state from state_extractor.get_state_features()
         policy_network: Your GraphPolicyNetwork instance
         device: torch device
         

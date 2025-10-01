@@ -7,7 +7,7 @@ from stable_baselines3 import DQN, PPO
 
 from topology import Topology
 from substrate import Substrate
-from state_graph_embedding import GraphEmbedding
+from state import TopologyState
 from encoder_graph_embeddings import GraphTransformerEncoder, GraphPolicyNetwork, TopologyPolicyAgent
 from observation_strategies import get_observation_strategy_6_lightweight
 
@@ -50,7 +50,7 @@ class DurotaxisEnv(gym.Env):
         self.action_space = spaces.Discrete(1)  # Dummy action - actual actions come from policy network
 
         # 2. Observation Space
-        # The observation space accommodates graph embeddings from the GraphEmbedding class.
+        # The observation space accommodates graph embeddings from the TopologyState class.
         # Since graph size is dynamic, we use a fixed-size embedding representation.
         self.observation_space = spaces.Box(
             low=-np.inf, 
@@ -91,7 +91,7 @@ class DurotaxisEnv(gym.Env):
         )
 
     def _setup_environment(self):
-        """Initialize substrate, topology, embedding, and policy components."""
+        """Initialize substrate, topology, state extractor, and policy components."""
         # Create substrate
         self.substrate = Substrate(self.substrate_size)
         self.substrate.create(self.substrate_type, **self.substrate_params)
@@ -99,8 +99,8 @@ class DurotaxisEnv(gym.Env):
         # Create topology
         self.topology = Topology(substrate=self.substrate)
         
-        # Create embedding system
-        self.embedding = GraphEmbedding(self.topology)
+        # Create state extractor
+        self.state_extractor = TopologyState(self.topology)
         
         # Initialize policy network (will be set up after first reset)
         self.policy_agent = None
@@ -112,7 +112,7 @@ class DurotaxisEnv(gym.Env):
             return
             
         # Get initial state to determine dimensions
-        state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+        state = self.state_extractor.get_state_features(include_substrate=True)
         
         node_dim = state['node_embeddings'].shape[1] if state['num_nodes'] > 0 else self.embedding_dim
         graph_dim = state['graph_embedding'].shape[0]
@@ -141,11 +141,11 @@ class DurotaxisEnv(gym.Env):
         self.current_step += 1
         
         # Store previous state for reward calculation
-        prev_state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+        prev_state = self.state_extractor.get_state_features(include_substrate=True)
         prev_num_nodes = prev_state['num_nodes']
         
         # Get previous DGL graph 
-        prev_dgl = self.embedding.to_dgl(embedding_dim=self.embedding_dim)
+        prev_dgl = self.state_extractor.to_dgl()
         
         # Execute actions using the policy network
         if self.policy_agent is not None and prev_num_nodes > 0:
@@ -162,10 +162,10 @@ class DurotaxisEnv(gym.Env):
             executed_actions = self.topology.act()
         
         # Get new state
-        new_state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+        new_state = self.state_extractor.get_state_features(include_substrate=True)
         
         # Get next DGL graph
-        next_dgl = self.embedding.to_dgl(embedding_dim=self.embedding_dim)
+        next_dgl = self.state_extractor.to_dgl()
         
         # Strategy 6: Enhanced observation using policy network
         observation = get_observation_strategy_6_lightweight(
@@ -292,7 +292,7 @@ class DurotaxisEnv(gym.Env):
         self._initialize_policy()
         
         # Get initial observation
-        state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+        state = self.state_extractor.get_state_features(include_substrate=True)
         observation = state['graph_embedding'].numpy().astype(np.float32)
         
         info = {
@@ -307,7 +307,7 @@ class DurotaxisEnv(gym.Env):
     def render(self):
         """Render the current state of the environment."""
         if self.render_mode == "human":
-            state = self.embedding.get_state_embedding(embedding_dim=self.embedding_dim)
+            state = self.state_extractor.get_state_features(include_substrate=True)
             print(f"Step {self.current_step}: {state['num_nodes']} nodes, {state['num_edges']} edges")
             
             # Optional: visualize the topology

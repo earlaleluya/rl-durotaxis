@@ -261,7 +261,7 @@ class GraphPolicyNetwork(nn.Module):
         Forward pass using embedding state.
         
         Args:
-            state_dict: State from embedding.get_state_embedding()
+            state_dict: State from state_extractor.get_state_features()
             deterministic: Whether to sample or use deterministic actions
             max_gamma: Upper bound for gamma parameter
             max_alpha: Upper bound for alpha parameter
@@ -430,9 +430,9 @@ class TopologyPolicyAgent:
     Uses GraphTransformer instead of GAT layers.
     """
     
-    def __init__(self, topology, embedding, policy_network):
+    def __init__(self, topology, state_extractor, policy_network):
         self.topology = topology
-        self.embedding = embedding
+        self.state_extractor = state_extractor
         self.policy = policy_network
         
     def get_policy_actions(self, embedding_dim: int = 64, deterministic: bool = False) -> Tuple[Dict[int, str], Dict[int, Tuple[float, float, float, float]]]:
@@ -442,8 +442,8 @@ class TopologyPolicyAgent:
         Returns:
             Tuple of (actions_dict, spawn_params_dict)
         """
-        # Get state embedding
-        state = self.embedding.get_state_embedding(embedding_dim=embedding_dim)
+        # Get state features
+        state = self.state_extractor.get_state_features(include_substrate=True)
         
         if state['num_nodes'] == 0:
             return {}, {}
@@ -514,7 +514,7 @@ if __name__ == '__main__':
     try:
         from topology import Topology
         from substrate import Substrate
-        from state_graph_embedding import GraphEmbedding
+        from state import TopologyState
         
         print("\nTesting with real topology data...")
         
@@ -525,9 +525,9 @@ if __name__ == '__main__':
         topology = Topology(substrate=substrate)
         topology.reset(init_num_nodes=5)
         
-        # Create embedding 
-        embedding = GraphEmbedding(topology)
-        state = embedding.get_state_embedding(embedding_dim=64)
+        # Create state extractor 
+        state_extractor = TopologyState(topology)
+        state = state_extractor.get_state_features(include_substrate=True)
         
         print(f"Real data shapes:")
         print(f"  Graph features: {state['graph_features'].shape}")
@@ -584,7 +584,7 @@ if __name__ == '__main__':
         
         # Test TopologyPolicyAgent
         print("\nTesting TopologyPolicyAgent...")
-        agent = TopologyPolicyAgent(topology, embedding, policy)
+        agent = TopologyPolicyAgent(topology, state_extractor, policy)
         
         # Test policy-based actions
         actions, spawn_params = agent.get_policy_actions(embedding_dim=64, deterministic=True)

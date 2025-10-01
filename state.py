@@ -4,15 +4,15 @@ import dgl
 from scipy.spatial import ConvexHull
 
 
-class GraphEmbedding:
+class TopologyState:
     """
-    Graph embedding class that works with Topology instances to create
-    state representations for RL algorithms.
+    Topology State class that extracts graph features, node features, and edge features
+    from Topology instances for RL algorithms and graph neural networks.
     """
     
     def __init__(self, topology=None):
         """
-        Initialize GraphEmbedding with a Topology instance.
+        Initialize TopologyState with a Topology instance.
         
         Parameters
         ----------
@@ -40,54 +40,60 @@ class GraphEmbedding:
             raise ValueError("No topology set. Use set_topology() first.")
         return self.topology.substrate
 
-    def get_state_embedding(self, embedding_dim=64, include_substrate=True):
+    def get_state_features(self, include_substrate=True):
         """
-        Get comprehensive state embedding combining graph-level and node-level features.
+        Get topology state features: graph features, node features, and edge features.
         
         Parameters
         ----------
-        embedding_dim : int
-            Dimension of the output embeddings
         include_substrate : bool
             Whether to include substrate intensity in node features
             
         Returns
         -------
         dict : State dictionary containing:
-            - 'graph_embedding': Global graph representation
-            - 'node_embeddings': Per-node feature matrix
-            - 'edge_index': Edge connectivity for GNN (DGL style: (src, dst) tuples)
-            - 'edge_attr': Edge attributes
-            - 'graph_features': Raw graph-level features
-            - 'node_features': Raw node-level features
+            - 'graph_features': Graph-level feature vector
+            - 'node_features': Node feature matrix [num_nodes, node_feature_dim]
+            - 'edge_attr': Edge feature matrix [num_edges, edge_feature_dim]
+            - 'edge_index': Edge connectivity (src, dst) tuples for GNN
+            - 'num_nodes': Number of nodes
+            - 'num_edges': Number of edges
         """
         
-        # Get raw features
+        # Extract the three main feature types
         node_features = self._get_node_features(include_substrate=include_substrate)
         edge_features = self._get_edge_features()
         graph_features = self._get_graph_features()
         
-        # Create embeddings
-        node_embeddings = self._create_node_embeddings(node_features, embedding_dim)
-        graph_embedding = self._create_graph_embedding(node_embeddings, graph_features, embedding_dim)
-        
-        # Get edge information for GNN
+        # Get edge connectivity for GNN
         src, dst = self.graph.edges()
         
         state = {
-            'graph_embedding': graph_embedding,          # Shape: [embedding_dim]
-            'node_embeddings': node_embeddings,          # Shape: [num_nodes, embedding_dim]
-            'edge_index': (src, dst),                    # DGL style edge representation
-            'edge_attr': edge_features,                  # Shape: [num_edges, edge_feature_dim]
+            'topology': self.topology,                   
             'graph_features': graph_features,            # Shape: [graph_feature_dim]
             'node_features': node_features,              # Shape: [num_nodes, node_feature_dim]
+            'edge_attr': edge_features,                  # Shape: [num_edges, edge_feature_dim]
+            'edge_index': (src, dst),                    # Edge connectivity
             'num_nodes': self.graph.num_nodes(),
-            'num_edges': self.graph.num_edges(),
-            'topology': self.topology
+            'num_edges': self.graph.num_edges()
         }
         
         return state
 
+    def to_dgl(self, embedding_dim=None):
+        """
+        Backward compatibility method to return the DGL graph.
+        
+        Parameters
+        ----------
+        embedding_dim : int, optional
+            Ignored for backward compatibility
+            
+        Returns
+        -------
+        dgl.DGLGraph : The DGL graph from topology
+        """
+        return self.graph
 
     def _get_node_features(self, include_substrate=True):
         """
@@ -96,36 +102,41 @@ class GraphEmbedding:
         Returns
         -------
         torch.Tensor : Node feature matrix [num_nodes, feature_dim]
+            Features include:
+            - Position coordinates [x, y]
+            - Substrate intensity (optional)
+            - Node degree [in_degree, out_degree]
+            - Centrality measure
+            - Distance from graph centroid
+            - Boundary flag (convex hull membership)
         """
-        # Node features are directly stored in the DGL graph's ndata
         positions = self.graph.ndata['pos']
         num_nodes = positions.shape[0]
         
         features = []
         
-        # Basic positional features
-        features.append(positions) # [x, y] coordinates
+        # 1. Positional features
+        features.append(positions)  # [x, y] coordinates
         
+        # 2. Substrate features (optional)
         if include_substrate and self.substrate is not None:
-            # Use the topology's method to get substrate intensities
             substrate_features = self.topology.get_substrate_intensities()
             features.append(substrate_features)
-
         
-        # Topological features
+        # 3. Topological features
         degrees = self._get_node_degrees()
         features.append(degrees)
         
-        # Centrality measures
+        # 4. Centrality measures
         centralities = self._get_node_centralities()
         features.append(centralities)
         
-        # Distance from centroid
+        # 5. Distance from centroid
         centroid = torch.mean(positions, dim=0)
         distances_from_centroid = torch.norm(positions - centroid, dim=1, keepdim=True)
         features.append(distances_from_centroid)
         
-        # Convex hull membership (is node on boundary?)
+        # 6. Boundary membership
         boundary_flags = self._get_boundary_flags()
         features.append(boundary_flags)
         
@@ -138,6 +149,9 @@ class GraphEmbedding:
         Returns
         -------
         torch.Tensor : Edge feature matrix [num_edges, feature_dim]
+            Features include:
+            - Euclidean distance between nodes
+            - Normalized direction vector [dx, dy]
         """
         if self.graph.num_edges() == 0:
             return torch.empty(0, 3, dtype=torch.float32)
@@ -150,10 +164,10 @@ class GraphEmbedding:
         src_pos = positions[src]
         dst_pos = positions[dst]
         
-        # Euclidean distance
+        # 1. Euclidean distance
         distances = torch.norm(dst_pos - src_pos, dim=1, keepdim=True)
         
-        # Direction vector (normalized)
+        # 2. Normalized direction vector
         direction = dst_pos - src_pos
         direction_norm = F.normalize(direction, p=2, dim=1)
         
@@ -167,23 +181,28 @@ class GraphEmbedding:
         
         Returns
         -------
-        torch.Tensor : Graph feature vector with Size([feature_dim])
+        torch.Tensor : Graph feature vector [feature_dim]
+            Features include:
+            - Basic statistics: num_nodes, num_edges, density
+            - Spatial statistics: centroid, bounding box, convex hull area
+            - Topological statistics: average degree
         """
         positions = self.graph.ndata['pos']
         
         features = []
         
-        # Basic graph statistics
+        # 1. Basic graph statistics
         num_nodes = torch.tensor([self.graph.num_nodes()], dtype=torch.float32)
         num_edges = torch.tensor([self.graph.num_edges()], dtype=torch.float32)
         density = num_edges / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else torch.tensor([0.0])
         
         features.extend([num_nodes, num_edges, density])
         
-        # Spatial statistics - ensure all are 1D tensors
+        # 2. Spatial statistics
         if num_nodes > 0:
             centroid = torch.mean(positions, dim=0)  # [2] for 2D positions
-            # Bounding box
+            
+            # Bounding box features
             bbox_min = torch.min(positions, dim=0)[0]  # [2]
             bbox_max = torch.max(positions, dim=0)[0]  # [2]
             bbox_size = bbox_max - bbox_min  # [2]
@@ -196,14 +215,14 @@ class GraphEmbedding:
             bbox_size = torch.zeros(2)
             bbox_area = torch.zeros(1)
         
-        # Add all spatial features - concatenate vectors properly
-        features.append(centroid)  # [2]
-        features.append(bbox_min)  # [2]
-        features.append(bbox_max)  # [2]
-        features.append(bbox_size)  # [2]
-        features.append(bbox_area)  # [1]
+        # Add spatial features
+        features.append(centroid)     # [2]
+        features.append(bbox_min)     # [2]
+        features.append(bbox_max)     # [2]
+        features.append(bbox_size)    # [2]
+        features.append(bbox_area)    # [1]
         
-        # Convex hull area (if possible)
+        # 3. Convex hull area
         try:
             if num_nodes >= 3:
                 hull = ConvexHull(positions.numpy())
@@ -215,7 +234,7 @@ class GraphEmbedding:
         
         features.append(hull_area)
         
-        # Average node degree
+        # 4. Average node degree
         if num_nodes > 0:
             degrees = self._get_node_degrees()
             avg_degree = torch.mean(degrees).unsqueeze(0)  # [1]
@@ -225,45 +244,6 @@ class GraphEmbedding:
         features.append(avg_degree)
         
         return torch.cat(features, dim=0)
-
-    def _create_node_embeddings(self, node_features, embedding_dim):
-        """
-        Create node embeddings from raw features using a simple linear projection.
-        """
-        feature_dim = node_features.shape[1]
-        
-        # Simple linear projection (in practice, you'd use a learned network)
-        if feature_dim < embedding_dim:
-            # Pad with zeros if features are fewer than embedding dim
-            padding = torch.zeros(node_features.shape[0], embedding_dim - feature_dim)
-            embeddings = torch.cat([node_features, padding], dim=1)
-        else:
-            # Simple projection (you could use PCA or learned projection)
-            weight = torch.randn(feature_dim, embedding_dim) * 0.1
-            embeddings = torch.matmul(node_features, weight)
-        
-        return embeddings
-
-    def _create_graph_embedding(self, node_embeddings, graph_features, embedding_dim):
-        """
-        Create graph-level embedding from node embeddings and graph features.
-        """
-        if node_embeddings.shape[0] == 0:
-            return torch.zeros(embedding_dim)
-        
-        # Graph-level aggregation (mean pooling + graph features)
-        node_pooled = torch.mean(node_embeddings, dim=0)
-        
-        # Combine with graph features
-        if graph_features.shape[0] < embedding_dim:
-            graph_padded = F.pad(graph_features, (0, embedding_dim - graph_features.shape[0]))
-        else:
-            graph_padded = graph_features[:embedding_dim]
-        
-        # Simple combination (you could use more sophisticated methods)
-        graph_embedding = 0.7 * node_pooled + 0.3 * graph_padded
-        
-        return graph_embedding
 
     def _get_node_degrees(self):
         """Get node degree features."""
@@ -312,51 +292,6 @@ class GraphEmbedding:
         
         return boundary_flags
 
-    def get_rl_ready_state(self, embedding_dim=64):
-        """
-        Get a state representation ready for RL algorithms.
-        
-        Returns a dictionary compatible with common GNN libraries like DGL.
-        """
-        state = self.get_state_embedding(embedding_dim=embedding_dim)
-        
-        # Add additional RL-specific information
-        state['action_space_size'] = self.graph.num_nodes() * 2  # spawn or delete for each node
-        state['observation_space_dim'] = embedding_dim
-        
-        return state
-
-    def to_dgl(self, embedding_dim=64):
-        """
-        Convert the topology to a DGL Graph format.
-        
-        Returns
-        -------
-        dgl.DGLGraph : Graph data ready for GNN training
-        """
-        state = self.get_state_embedding(embedding_dim=embedding_dim)
-        
-        # Create a DGL graph from the edge list
-        if state['num_edges'] > 0:
-            src, dst = state['edge_index']
-            dgl_graph = dgl.graph((src, dst), num_nodes=state['num_nodes'])
-            
-            # Set edge features if edges exist
-            if state['edge_attr'].shape[0] > 0:
-                dgl_graph.edata['edge_attr'] = state['edge_attr']
-        else:
-            # Create a graph with no edges
-            dgl_graph = dgl.graph(([], []), num_nodes=state['num_nodes'])
-    
-        # Set node features
-        dgl_graph.ndata['x'] = state['node_embeddings']
-    
-        # Add graph-level features as a single node feature
-        # (This is one way to handle graph-level info in DGL)
-        if state['num_nodes'] > 0:
-            dgl_graph.ndata['graph_feat'] = state['graph_embedding'].unsqueeze(0).repeat(dgl_graph.num_nodes(), 1)
-    
-        return dgl_graph
 
 
 if __name__ == '__main__':
@@ -367,7 +302,7 @@ if __name__ == '__main__':
     substrate = Substrate((100, 50))
     substrate.create('linear', m=0.01, b=1.0)
     
-    # Use the existing Topology class - it already creates DGL graphs
+    # Create topology with DGL graph
     topology = Topology(substrate=substrate)
     topology.reset(init_num_nodes=10)
     
@@ -377,13 +312,18 @@ if __name__ == '__main__':
     print(f"Number of edges: {topology.graph.num_edges()}")
     print(f"Node positions shape: {topology.graph.ndata['pos'].shape}")
     
-    # Create embedding instance
-    embedding = GraphEmbedding(topology)
+    # Create topology state extractor
+    state_extractor = TopologyState(topology)
     
-    # Get state for GNN-based RL
-    state = embedding.get_rl_ready_state(embedding_dim=128)
-    print(f"Graph embedding shape: {state['graph_embedding'].shape}")
-    print(f"Node embeddings shape: {state['node_embeddings'].shape}")
+    # Extract state features
+    state = state_extractor.get_state_features()
+    
+    print(f"\n--- Extracted State Features ---")
+    print(f"Graph features shape: {state['graph_features'].shape}")
+    print(f"Node features shape: {state['node_features'].shape}")
+    print(f"Edge features shape: {state['edge_attr'].shape}")
+    print(f"Number of nodes: {state['num_nodes']}")
+    print(f"Number of edges: {state['num_edges']}")
     
     # Check edge index
     if state['num_edges'] > 0:
@@ -392,23 +332,6 @@ if __name__ == '__main__':
     else:
         print("No edges in the graph")
     
-    # Convert to DGL format
-    dgl_graph = embedding.to_dgl(embedding_dim=64)
-    print(f"DGL graph: {dgl_graph}")
-    print(f"Node features 'x' shape: {dgl_graph.ndata['x'].shape}")
-    if 'edge_attr' in dgl_graph.edata and dgl_graph.num_edges() > 0:
-        print(f"Edge features 'edge_attr' shape: {dgl_graph.edata['edge_attr'].shape}")
-    else:
-        print("No edge features (no edges in graph)")
-    
-    # Get embeddings for transformer input
-    state = embedding.get_state_embedding(embedding_dim=256)
-    node_sequence = state['node_embeddings']  # [num_nodes, embedding_dim]
-    graph_context = state['graph_embedding']  # [embedding_dim]
-    
-    print(f"Node sequence shape: {node_sequence.shape}")
-    print(f"Graph context shape: {graph_context.shape}")
-    
     # Test with some actions to create edges
     print("\n--- Testing with graph actions ---")
     actions = topology.act()
@@ -416,7 +339,12 @@ if __name__ == '__main__':
     print(f"After actions - Number of nodes: {topology.graph.num_nodes()}")
     print(f"After actions - Number of edges: {topology.graph.num_edges()}")
     
-    # Get updated embeddings
-    updated_state = embedding.get_rl_ready_state(embedding_dim=128)
-    print(f"Updated graph embedding shape: {updated_state['graph_embedding'].shape}")
-    print(f"Updated node embeddings shape: {updated_state['node_embeddings'].shape}")
+    # Extract features again after topology changes
+    state_after = state_extractor.get_state_features()
+    print(f"\n--- State Features After Actions ---")
+    print(f"Graph features shape: {state_after['graph_features'].shape}")
+    print(f"Node features shape: {state_after['node_features'].shape}")
+    print(f"Edge features shape: {state_after['edge_attr'].shape}")
+    print(f"Number of nodes: {state_after['num_nodes']}")
+    print(f"Number of edges: {state_after['num_edges']}")
+    
