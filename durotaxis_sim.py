@@ -423,7 +423,7 @@ class DurotaxisEnv(gym.Env):
         # Penalty for too many (N > Nc) or too few nodes (N < 2)
         num_nodes = new_state['num_nodes']
         if num_nodes < 2:
-            graph_reward -= 5.0  # Strong penalty for losing all connectivity
+            graph_reward -= 10.0  # Strong penalty for losing all connectivity
         elif num_nodes > self.max_nodes:
             graph_reward -= 10.0  # Penalty for excessive growth, N > Nc
         else:
@@ -478,12 +478,15 @@ class DurotaxisEnv(gym.Env):
                             avg_intensity = sum(current_intensities) / len(current_intensities)
                             current_node_intensity = node_features[i][2].item() if len(node_features[i]) > 2 else 0.0
                             
+                            # Set to_delete flag based on intensity comparison
                             if current_node_intensity < avg_intensity:
                                 node_reward -= 5.0  # Penalty for being below average
-                                print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -5.0)")
+                                self._set_node_to_delete_flag(i, True)  # Mark for deletion
+                                print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -5.0, marked for deletion)")
                             else:
                                 node_reward += 0.01  # Basic survival reward
-                                print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +0.01)")
+                                self._set_node_to_delete_flag(i, False)  # Not marked for deletion
+                                print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +0.01, safe)")
 
                 # 3. Substrate intensity rewards
                 if len(node_features[i]) > 2: 
@@ -792,11 +795,11 @@ class DurotaxisEnv(gym.Env):
 
     def _check_terminated(self, state):
         """Check if the episode should terminate."""
-        # Terminate if no nodes left ('fail termination')
+        # 1. Terminate if no nodes left ('fail termination')
         if state['num_nodes'] == 0:
             return True
         
-        # Terminate if graph's centroid keeps going left consequently for 2*self.delta_time times ('fail termination')
+        # 2. Terminate if graph's centroid keeps going left consequently for 2*self.delta_time times ('fail termination')
         if state['num_nodes'] > 0:
             # Get current centroid x-coordinate directly from graph_features
             centroid_x = state['graph_features'][3].item()
@@ -820,7 +823,7 @@ class DurotaxisEnv(gym.Env):
                     print(f"   Current centroid: {current_centroid:.2f}, Previous: {previous_centroid:.2f}")
                     return True
 
-        # Terminate if one node from the graph reaches the rightmost location ('success termination')
+        # 3. Terminate if one node from the graph reaches the rightmost location ('success termination')
         if state['num_nodes'] > 0:
             # Get substrate width to determine rightmost position
             substrate_width = self.substrate.width
@@ -925,6 +928,9 @@ class DurotaxisEnv(gym.Env):
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)
         
+        # Initialize to_delete flags for all nodes to 0 (not marked for deletion)
+        self._clear_all_to_delete_flags()
+        
         # Initialize policy if not done yet
         self._initialize_policy()
         
@@ -955,6 +961,87 @@ class DurotaxisEnv(gym.Env):
                     self.topology.plot()
                 except Exception as e:
                     print(f"Plotting failed: {e}")
+
+    # ============ to_delete Flag Management Methods ============
+    
+    def _set_node_to_delete_flag(self, node_idx, flag_value):
+        """Set the to_delete flag for a specific node."""
+        if self.topology.graph.num_nodes() == 0:
+            return
+        
+        if 0 <= node_idx < self.topology.graph.num_nodes():
+            self.topology.graph.ndata['to_delete'][node_idx] = float(flag_value)
+    
+    def _get_node_to_delete_flag(self, node_idx):
+        """Get the to_delete flag for a specific node."""
+        if self.topology.graph.num_nodes() == 0:
+            return False
+        
+        if 0 <= node_idx < self.topology.graph.num_nodes():
+            return bool(self.topology.graph.ndata['to_delete'][node_idx].item())
+        return False
+    
+    def _get_nodes_marked_for_deletion(self):
+        """Get indices of all nodes marked for deletion."""
+        if self.topology.graph.num_nodes() == 0:
+            return []
+        
+        to_delete_flags = self.topology.graph.ndata['to_delete']
+        marked_indices = []
+        for i, flag in enumerate(to_delete_flags):
+            if flag.item() > 0.5:  # Consider > 0.5 as marked
+                marked_indices.append(i)
+        return marked_indices
+    
+    def _count_nodes_marked_for_deletion(self):
+        """Count how many nodes are marked for deletion."""
+        return len(self._get_nodes_marked_for_deletion())
+    
+    def _clear_all_to_delete_flags(self):
+        """Clear all to_delete flags (set to 0.0)."""
+        if self.topology.graph.num_nodes() > 0:
+            self.topology.graph.ndata['to_delete'] = torch.zeros(
+                self.topology.graph.num_nodes(), dtype=torch.float32
+            )
+    
+    def get_deletion_analysis(self):
+        """
+        Get comprehensive analysis of nodes marked for deletion.
+        
+        Returns:
+            dict: Analysis containing counts, percentages, and persistent IDs
+        """
+        if self.topology.graph.num_nodes() == 0:
+            return {
+                'total_nodes': 0,
+                'nodes_marked_for_deletion': 0,
+                'deletion_percentage': 0.0,
+                'marked_node_indices': [],
+                'persistent_ids_marked': [],
+                'persistent_ids_safe': []
+            }
+        
+        total_nodes = self.topology.graph.num_nodes()
+        marked_indices = self._get_nodes_marked_for_deletion()
+        marked_count = len(marked_indices)
+        
+        # Get persistent IDs
+        persistent_ids = self.topology.graph.ndata['persistent_id'].tolist()
+        
+        marked_pids = [persistent_ids[i] for i in marked_indices]
+        safe_indices = [i for i in range(total_nodes) if i not in marked_indices]
+        safe_pids = [persistent_ids[i] for i in safe_indices]
+        
+        deletion_percentage = (marked_count / total_nodes * 100) if total_nodes > 0 else 0.0
+        
+        return {
+            'total_nodes': total_nodes,
+            'nodes_marked_for_deletion': marked_count,
+            'deletion_percentage': deletion_percentage,
+            'marked_node_indices': marked_indices,
+            'persistent_ids_marked': marked_pids,
+            'persistent_ids_safe': safe_pids
+        }
 
     def close(self):
         """Clean up resources."""
