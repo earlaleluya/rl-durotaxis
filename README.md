@@ -36,7 +36,7 @@ pip install torch==2.4.0 stable-baselines3 dgl -f https://data.dgl.ai/wheels/tor
 
 Download the file using git.
 ```bash
-git clone <link>
+git clone https://github.com/earlaleluya/rl-durotaxis.git
 ```
 
 Install other packages.
