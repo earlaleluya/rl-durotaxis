@@ -30,7 +30,9 @@ class DurotaxisEnv(gym.Env):
                  embedding_dim=64,
                  hidden_dim=128,  
                  delta_time=3,
-                 delta_intensity=2.50,  
+                 delta_intensity=2.50,
+                 delete_reward=2.0,  # Reward for proper deletion, penalty for persistence
+                 edge_reward=0.1,  # Reward for rightward edges, penalty for leftward edges
                  render_mode=None,
                  policy_agent=None):
         super().__init__()
@@ -46,6 +48,8 @@ class DurotaxisEnv(gym.Env):
         self.hidden_dim = hidden_dim 
         self.delta_time = delta_time
         self.delta_intensity = delta_intensity  
+        self.delete_reward = delete_reward  # Reward for proper deletion / penalty for persistence
+        self.edge_reward = edge_reward  # Reward for rightward edges / penalty for leftward edges
         self.current_step = 0
         
         # Centroid tracking for fail termination
@@ -436,6 +440,14 @@ class DurotaxisEnv(gym.Env):
         spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
         graph_reward += spawn_reward
         
+        # === DELETE REWARD: Proper deletion compliance ===
+        delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
+        graph_reward += delete_reward
+        
+        # === EDGE REWARD: Directional bias toward rightward movement ===
+        edge_reward = self._calculate_edge_reward(prev_state, new_state, actions)
+        graph_reward += edge_reward
+        
         
         # === NODE-LEVEL REWARDS ===
         
@@ -540,6 +552,8 @@ class DurotaxisEnv(gym.Env):
             'total_reward': total_reward,
             'graph_reward': graph_reward,
             'spawn_reward': spawn_reward,
+            'delete_reward': delete_reward,
+            'edge_reward': edge_reward,
             'node_rewards': node_rewards,
             'total_node_reward': total_node_reward,
             'num_nodes': num_nodes
@@ -623,6 +637,134 @@ class DurotaxisEnv(gym.Env):
                                           f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
         
         return spawn_reward
+
+    def _calculate_delete_reward(self, prev_state, new_state, actions):
+        """
+        Calculate reward/penalty based on deletion compliance with to_delete flags.
+        
+        Logic:
+        - If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
+        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward
+        
+        Args:
+            prev_state: Previous state dict containing topology
+            new_state: Current state dict containing topology  
+            actions: Actions taken this step
+            
+        Returns:
+            float: Delete reward (positive for proper deletions, negative for persistence)
+        """
+        delete_reward = 0.0
+        
+        # Need previous topology to check to_delete flags
+        if 'topology' not in prev_state or prev_state['topology'] is None:
+            return 0.0
+            
+        prev_topology = prev_state['topology']
+        
+        # Check if previous topology had any nodes
+        if prev_topology.graph.num_nodes() == 0:
+            return 0.0
+            
+        # Check if previous topology had to_delete flags
+        if 'to_delete' not in prev_topology.graph.ndata:
+            return 0.0
+            
+        # Get previous topology data
+        prev_to_delete_flags = prev_topology.graph.ndata['to_delete']
+        prev_persistent_ids = prev_topology.graph.ndata['persistent_id']
+        
+        # Current topology data
+        current_topology = new_state['topology']
+        if current_topology.graph.num_nodes() > 0:
+            current_persistent_ids = current_topology.graph.ndata['persistent_id'].tolist()
+        else:
+            current_persistent_ids = []
+        
+        # Check each node from previous topology
+        for i, to_delete_flag in enumerate(prev_to_delete_flags):
+            if to_delete_flag.item() > 0.5:  # Node was marked for deletion
+                prev_persistent_id = prev_persistent_ids[i].item()
+                
+                # Check if this persistent ID still exists in current topology
+                if prev_persistent_id in current_persistent_ids:
+                    # Node was marked for deletion but still exists - penalty
+                    delete_reward -= self.delete_reward
+                    print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_reward})")
+                else:
+                    # Node was marked for deletion and was actually deleted - reward
+                    delete_reward += self.delete_reward
+                    print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_reward})")
+        
+        return delete_reward
+
+    def _calculate_edge_reward(self, prev_state, new_state, actions):
+        """
+        Calculate reward/penalty based on edge directions to encourage rightward movement.
+        
+        Logic:
+        - For each edge, calculate direction vector from source to destination node
+        - If edge points rightward (positive x-direction): +edge_reward
+        - If edge points leftward (negative x-direction): -edge_reward
+        - Vertical edges (same x-coordinate) get no reward/penalty
+        
+        Args:
+            prev_state: Previous state dict (not used but kept for consistency)
+            new_state: Current state dict containing topology
+            actions: Actions taken this step (not used but kept for consistency)
+            
+        Returns:
+            float: Edge reward (positive for rightward bias, negative for leftward bias)
+        """
+        edge_reward = 0.0
+        
+        # Need current topology to analyze edges
+        if 'topology' not in new_state or new_state['topology'] is None:
+            return 0.0
+            
+        current_topology = new_state['topology']
+        
+        # Check if topology has any nodes and edges
+        if current_topology.graph.num_nodes() == 0 or current_topology.graph.num_edges() == 0:
+            return 0.0
+        
+        # Get node positions and edge information
+        node_positions = current_topology.graph.ndata['pos']  # Shape: [num_nodes, 2]
+        edges = current_topology.graph.edges()  # Returns (src_nodes, dst_nodes)
+        src_nodes, dst_nodes = edges
+        
+        rightward_edges = 0
+        leftward_edges = 0
+        
+        # Analyze each edge direction
+        for i in range(len(src_nodes)):
+            src_idx = src_nodes[i].item()
+            dst_idx = dst_nodes[i].item()
+            
+            # Get positions of source and destination nodes
+            src_pos = node_positions[src_idx]  # [x, y]
+            dst_pos = node_positions[dst_idx]  # [x, y]
+            
+            # Calculate direction vector
+            dx = dst_pos[0].item() - src_pos[0].item()  # x-direction component
+            
+            # Categorize edge direction
+            if dx > 0.01:  # Rightward (with small threshold to avoid numerical issues)
+                rightward_edges += 1
+                edge_reward += self.edge_reward
+            elif dx < -0.01:  # Leftward
+                leftward_edges += 1
+                edge_reward -= self.edge_reward
+            # If |dx| <= 0.01, consider it vertical/neutral (no reward/penalty)
+        
+        # Log edge direction analysis for debugging
+        if rightward_edges > 0 or leftward_edges > 0:
+            total_edges = current_topology.graph.num_edges()
+            print(f"🔀 Edge analysis: {rightward_edges} rightward (+), {leftward_edges} leftward (-), "
+                  f"{total_edges - rightward_edges - leftward_edges} vertical/neutral (0) "
+                  f"| Reward: {edge_reward:.3f}")
+        
+        return edge_reward
 
     def _node_exists_in_topology(self, node_x, node_y, topology, tolerance=None):
         """
@@ -904,6 +1046,28 @@ class DurotaxisEnv(gym.Env):
         """
         if self.last_reward_breakdown:
             return self.last_reward_breakdown.get('spawn_reward', 0.0)
+        return 0.0
+
+    def get_delete_reward(self):
+        """
+        Get the delete reward from the last step.
+        
+        Returns:
+            float: Delete reward (positive for proper deletions, negative for persistence), 0.0 if none
+        """
+        if self.last_reward_breakdown:
+            return self.last_reward_breakdown.get('delete_reward', 0.0)
+        return 0.0
+
+    def get_edge_reward(self):
+        """
+        Get the edge reward from the last step.
+        
+        Returns:
+            float: Edge reward (positive for rightward bias, negative for leftward bias), 0.0 if none
+        """
+        if self.last_reward_breakdown:
+            return self.last_reward_breakdown.get('edge_reward', 0.0)
         return 0.0
 
     def reset(self, seed=None, options=None):
