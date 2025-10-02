@@ -31,7 +31,7 @@ class GraphInputEncoder(nn.Module):
         
     Input Shapes:
         graph_features: [14] - Global graph properties
-        node_features: [num_nodes, 8] - Per-node cell properties  
+        node_features: [num_nodes, 9] - Per-node cell properties  
         edge_features: [num_edges, 3] - Per-edge connection properties
         edge_index: [2, num_edges] - Graph connectivity in COO format
         batch: [num_nodes] (optional) - Batch assignment for multiple graphs
@@ -42,7 +42,7 @@ class GraphInputEncoder(nn.Module):
     Example:
         >>> encoder = GraphInputEncoder(hidden_dim=128, out_dim=64, num_layers=3)
         >>> graph_feat = torch.randn(14)
-        >>> node_feat = torch.randn(5, 8)  # 5 nodes
+        >>> node_feat = torch.randn(5, 9)  # 5 nodes, 9 features
         >>> edge_feat = torch.randn(6, 3)  # 6 edges
         >>> edge_idx = torch.randint(0, 5, (2, 6))
         >>> out = encoder(graph_feat, node_feat, edge_feat, edge_idx)
@@ -98,8 +98,8 @@ class GraphInputEncoder(nn.Module):
         Args:
             graph_features (torch.Tensor): Global graph properties [14]
                 Features include: substrate stats, topology metrics, cell counts, etc.
-            node_features (torch.Tensor): Per-node cell properties [num_nodes, 8]  
-                Features include: position, velocity, substrate intensity, cell state, etc.
+            node_features (torch.Tensor): Per-node cell properties [num_nodes, 9]  
+                Features include: position, velocity, substrate intensity, cell state, new_node flag, etc.
             edge_features (torch.Tensor): Per-edge connection properties [num_edges, 3]
                 Features include: distance, angle, connection strength, etc.
             edge_index (torch.Tensor): Graph connectivity in COO format [2, num_edges]
@@ -234,7 +234,7 @@ if __name__ == '__main__':
     num_edges = 6
 
     graph_features = torch.randn(14)
-    node_features = torch.randn(num_nodes, 8)
+    node_features = torch.randn(num_nodes, 9)  # Updated to 9 dimensions
     edge_features = torch.randn(num_edges, 3)
     edge_index = torch.randint(0, num_nodes+1, (2, num_edges))  # random edges
 
@@ -297,4 +297,4 @@ if __name__ == '__main__':
         
     except ImportError as e:
         print(f"Could not import dependencies: {e}")
-        print("Basic GraphTransformer test completed successfully!") 
+        print("Basic GraphTransformer test completed successfully!")
