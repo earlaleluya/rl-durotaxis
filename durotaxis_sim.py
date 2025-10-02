@@ -31,8 +31,34 @@ class DurotaxisEnv(gym.Env):
                  hidden_dim=128,  
                  delta_time=3,
                  delta_intensity=2.50,
-                 delete_reward=2.0,  # Reward for proper deletion, penalty for persistence
-                 edge_reward=0.1,  # Reward for rightward edges, penalty for leftward edges
+                 # Grouped reward parameters
+                 graph_rewards={
+                     'connectivity_penalty': 10.0,  # Penalty for losing connectivity (N < 2)
+                     'growth_penalty': 10.0,  # Penalty for excessive growth (N > max_nodes)
+                     'survival_reward': 0.01,  # Basic survival reward for valid topology
+                     'action_reward': 0.005,  # Reward multiplier per action taken
+                 },
+                 node_rewards={
+                     'movement_reward': 0.01,  # Reward multiplier for rightward movement
+                     'intensity_penalty': 5.0,  # Penalty for below-average substrate intensity
+                     'intensity_bonus': 0.01,  # Bonus for above-average substrate intensity
+                     'substrate_reward': 0.05,  # Reward multiplier for substrate intensity
+                 },
+                 edge_reward={
+                    'rightward_bonus': 0.1, 
+                    'leftward_penalty': 0.1},  # Edge direction rewards
+                 spawn_rewards={
+                     'spawn_success_reward': 1.0,  # Reward for successful durotaxis spawning
+                     'spawn_failure_penalty': 1.0,  # Penalty for failed durotaxis spawning
+                 },
+                 delete_reward={
+                    'proper_deletion': 2.0, 
+                    'persistence_penalty': 2.0},  # Deletion compliance rewards
+                 position_rewards={
+                     'boundary_bonus': 0.1,  # Bonus for boundary/frontier nodes
+                     'left_edge_penalty': 0.2,  # Penalty for being near left edge
+                     'edge_position_penalty': 0.1,  # Penalty for being near top/bottom edges
+                 },
                  render_mode=None,
                  policy_agent=None):
         super().__init__()
@@ -48,8 +74,38 @@ class DurotaxisEnv(gym.Env):
         self.hidden_dim = hidden_dim 
         self.delta_time = delta_time
         self.delta_intensity = delta_intensity  
-        self.delete_reward = delete_reward  # Reward for proper deletion / penalty for persistence
-        self.edge_reward = edge_reward  # Reward for rightward edges / penalty for leftward edges
+        
+        # Unpack directional reward dictionaries
+        self.delete_reward = delete_reward
+        self.delete_proper_reward = delete_reward['proper_deletion']
+        self.delete_persistence_penalty = delete_reward['persistence_penalty']
+        
+        self.edge_reward = edge_reward
+        self.edge_rightward_bonus = edge_reward['rightward_bonus']
+        self.edge_leftward_penalty = edge_reward['leftward_penalty']
+        
+        # Unpack grouped reward parameters
+        self.graph_rewards = graph_rewards
+        self.connectivity_penalty = graph_rewards['connectivity_penalty']
+        self.growth_penalty = graph_rewards['growth_penalty']
+        self.survival_reward = graph_rewards['survival_reward']
+        self.action_reward = graph_rewards['action_reward']
+        
+        self.node_rewards = node_rewards
+        self.movement_reward = node_rewards['movement_reward']
+        self.intensity_penalty = node_rewards['intensity_penalty']
+        self.intensity_bonus = node_rewards['intensity_bonus']
+        self.substrate_reward = node_rewards['substrate_reward']
+        
+        self.position_rewards = position_rewards
+        self.boundary_bonus = position_rewards['boundary_bonus']
+        self.left_edge_penalty = position_rewards['left_edge_penalty']
+        self.edge_position_penalty = position_rewards['edge_position_penalty']
+        
+        self.spawn_rewards = spawn_rewards
+        self.spawn_success_reward = spawn_rewards['spawn_success_reward']
+        self.spawn_failure_penalty = spawn_rewards['spawn_failure_penalty']
+        
         self.current_step = 0
         
         # Centroid tracking for fail termination
@@ -427,14 +483,14 @@ class DurotaxisEnv(gym.Env):
         # Penalty for too many (N > Nc) or too few nodes (N < 2)
         num_nodes = new_state['num_nodes']
         if num_nodes < 2:
-            graph_reward -= 10.0  # Strong penalty for losing all connectivity
+            graph_reward -= self.connectivity_penalty  # Strong penalty for losing all connectivity
         elif num_nodes > self.max_nodes:
-            graph_reward -= 10.0  # Penalty for excessive growth, N > Nc
+            graph_reward -= self.growth_penalty  # Penalty for excessive growth, N > Nc
         else:
-            graph_reward += 0.01 # Basic survival reward
+            graph_reward += self.survival_reward # Basic survival reward
 
         # Small reward for taking actions (encourages exploration)
-        graph_reward += len(actions) * 0.005
+        graph_reward += len(actions) * self.action_reward
         
         # === SPAWN REWARD: Durotaxis-based spawning ===
         spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
@@ -465,7 +521,7 @@ class DurotaxisEnv(gym.Env):
                 if hasattr(self, 'prev_node_positions') and i < len(self.prev_node_positions):
                     prev_x = self.prev_node_positions[i][0]
                     x_movement = node_x - prev_x
-                    node_reward += x_movement * 0.01  # Reward rightward movement
+                    node_reward += x_movement * self.movement_reward  # Reward rightward movement
                 
                 # 2. Dequeued topology comparison reward
                 if self.dequeued_topology is not None:
@@ -492,24 +548,24 @@ class DurotaxisEnv(gym.Env):
                             
                             # Set to_delete flag based on intensity comparison
                             if current_node_intensity < avg_intensity:
-                                node_reward -= 5.0  # Penalty for being below average
+                                node_reward -= self.intensity_penalty  # Penalty for being below average
                                 self._set_node_to_delete_flag(i, True)  # Mark for deletion
-                                print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -5.0, marked for deletion)")
+                                print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -{self.intensity_penalty}, marked for deletion)")
                             else:
-                                node_reward += 0.01  # Basic survival reward
+                                node_reward += self.intensity_bonus  # Basic survival reward
                                 self._set_node_to_delete_flag(i, False)  # Not marked for deletion
-                                print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +0.01, safe)")
+                                print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +{self.intensity_bonus}, safe)")
 
                 # 3. Substrate intensity rewards
                 if len(node_features[i]) > 2: 
                     substrate_intensity = node_features[i][2].item()
-                    node_reward += substrate_intensity * 0.05  # Reward higher stiffness areas                
+                    node_reward += substrate_intensity * self.substrate_reward  # Reward higher stiffness areas                
                 
                 # 4. Boundary position rewards
                 if len(node_features[i]) > 7:  # Assuming boundary flag is at index 7
                     is_boundary = node_features[i][7].item()
                     if is_boundary > 0.5:  # Node is on boundary
-                        node_reward += 0.1  # Small bonus for frontier nodes
+                        node_reward += self.boundary_bonus  # Small bonus for frontier nodes
                 
                 # 5. Positional penalties (avoid substrate edges)
                 substrate_width = self.substrate.width
@@ -517,11 +573,11 @@ class DurotaxisEnv(gym.Env):
                 
                 # Penalty for being too close to left edge (opposite of durotaxis)
                 if node_x < substrate_width * 0.1:
-                    node_reward -= 0.2
+                    node_reward -= self.left_edge_penalty
                 
                 # Penalty for being too close to top/bottom edges
                 if node_y < substrate_height * 0.1 or node_y > substrate_height * 0.9:
-                    node_reward -= 0.1
+                    node_reward -= self.edge_position_penalty
                 
                 node_rewards.append(node_reward)
             
@@ -567,7 +623,7 @@ class DurotaxisEnv(gym.Env):
         
         Reward rule: If a node spawns a new node and the substrate intensity 
         of the new node is >= delta_intensity higher than the spawning node,
-        then reward += 1.0
+        then reward += spawn_success_reward, otherwise penalty -= spawn_failure_penalty
         
         Args:
             prev_state: Previous topology state
@@ -575,7 +631,7 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken (should include spawn actions)
             
         Returns:
-            float: Spawn reward (1.0 per qualifying spawn, 0.0 otherwise)
+            float: Spawn reward (spawn_success_reward per qualifying spawn, 0.0 otherwise)
         """
         spawn_reward = 0.0
         
@@ -626,12 +682,12 @@ class DurotaxisEnv(gym.Env):
                                 intensity_difference = new_node_intensity - best_parent_intensity
                                 
                                 if intensity_difference >= self.delta_intensity:
-                                    spawn_reward += 1.0
+                                    spawn_reward += self.spawn_success_reward
                                     print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
                                           f"Parent intensity: {best_parent_intensity:.3f}, "
                                           f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
                                 else:
-                                    spawn_reward -= 1.0
+                                    spawn_reward -= self.spawn_failure_penalty
                                     print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
                                           f"Parent intensity: {best_parent_intensity:.3f}, "
                                           f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
@@ -689,12 +745,12 @@ class DurotaxisEnv(gym.Env):
                 # Check if this persistent ID still exists in current topology
                 if prev_persistent_id in current_persistent_ids:
                     # Node was marked for deletion but still exists - penalty
-                    delete_reward -= self.delete_reward
-                    print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_reward})")
+                    delete_reward -= self.delete_persistence_penalty
+                    print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
                 else:
                     # Node was marked for deletion and was actually deleted - reward
-                    delete_reward += self.delete_reward
-                    print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_reward})")
+                    delete_reward += self.delete_proper_reward
+                    print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
         
         return delete_reward
 
@@ -751,10 +807,10 @@ class DurotaxisEnv(gym.Env):
             # Categorize edge direction
             if dx > 0.01:  # Rightward (with small threshold to avoid numerical issues)
                 rightward_edges += 1
-                edge_reward += self.edge_reward
+                edge_reward += self.edge_rightward_bonus
             elif dx < -0.01:  # Leftward
                 leftward_edges += 1
-                edge_reward -= self.edge_reward
+                edge_reward -= self.edge_leftward_penalty
             # If |dx| <= 0.01, consider it vertical/neutral (no reward/penalty)
         
         # Log edge direction analysis for debugging
