@@ -279,41 +279,65 @@ class Topology:
 
 
 
-    def reset(self, init_num_nodes=1, init_bin=0.05):
-        """
-        Reset the topology by generating random node coordinates.
-        The x-coordinate is in [0, init_bin * substrate.width].
-        The y-coordinate is in [0, substrate.height].
-        """
-        x_max = init_bin * self.substrate.width
-        y_max = self.substrate.height
-        # Randomize coordinates
-        coordinates = torch.stack([
-            torch.rand(init_num_nodes, dtype=torch.float32) * x_max,  # x-coordinates
-            torch.rand(init_num_nodes, dtype=torch.float32) * y_max   # y-coordinates
-        ], dim=1)
-        # Sort nodes by x-coordinate
-        x_coords = coordinates[:, 0]
-        sorted_indices = torch.argsort(x_coords)
-        # Create edges: node i -> node i+1 in sorted order
-        src = sorted_indices[:-1]
-        dst = sorted_indices[1:]
-        # Create a directed graph with these edges
-        g = dgl.graph((src, dst), num_nodes=init_num_nodes)
-        g.ndata['pos'] = coordinates
+    def reset(self, init_num_nodes=5):
+        """Reset topology with initial nodes."""
+        # Reset the next persistent ID counter
+        self._next_persistent_id = 0
         
-        # Initialize new_node flags (all nodes are "old" after reset)
-        g.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
+        # Create new graph with initial nodes
+        self.graph = dgl.graph(([], []))
         
-        # Initialize persistent IDs for tracking nodes across deletions
-        persistent_ids = torch.arange(init_num_nodes, dtype=torch.long)
-        g.ndata['persistent_id'] = persistent_ids
-        self._next_persistent_id = init_num_nodes  # Next available ID
+        # Add initial nodes
+        self.graph.add_nodes(init_num_nodes)
         
-        self.graph = g
-        return g
+        # Initialize node positions randomly
+        positions = []
+        persistent_ids = []
+        for i in range(init_num_nodes):
+            # Random position within substrate bounds
+            x = np.random.uniform(0, self.substrate.width)
+            y = np.random.uniform(0, self.substrate.height)
+            positions.append([x, y])
+            persistent_ids.append(self._next_persistent_id)
+            self._next_persistent_id += 1
+        
+        # Set node features
+        self.graph.ndata['pos'] = torch.tensor(positions, dtype=torch.float32)
+        self.graph.ndata['persistent_id'] = torch.tensor(persistent_ids, dtype=torch.long)
+        self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
+        self.graph.ndata['to_delete'] = torch.zeros(init_num_nodes, dtype=torch.float32)  # Initialize to_delete flags
+        
+        # Initial graph may start with no edges
+        # Add some random initial connections
+        if init_num_nodes > 1:
+            self._add_initial_edges(init_num_nodes)
 
+        return self.graph
 
+    def _add_initial_edges(self, init_num_nodes):
+        """Add initial edges to the graph based on proximity."""
+        positions = self.graph.ndata['pos'].numpy()
+        
+        # Add edges between nearby nodes
+        edges_src = []
+        edges_dst = []
+        
+        for i in range(init_num_nodes):
+            for j in range(i + 1, init_num_nodes):
+                # Calculate distance between nodes
+                pos_i = positions[i]
+                pos_j = positions[j]
+                distance = np.sqrt((pos_i[0] - pos_j[0])**2 + (pos_i[1] - pos_j[1])**2)
+                
+                # Add edge if nodes are close enough (threshold based on substrate size)
+                threshold = min(self.substrate.width, self.substrate.height) * 0.3
+                if distance < threshold:
+                    edges_src.extend([i, j])
+                    edges_dst.extend([j, i])  # Undirected graph
+        
+        # Add edges to the graph if any were found
+        if edges_src:
+            self.graph.add_edges(edges_src, edges_dst)
 
     def show(self, size=(10, 8), highlight_outmost=False, update_only=True):        
         """
@@ -414,13 +438,10 @@ if __name__ == '__main__':
    
     agent = Topology(substrate=substrate_linear)      
 
-
-
     agent.reset(init_num_nodes=100, init_bin=0.1)
     for i in range(1,20):
         agent.show(highlight_outmost=True)
         agent.act()
-
 
     # Keep the last figure window open
     plt.ioff()  # Turn off interactive mode
