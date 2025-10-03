@@ -279,8 +279,15 @@ class Topology:
 
 
 
-    def reset(self, init_num_nodes=5):
-        """Reset topology with initial nodes."""
+    def reset(self, init_num_nodes=5, init_bin=0.1):
+        """
+        Reset topology with initial nodes.
+        
+        Args:
+            init_num_nodes (int): Number of initial nodes to create
+            init_bin (float): Fraction of substrate width from leftmost side where nodes will be placed.
+                            For example, init_bin=0.1 places nodes in the leftmost 10% of the substrate.
+        """
         # Reset the next persistent ID counter
         self._next_persistent_id = 0
         
@@ -290,12 +297,15 @@ class Topology:
         # Add initial nodes
         self.graph.add_nodes(init_num_nodes)
         
-        # Initialize node positions randomly
+        # Calculate the x-range for initial placement based on init_bin
+        max_x = self.substrate.width * init_bin
+        
+        # Initialize node positions within the specified bin
         positions = []
         persistent_ids = []
         for i in range(init_num_nodes):
-            # Random position within substrate bounds
-            x = np.random.uniform(0, self.substrate.width)
+            # Random position within the leftmost init_bin fraction of substrate
+            x = np.random.uniform(0, max_x)
             y = np.random.uniform(0, self.substrate.height)
             positions.append([x, y])
             persistent_ids.append(self._next_persistent_id)
@@ -315,29 +325,38 @@ class Topology:
         return self.graph
 
     def _add_initial_edges(self, init_num_nodes):
-        """Add initial edges to the graph based on proximity."""
+        """Add initial edges to the graph based on x-coordinates, connecting from left to right."""
         positions = self.graph.ndata['pos'].numpy()
         
-        # Add edges between nearby nodes
+        # Create node index pairs with their x-coordinates
+        node_x_pairs = [(i, positions[i][0]) for i in range(init_num_nodes)]
+        
+        # Sort nodes by x-coordinate (left to right)
+        node_x_pairs.sort(key=lambda pair: pair[1])
+        
+        # Extract sorted node indices
+        sorted_node_indices = [pair[0] for pair in node_x_pairs]
+        
+        # Create edges connecting each node to the next rightmost node
         edges_src = []
         edges_dst = []
         
-        for i in range(init_num_nodes):
-            for j in range(i + 1, init_num_nodes):
-                # Calculate distance between nodes
-                pos_i = positions[i]
-                pos_j = positions[j]
-                distance = np.sqrt((pos_i[0] - pos_j[0])**2 + (pos_i[1] - pos_j[1])**2)
-                
-                # Add edge if nodes are close enough (threshold based on substrate size)
-                threshold = min(self.substrate.width, self.substrate.height) * 0.3
-                if distance < threshold:
-                    edges_src.extend([i, j])
-                    edges_dst.extend([j, i])  # Undirected graph
+        for i in range(len(sorted_node_indices) - 1):
+            current_node = sorted_node_indices[i]
+            next_node = sorted_node_indices[i + 1]
+            
+            # Add directed edge from current node to next rightmost node
+            edges_src.append(current_node)
+            edges_dst.append(next_node)
         
-        # Add edges to the graph if any were found
+        # Add edges to the graph if any were created
         if edges_src:
             self.graph.add_edges(edges_src, edges_dst)
+
+
+
+
+
 
     def show(self, size=(10, 8), highlight_outmost=False, update_only=True):        
         """
