@@ -60,7 +60,8 @@ class DurotaxisEnv(gym.Env):
                      'edge_position_penalty': 0.1,  # Penalty for being near top/bottom edges
                  },
                  render_mode=None,
-                 policy_agent=None):
+                 policy_agent=None,
+                 flush_delay=0.01):  # Visualization flush delay
         super().__init__()
         
         # Environment parameters
@@ -74,6 +75,7 @@ class DurotaxisEnv(gym.Env):
         self.hidden_dim = hidden_dim 
         self.delta_time = delta_time
         self.delta_intensity = delta_intensity  
+        self.flush_delay = flush_delay  # Store flush delay for visualization  
         
         # Unpack directional reward dictionaries
         self.delete_reward = delete_reward
@@ -165,7 +167,7 @@ class DurotaxisEnv(gym.Env):
         self.substrate.create(self.substrate_type, **self.substrate_params)
         
         # Create topology
-        self.topology = Topology(substrate=self.substrate)
+        self.topology = Topology(substrate=self.substrate, flush_delay=self.flush_delay)
         
         # Create state extractor
         self.state_extractor = TopologyState(self.topology)
@@ -1175,12 +1177,12 @@ class DurotaxisEnv(gym.Env):
             state = self.state_extractor.get_state_features(include_substrate=True)
             print(f"Step {self.current_step}: {state['num_nodes']} nodes, {state['num_edges']} edges")
             
-            # Optional: visualize the topology
-            if hasattr(self.topology, 'plot') and state['num_nodes'] > 0:
+            # Visualize the topology using the show method
+            if hasattr(self.topology, 'show') and state['num_nodes'] > 0:
                 try:
-                    self.topology.plot()
+                    self.topology.show(highlight_outmost=True)
                 except Exception as e:
-                    print(f"Plotting failed: {e}")
+                    print(f"Visualization failed: {e}")
 
     # ============ to_delete Flag Management Methods ============
     

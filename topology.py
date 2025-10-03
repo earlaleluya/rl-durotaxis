@@ -18,9 +18,10 @@ import numpy as np
 
 class Topology:
     
-    def __init__(self, dgl_graph=None, substrate=None):
+    def __init__(self, dgl_graph=None, substrate=None, flush_delay=0.01):
         self.substrate = substrate
         self._next_persistent_id = 0  # Global counter for unique persistent IDs
+        self.flush_delay = flush_delay  # Default flush delay for visualization
         self.graph = dgl_graph if dgl_graph is not None else self.reset()
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
@@ -217,15 +218,6 @@ class Topology:
                 self.graph.add_edges(p, s)
 
 
-
-
-    def try_show(self, g):
-        G = g.to_networkx()
-        nx.draw(G, pos=g.ndata['pos'], with_labels=True, node_color='lightgreen', node_size=500, font_size=16)
-        plt.show()
-
-
-
     def compute_centroid(self):
         """Compute the centroid (center of mass) of all nodes"""
         centroid = torch.mean(self.graph.ndata['pos'], dim=0)
@@ -354,17 +346,15 @@ class Topology:
             self.graph.add_edges(edges_src, edges_dst)
 
 
-
-
-
-
-    def show(self, size=(10, 8), highlight_outmost=False, update_only=True):        
+    def show(self, size=(10, 8), flush_delay=None, highlight_outmost=False, update_only=True):        
         """
         Visualizes the agent's topology and substrate signal matrix.
         Parameters
         ----------
         size : tuple of int, optional
             Figure size for the plot (width, height). Default is (10, 8).
+        flush_delay : float, optional
+            Time in seconds to pause after updating the plot. If None, uses the class default flush_delay.
         highlight_outmost : bool, optional
             If True, highlights the outmost nodes in the topology, draws the convex hull boundary,
             and marks the centroid. If False, only plots all nodes and the centroid.
@@ -385,6 +375,10 @@ class Topology:
         """
         canvas = self.substrate.signal_matrix.copy()
         positions = self.graph.ndata['pos'].numpy()
+        
+        # Use class flush_delay if none provided
+        if flush_delay is None:
+            flush_delay = self.flush_delay
         
         # Enable interactive mode
         plt.ion()
@@ -436,8 +430,8 @@ class Topology:
         # Refresh the display
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
-        plt.pause(0.01)  # Small pause to ensure update
-    
+        plt.pause(flush_delay)  
+
     
     def close_figure(self):
         """Close the figure window and reset figure references"""
@@ -455,7 +449,8 @@ if __name__ == '__main__':
     substrate_linear = Substrate((600, 400))
     substrate_linear.create('linear', m=0.05, b=1)
    
-    agent = Topology(substrate=substrate_linear)      
+    # Create topology with custom flush_delay (0.1 seconds)
+    agent = Topology(substrate=substrate_linear, flush_delay=0.1)      
 
     agent.reset(init_num_nodes=100, init_bin=0.1)
     for i in range(1,20):
