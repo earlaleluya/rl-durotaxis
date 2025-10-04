@@ -77,14 +77,6 @@ class Topology:
         
         for i in range(num_nodes):
             pos = positions[i].numpy()
-            
-            # Debug: Check if position is out of bounds
-            x, y = int(pos[0]), int(pos[1])
-            if (x < 0 or y < 0 or 
-                (substrate_shape[1] > 0 and x >= substrate_shape[1]) or 
-                (substrate_shape[0] > 0 and y >= substrate_shape[0])):
-                print(f"⚠️ Node {i} position out of bounds: ({x}, {y}) vs substrate shape {substrate_shape}")
-            
             intensity = self.substrate.get_intensity(pos)
             intensities.append(intensity)
         
@@ -283,6 +275,13 @@ class Topology:
         # Reset the next persistent ID counter
         self._next_persistent_id = 0
         
+        # Create new graph - handle zero nodes case
+        if init_num_nodes <= 0:
+            # Create empty graph with minimal node features for consistency
+            self.graph = dgl.graph(([], []))
+            # No nodes to add, but ensure node data tensors exist for compatibility
+            return
+        
         # Create new graph with initial nodes
         self.graph = dgl.graph(([], []))
         
@@ -346,7 +345,7 @@ class Topology:
             self.graph.add_edges(edges_src, edges_dst)
 
 
-    def show(self, size=(10, 8), flush_delay=None, highlight_outmost=False, update_only=True):        
+    def show(self, size=(10, 8), flush_delay=None, highlight_outmost=False, update_only=True, episode_num=None):        
         """
         Visualizes the agent's topology and substrate signal matrix.
         Parameters
@@ -363,7 +362,8 @@ class Topology:
         Description
         -----------
         - Plots the substrate signal matrix as a background image.
-        - Plots all node positions in the graph.
+        - If nodes exist, plots all node positions in the graph.
+        - If no nodes exist, shows substrate-only visualization.
         - If `highlight_outmost` is True:
             - Highlights outmost nodes in red.
             - Draws the convex hull boundary around the nodes.
@@ -374,7 +374,13 @@ class Topology:
         - Displays a legend and sets the plot title to 'Topology'.
         """
         canvas = self.substrate.signal_matrix.copy()
-        positions = self.graph.ndata['pos'].numpy()
+        
+        # Check if we have any nodes
+        num_nodes = self.graph.num_nodes()
+        if num_nodes > 0:
+            positions = self.graph.ndata['pos'].numpy()
+        else:
+            positions = None
         
         # Use class flush_delay if none provided
         if flush_delay is None:
@@ -383,54 +389,103 @@ class Topology:
         # Enable interactive mode
         plt.ion()
         
-        # Create figure only if it doesn't exist or update_only is False
-        if self.fig is None or not update_only:
+        # Validate and recover figure state if needed
+        figure_needs_recreation = False
+        if self.fig is not None:
+            try:
+                # Check if figure is still valid
+                if not plt.fignum_exists(self.fig.number):
+                    figure_needs_recreation = True
+                    self.fig = None
+                    self.ax = None
+            except:
+                figure_needs_recreation = True
+                self.fig = None
+                self.ax = None
+        
+        # Create figure only if it doesn't exist, update_only is False, or needs recreation
+        # Always try to reuse existing figure for episode continuity
+        if self.fig is None or not update_only or figure_needs_recreation:
             self.fig, self.ax = plt.subplots(figsize=size)
             plt.show(block=False)  # Non-blocking show
         else:
-            # Clear the existing axes for update
+            # Clear the existing axes for update but keep the window
             self.ax.clear()
         
-        # Compute and plot centroid
-        centroid = self.compute_centroid()
+        # Set up the plot area with proper limits
+        substrate_width, substrate_height = self.substrate.width, self.substrate.height
+        self.ax.set_xlim(0, substrate_width)
+        self.ax.set_ylim(0, substrate_height)
+        self.ax.set_aspect('equal', adjustable='box')
         
-        if highlight_outmost:
-            # Get outmost nodes
-            outmost_indices = self.get_outmost_nodes()
-            # Plot all nodes in blue
-            self.ax.scatter(positions[:, 0], positions[:, 1], c='blue', s=10, alpha=0.6, label='All nodes')
-            # Highlight outmost nodes in red
-            outmost_positions = positions[outmost_indices]
-            self.ax.scatter(outmost_positions[:, 0], outmost_positions[:, 1], 
-                           c='red', s=50, marker='o', edgecolor='black', linewidth=1,
-                           label=f'Outmost nodes ({len(outmost_indices)})')
-            # Draw convex hull boundary
-            if len(outmost_indices) >= 3:
-                try:
-                    hull = ConvexHull(positions)
-                    for simplex in hull.simplices:
-                        self.ax.plot(positions[simplex, 0], positions[simplex, 1], 'r--', alpha=0.7)
-                except:
-                    pass
-            # Add green marker for centroid
-            self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
-                           edgecolor='black', linewidth=1, label='Centroid')
-            self.ax.legend()
-            self.ax.set_title('Topology')
+        # Display substrate as background first
+        self.ax.imshow(canvas, cmap='viridis', origin='lower', 
+                      extent=[0, substrate_width, 0, substrate_height], alpha=0.7)
+        
+        # Handle visualization based on whether nodes exist
+        if positions is None or num_nodes == 0:
+            # Substrate-only visualization (no nodes)
+            episode_str = f"Ep{episode_num:2d}" if episode_num is not None else "Ep??"
+            step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"
+            self.ax.set_title(f'{episode_str} {step_str}: Substrate Only - 0 nodes')
+            # No legend needed for substrate-only view
         else:
-            self.ax.scatter(positions[:, 0], positions[:, 1], c='red', s=10)
-            # Add green marker for centroid
-            self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
-                           edgecolor='black', linewidth=1, label='Centroid')
-            self.ax.legend()
-            self.ax.set_title('Topology')        
+            # Normal visualization with nodes
+            # Compute and plot centroid
+            centroid = self.compute_centroid()
+            
+            if highlight_outmost:
+                # Get outmost nodes
+                outmost_indices = self.get_outmost_nodes()
+                # Plot all nodes in blue
+                self.ax.scatter(positions[:, 0], positions[:, 1], c='blue', s=10, alpha=0.6, label='All nodes')
+                # Highlight outmost nodes in red
+                outmost_positions = positions[outmost_indices]
+                self.ax.scatter(outmost_positions[:, 0], outmost_positions[:, 1], 
+                               c='red', s=50, marker='o', edgecolor='black', linewidth=1,
+                               label=f'Outmost nodes ({len(outmost_indices)})')
+                # Draw convex hull boundary
+                if len(outmost_indices) >= 3:
+                    try:
+                        hull = ConvexHull(positions)
+                        for simplex in hull.simplices:
+                            self.ax.plot(positions[simplex, 0], positions[simplex, 1], 'r--', alpha=0.7)
+                    except:
+                        pass
+                # Add green marker for centroid
+                self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
+                               edgecolor='black', linewidth=1, label='Centroid')
+                self.ax.legend()
+                # Uniform title format
+                episode_str = f"Ep{episode_num:2d}" if episode_num is not None else "Ep??"
+                step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"
+                self.ax.set_title(f'{episode_str} {step_str}: Topology - {len(positions)} nodes')
+            else:
+                self.ax.scatter(positions[:, 0], positions[:, 1], c='red', s=20, alpha=0.8, label='Nodes')
+                # Add green marker for centroid
+                self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
+                               edgecolor='black', linewidth=1, label='Centroid')
+                self.ax.legend()
+                # Uniform title format
+                episode_str = f"Ep{episode_num:2d}" if episode_num is not None else "Ep??"
+                step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"
+                self.ax.set_title(f'{episode_str} {step_str}: Topology - {len(positions)} nodes')        # Remove the duplicate imshow call since we already added it above
         
-        self.ax.imshow(canvas, cmap='viridis', origin='lower')
-        
-        # Refresh the display
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(flush_delay)  
+        # Refresh the display with proper flushing and error handling
+        try:
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+            
+            # Force window update
+            if hasattr(self.fig.canvas, 'manager'):
+                self.fig.canvas.manager.show()
+            
+            plt.pause(flush_delay)
+        except Exception as e:
+            print(f"Warning: Figure refresh failed: {e}")
+            # Try to recreate figure for next call
+            self.fig = None
+            self.ax = None  
 
     
     def close_figure(self):
@@ -439,6 +494,21 @@ class Topology:
             plt.close(self.fig)
             self.fig = None
             self.ax = None
+    
+    def force_figure_update(self):
+        """Force the matplotlib figure to update and refresh"""
+        if self.fig is not None:
+            try:
+                self.fig.canvas.draw_idle()
+                self.fig.canvas.flush_events()
+                if hasattr(self.fig.canvas, 'manager'):
+                    self.fig.canvas.manager.show()
+                plt.pause(0.01)  # Small pause to ensure update
+            except Exception as e:
+                print(f"Warning: Force figure update failed: {e}")
+                # Reset figure state for recovery
+                self.fig = None
+                self.ax = None
       
 
 

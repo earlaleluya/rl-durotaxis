@@ -59,9 +59,17 @@ class DurotaxisEnv(gym.Env):
                      'left_edge_penalty': 0.2,  # Penalty for being near left edge
                      'edge_position_penalty': 0.1,  # Penalty for being near top/bottom edges
                  },
+                 termination_rewards={
+                     'success_reward': 100.0,  # Large reward for reaching rightmost location
+                     'out_of_bounds_penalty': -30.0,  # Large penalty for nodes going out of bounds
+                     'no_nodes_penalty': -30.0,  # Penalty for losing all nodes
+                     'leftward_drift_penalty': -30.0,  # Penalty for consistent leftward movement
+                     'timeout_penalty': -10.0,  # Small penalty for reaching max time steps
+                 },
                  render_mode=None,
                  policy_agent=None,
-                 flush_delay=0.01):  # Visualization flush delay
+                 flush_delay=0.01,  # Visualization flush delay
+                 enable_visualization=True):  # Enable/disable topology.show() visualization
         super().__init__()
         
         # Environment parameters
@@ -75,7 +83,8 @@ class DurotaxisEnv(gym.Env):
         self.hidden_dim = hidden_dim 
         self.delta_time = delta_time
         self.delta_intensity = delta_intensity  
-        self.flush_delay = flush_delay  # Store flush delay for visualization  
+        self.flush_delay = flush_delay  # Store flush delay for visualization
+        self.enable_visualization = enable_visualization  # Control topology.show() activation  
         
         # Unpack directional reward dictionaries
         self.delete_reward = delete_reward
@@ -108,7 +117,15 @@ class DurotaxisEnv(gym.Env):
         self.spawn_success_reward = spawn_rewards['spawn_success_reward']
         self.spawn_failure_penalty = spawn_rewards['spawn_failure_penalty']
         
+        self.termination_rewards = termination_rewards
+        self.success_reward = termination_rewards['success_reward']
+        self.out_of_bounds_penalty = termination_rewards['out_of_bounds_penalty']
+        self.no_nodes_penalty = termination_rewards['no_nodes_penalty']
+        self.leftward_drift_penalty = termination_rewards['leftward_drift_penalty']
+        self.timeout_penalty = termination_rewards['timeout_penalty']
+        
         self.current_step = 0
+        self.current_episode = 0
         
         # Centroid tracking for fail termination
         self.centroid_history = []  # Store centroid x-coordinates
@@ -240,7 +257,7 @@ class DurotaxisEnv(gym.Env):
             
             if actual_nodes <= self.max_nodes:
                 # Normal case: no pooling needed
-                print(f"✅ No pooling needed: {actual_nodes} nodes ≤ {self.max_nodes} max_nodes")
+                # print(f"✅ No pooling needed: {actual_nodes} nodes ≤ {self.max_nodes} max_nodes")
                 encoder_flat = encoder_out.flatten().detach().cpu().numpy()
                 
                 # Pad with zeros if smaller than max size
@@ -250,7 +267,7 @@ class DurotaxisEnv(gym.Env):
             
             else:
                 # 🧠 SEMANTIC POOLING: Intelligently select representative nodes
-                print(f"🧠 Applying semantic pooling: {actual_nodes} nodes > {self.max_nodes} max_nodes")
+                # print(f"🧠 Applying semantic pooling: {actual_nodes} nodes > {self.max_nodes} max_nodes")
                 
                 graph_token = encoder_out[0:1]  # [1, out_dim] - Always preserve graph token
                 node_embeddings = encoder_out[1:]  # [actual_nodes, out_dim]
@@ -268,11 +285,11 @@ class DurotaxisEnv(gym.Env):
                 # Combine graph token with selected nodes
                 pooled_embeddings = torch.cat([graph_token, selected_nodes], dim=0)
                 
-                print(f"  📊 Pooling results:")
-                print(f"    - Original nodes: {actual_nodes}")
-                print(f"    - Selected nodes: {len(selected_indices)}")
-                print(f"    - Selected indices: {sorted(selected_indices.tolist())}")
-                print(f"    - Information preserved: {len(selected_indices)/actual_nodes*100:.1f}%")
+                # print(f"  📊 Pooling results:")
+                # print(f"    - Original nodes: {actual_nodes}")
+                # print(f"    - Selected nodes: {len(selected_indices)}")
+                # print(f"    - Selected indices: {sorted(selected_indices.tolist())}")
+                # print(f"    - Information preserved: {len(selected_indices)/actual_nodes*100:.1f}%")
                 
                 # Flatten and pad to fixed size
                 pooled_flat = pooled_embeddings.flatten().detach().cpu().numpy()
@@ -456,7 +473,16 @@ class DurotaxisEnv(gym.Env):
         self._reset_new_node_flags()
         
         # Check termination conditions
-        terminated = self._check_terminated(new_state)
+        terminated, termination_reward = self._check_terminated(new_state)
+        
+        # Add termination reward to the total reward
+        if terminated:
+            reward += termination_reward
+            # Update reward breakdown to include termination reward
+            if self.last_reward_breakdown:
+                self.last_reward_breakdown['termination_reward'] = termination_reward
+                self.last_reward_breakdown['total_reward'] = reward
+        
         truncated = self.current_step >= self.max_steps
         
         # Info dictionary
@@ -468,6 +494,19 @@ class DurotaxisEnv(gym.Env):
             'policy_initialized': self._policy_initialized,
             'reward_breakdown': self.last_reward_breakdown  # Detailed reward information
         }
+        
+        # 📊 One-line performance summary
+        centroid_x = new_state.get('graph_features', [0, 0, 0, 0])[3] if new_state['num_nodes'] > 0 else 0
+        centroid_direction = "→" if len(self.centroid_history) >= 2 and centroid_x > self.centroid_history[-2] else "←" if len(self.centroid_history) >= 2 and centroid_x < self.centroid_history[-2] else "="
+        spawn_r = self.last_reward_breakdown.get('spawn_reward', 0) if self.last_reward_breakdown else 0
+        node_r = self.last_reward_breakdown.get('total_node_reward', 0) if self.last_reward_breakdown else 0
+        edge_r = self.last_reward_breakdown.get('edge_reward', 0) if self.last_reward_breakdown else 0
+        print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction} | A={len(executed_actions):2d} | T={terminated} {truncated}")
+        
+        # Auto-render after each step to ensure visualization is always updated
+        # This ensures visualization works even when PPO doesn't call render()
+        if self.enable_visualization:
+            self.render()
         
         return observation, reward, terminated, truncated, info
 
@@ -551,12 +590,12 @@ class DurotaxisEnv(gym.Env):
                             # Set to_delete flag based on intensity comparison
                             if current_node_intensity < avg_intensity:
                                 node_reward -= self.intensity_penalty  # Penalty for being below average
-                                self._set_node_to_delete_flag(i, True)  # Mark for deletion
-                                print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -{self.intensity_penalty}, marked for deletion)")
+                                # Note: Automatic deletion based on intensity is disabled to prevent topology collapse
+                                # print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -{self.intensity_penalty})")
                             else:
                                 node_reward += self.intensity_bonus  # Basic survival reward
-                                self._set_node_to_delete_flag(i, False)  # Not marked for deletion
-                                print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +{self.intensity_bonus}, safe)")
+                                # Note: Automatic deletion based on intensity is disabled to prevent topology collapse
+                                # print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +{self.intensity_bonus})")
 
                 # 3. Substrate intensity rewards
                 if len(node_features[i]) > 2: 
@@ -685,14 +724,14 @@ class DurotaxisEnv(gym.Env):
                                 
                                 if intensity_difference >= self.delta_intensity:
                                     spawn_reward += self.spawn_success_reward
-                                    print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
-                                          f"Parent intensity: {best_parent_intensity:.3f}, "
-                                          f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
+                                    # print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
+                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
+                                    #       f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
                                 else:
                                     spawn_reward -= self.spawn_failure_penalty
-                                    print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
-                                          f"Parent intensity: {best_parent_intensity:.3f}, "
-                                          f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
+                                    # print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
+                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
+                                    #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
         
         return spawn_reward
 
@@ -748,11 +787,11 @@ class DurotaxisEnv(gym.Env):
                 if prev_persistent_id in current_persistent_ids:
                     # Node was marked for deletion but still exists - penalty
                     delete_reward -= self.delete_persistence_penalty
-                    print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
+                    # print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
                 else:
                     # Node was marked for deletion and was actually deleted - reward
                     delete_reward += self.delete_proper_reward
-                    print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
+                    # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
         
         return delete_reward
 
@@ -818,9 +857,9 @@ class DurotaxisEnv(gym.Env):
         # Log edge direction analysis for debugging
         if rightward_edges > 0 or leftward_edges > 0:
             total_edges = current_topology.graph.num_edges()
-            print(f"🔀 Edge analysis: {rightward_edges} rightward (+), {leftward_edges} leftward (-), "
-                  f"{total_edges - rightward_edges - leftward_edges} vertical/neutral (0) "
-                  f"| Reward: {edge_reward:.3f}")
+            # print(f"🔀 Edge analysis: {rightward_edges} rightward (+), {leftward_edges} leftward (-), "
+            #       f"{total_edges - rightward_edges - leftward_edges} vertical/neutral (0) "
+            #       f"| Reward: {edge_reward:.3f}")
         
         return edge_reward
 
@@ -864,7 +903,7 @@ class DurotaxisEnv(gym.Env):
                     return False
             
             # Method 2: Fallback to spatial proximity (original method)
-            print("⚠️ Falling back to spatial matching (persistent IDs not available)")
+            # print("⚠️ Falling back to spatial matching (persistent IDs not available)")
             
             # Calculate adaptive tolerance based on substrate and environment characteristics
             if tolerance is None:
@@ -932,10 +971,10 @@ class DurotaxisEnv(gym.Env):
         else:
             self._tolerance_debug_counter = 1
         
-        if self._tolerance_debug_counter <= 3:  # Only print first few times
-            print(f"🎯 Adaptive tolerance: {adaptive_tolerance:.2f} "
-                  f"(slope_factor: {slope_factor:.2f}, size_factor: {size_factor:.2f}, "
-                  f"time_factor: {time_factor:.2f}, step_factor: {step_factor:.2f})")
+        # if self._tolerance_debug_counter <= 3:  # Only print first few times
+            # print(f"🎯 Adaptive tolerance: {adaptive_tolerance:.2f} "
+            #       f"(slope_factor: {slope_factor:.2f}, size_factor: {size_factor:.2f}, "
+            #       f"time_factor: {time_factor:.2f}, step_factor: {step_factor:.2f})")
         
         return adaptive_tolerance
 
@@ -994,12 +1033,35 @@ class DurotaxisEnv(gym.Env):
             self.topology.graph.ndata['new_node'] = torch.zeros(num_nodes, dtype=torch.float32)
 
     def _check_terminated(self, state):
-        """Check if the episode should terminate."""
-        # 1. Terminate if no nodes left ('fail termination')
-        if state['num_nodes'] == 0:
-            return True
+        """
+        Check if the episode should terminate.
         
-        # 2. Terminate if graph's centroid keeps going left consequently for 2*self.delta_time times ('fail termination')
+        Returns:
+            tuple: (terminated: bool, termination_reward: float)
+        """
+        # 1. Terminate if number of nodes becomes 0 ('fail termination')
+        if state['num_nodes'] == 0:
+            print(f"⚪ Episode terminated: No nodes remaining")
+            return True, self.no_nodes_penalty
+
+        # 2. Terminate if any node is out of bounds from the substrate ('fail termination')
+        if state['num_nodes'] > 0:
+            substrate_width = self.substrate.width
+            substrate_height = self.substrate.height
+            node_features = state['node_features']
+            
+            for i in range(state['num_nodes']):
+                node_x = node_features[i][0].item()  # x-coordinate
+                node_y = node_features[i][1].item()  # y-coordinate
+                
+                # Check if node is out of bounds
+                if (node_x < 0 or node_y < 0 or 
+                    node_x >= substrate_width or node_y >= substrate_height):
+                    print(f"❌ Episode terminated: Node {i} out of bounds at ({node_x:.2f}, {node_y:.2f})")
+                    print(f"   Substrate bounds: (0, 0) to ({substrate_width}, {substrate_height})")
+                    return True, self.out_of_bounds_penalty
+
+        # 3. Terminate if graph's centroid keeps going left consequently for 2*self.delta_time times ('fail termination')
         if state['num_nodes'] > 0:
             # Get current centroid x-coordinate directly from graph_features
             centroid_x = state['graph_features'][3].item()
@@ -1021,9 +1083,9 @@ class DurotaxisEnv(gym.Env):
                 if self.consecutive_left_moves >= self.fail_threshold:
                     print(f"❌ Episode terminated: Centroid moved left {self.consecutive_left_moves} consecutive times (threshold: {self.fail_threshold})")
                     print(f"   Current centroid: {current_centroid:.2f}, Previous: {previous_centroid:.2f}")
-                    return True
+                    return True, self.leftward_drift_penalty
 
-        # 3. Terminate if one node from the graph reaches the rightmost location ('success termination')
+        # 4. Terminate if one node from the graph reaches the rightmost location ('success termination')
         if state['num_nodes'] > 0:
             # Get substrate width to determine rightmost position
             substrate_width = self.substrate.width
@@ -1034,10 +1096,15 @@ class DurotaxisEnv(gym.Env):
             for i in range(state['num_nodes']):
                 node_x = node_features[i][0].item()  # x-coordinate
                 if node_x >= rightmost_x:
-                    print(f"🎯 Episode terminated: Node {i} reached rightmost location (x={node_x:.2f} >= {rightmost_x})")
-                    return True
+                    print(f"🎯 Episode terminated: Node {i} reached rightmost location (x={node_x:.2f} >= {rightmost_x}) - SUCCESS!")
+                    return True, self.success_reward
+
+        # 5. Terminate if max_time_steps is reached
+        if self.current_step >= self.max_steps:
+            print(f"⏰ Episode terminated: Max time steps reached ({self.current_step}/{self.max_steps})")
+            return True, self.timeout_penalty
         
-        return False
+        return False, 0.0  # No termination, no termination reward
 
     def get_topology_history(self):
         """
@@ -1132,8 +1199,9 @@ class DurotaxisEnv(gym.Env):
         """Reset the environment to initial state."""
         super().reset(seed=seed)
         
-        # Reset step counter
+        # Reset step counter and increment episode counter
         self.current_step = 0
+        self.current_episode += 1
         
         # Reset centroid tracking for fail termination
         self.centroid_history = []
@@ -1173,18 +1241,44 @@ class DurotaxisEnv(gym.Env):
 
     def render(self):
         """Render the current state of the environment."""
-        if self.render_mode == "human":
-            state = self.state_extractor.get_state_features(include_substrate=True)
-            print(f"Step {self.current_step}: {state['num_nodes']} nodes, {state['num_edges']} edges")
-            
-            # Visualize the topology using the show method
-            if hasattr(self.topology, 'show') and state['num_nodes'] > 0:
-                try:
-                    self.topology.show(highlight_outmost=True)
-                except Exception as e:
-                    print(f"Visualization failed: {e}")
-
-    # ============ to_delete Flag Management Methods ============
+        # Always show visualization if enabled, regardless of render_mode
+        # This ensures visualization works even when wrapped by PPO/Monitor
+        state = self.state_extractor.get_state_features(include_substrate=True)
+        
+        # Debug: Track render calls
+        # print(f"DEBUG: render() called - Episode {self.current_episode}, Step {self.current_step}")
+        
+        # Visualize the topology using the show method (only if enabled)
+        # Check actual topology node count, not processed state node count
+        actual_num_nodes = self.topology.graph.num_nodes()
+        
+        if self.enable_visualization and hasattr(self.topology, 'show'):
+            try:
+                # Set step counter for visualization
+                self.topology._step_counter = self.current_step
+                
+                # Show additional info if nodes exceed max_nodes
+                if actual_num_nodes > self.max_nodes:
+                    print(f"  🔍 Visualizing full topology: {actual_num_nodes} nodes (exceeds max_nodes={self.max_nodes})")
+                elif actual_num_nodes == 0:
+                    print(f"  🔍 Showing substrate-only: 0 nodes")
+                
+                # Always call topology.show() - it will handle zero nodes gracefully
+                self.topology.show(highlight_outmost=True, update_only=True, episode_num=self.current_episode)
+                
+                # Force figure update to ensure visualization continues across episodes
+                if hasattr(self.topology, 'force_figure_update'):
+                    self.topology.force_figure_update()
+                    
+            except Exception as e:
+                print(f"Visualization failed: {e}")
+                # Try to recover visualization for next call
+                if hasattr(self.topology, 'fig'):
+                    self.topology.fig = None
+                    self.topology.ax = None
+        elif not self.enable_visualization:
+            print("  📊 Visualization disabled (terminal output only)")
+        # If visualization is enabled but topology.show doesn't exist, silently continue    # ============ to_delete Flag Management Methods ============
     
     def _set_node_to_delete_flag(self, node_idx, flag_value):
         """Set the to_delete flag for a specific node."""
@@ -1293,7 +1387,7 @@ if __name__ == '__main__':
     
     # Create the durotaxis environment
     env = DurotaxisEnv(
-        substrate_size=(100, 50),
+        substrate_size=(600, 400),
         substrate_type='linear',
         substrate_params={'m': 0.01, 'b': 1.0},
         init_num_nodes=5,
@@ -1301,7 +1395,9 @@ if __name__ == '__main__':
         max_steps=100,
         embedding_dim=64,
         hidden_dim=128,
-        render_mode="human"
+        render_mode="human",  # Enable rendering
+        enable_visualization=True,  # Enable topology.show()
+        flush_delay=0.0001
     )
     
     print("Environment created successfully!")
@@ -1319,7 +1415,10 @@ if __name__ == '__main__':
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         
-        print(f"Step {step + 1}: Reward={reward:.3f}, Nodes={info['num_nodes']}, Edges={info['num_edges']}")
+        # print(f"Step {step + 1}: Reward={reward:.3f}, Nodes={info['num_nodes']}, Edges={info['num_edges']}")
+        
+        # Render the environment to show visualization
+        env.render()
         
         if terminated or truncated:
             print(f"Episode ended at step {step + 1}")
@@ -1365,7 +1464,8 @@ if __name__ == '__main__':
         max_steps=50,
         embedding_dim=128,
         hidden_dim=128,
-        render_mode="human"
+        render_mode="human",
+        enable_visualization=True
     )
     
     obs, info = env2.reset()
@@ -1374,6 +1474,9 @@ if __name__ == '__main__':
     for step in range(15):
         obs, reward, terminated, truncated, info = env2.step(0)
         print(f"Step {step + 1}: Reward={reward:.3f}, Nodes={info['num_nodes']}, Edges={info['num_edges']}")
+        
+        # Render the environment to show visualization
+        env2.render()
         
         if terminated or truncated:
             print("Episode ended")
