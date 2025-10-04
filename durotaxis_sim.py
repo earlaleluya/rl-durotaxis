@@ -57,6 +57,7 @@ class DurotaxisEnv(gym.Env):
                  substrate_params={'m': 0.01, 'b': 1.0},
                  init_num_nodes=1,
                  max_nodes=50,
+                 num_critical_nodes=200,
                  max_steps=1000,
                  embedding_dim=64,
                  hidden_dim=128,  
@@ -96,6 +97,7 @@ class DurotaxisEnv(gym.Env):
                      'no_nodes_penalty': -30.0,  # Penalty for losing all nodes
                      'leftward_drift_penalty': -30.0,  # Penalty for consistent leftward movement
                      'timeout_penalty': -10.0,  # Small penalty for reaching max time steps
+                     'critical_nodes_penalty': -25.0,  # Penalty for exceeding critical node threshold
                  },
                  render_mode=None,
                  policy_agent=None,
@@ -110,6 +112,7 @@ class DurotaxisEnv(gym.Env):
         self.substrate_params = substrate_params
         self.init_num_nodes = init_num_nodes
         self.max_nodes = max_nodes
+        self.num_critical_nodes = num_critical_nodes
         self.max_steps = max_steps
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim 
@@ -123,6 +126,10 @@ class DurotaxisEnv(gym.Env):
         self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.algorithm_name = "GraphTransformer"  # Default algorithm name
         self.external_model = None  # Store external RL model (PPO, DQN, etc.)
+        
+        # Determine run number and create run-specific directory
+        self.run_number = self._get_next_run_number()
+        self.run_directory = os.path.join(self.model_path, f"run{self.run_number:04d}")
         self._ensure_model_directory()
         
         # Unpack directional reward dictionaries
@@ -162,6 +169,8 @@ class DurotaxisEnv(gym.Env):
         self.no_nodes_penalty = termination_rewards['no_nodes_penalty']
         self.leftward_drift_penalty = termination_rewards['leftward_drift_penalty']
         self.timeout_penalty = termination_rewards['timeout_penalty']
+        self.critical_nodes_penalty = termination_rewards['critical_nodes_penalty']
+        self.critical_nodes_penalty = termination_rewards['critical_nodes_penalty']
         
         self.current_step = 0
         self.current_episode = 0
@@ -216,13 +225,43 @@ class DurotaxisEnv(gym.Env):
         # Store encoder output dimension for observation processing
         self.encoder_out_dim = 64
 
-    def _ensure_model_directory(self):
+    def _get_next_run_number(self):
         """
-        Ensure the model directory exists.
+        Get the next run number by finding existing run directories.
+        
+        Returns
+        -------
+        int
+            Next available run number (1, 2, 3, ...)
         """
         if not os.path.exists(self.model_path):
+            return 1
+        
+        existing_runs = []
+        for item in os.listdir(self.model_path):
+            if os.path.isdir(os.path.join(self.model_path, item)) and item.startswith('run'):
+                try:
+                    run_num_str = item[3:]  # Remove "run" prefix
+                    run_num = int(run_num_str)
+                    existing_runs.append(run_num)
+                except ValueError:
+                    continue
+        
+        return max(existing_runs) + 1 if existing_runs else 1
+
+    def _ensure_model_directory(self):
+        """
+        Ensure the model directory and run-specific directory exist.
+        """
+        # Create base model directory
+        if not os.path.exists(self.model_path):
             os.makedirs(self.model_path)
-            print(f"📁 Created model directory: {self.model_path}")
+            print(f"📁 Created base model directory: {self.model_path}")
+        
+        # Create run-specific directory
+        if not os.path.exists(self.run_directory):
+            os.makedirs(self.run_directory)
+            print(f"📁 Created run directory: {self.run_directory} (Run #{self.run_number})")
     
     def set_algorithm_name(self, algorithm_name):
         """
@@ -253,7 +292,7 @@ class DurotaxisEnv(gym.Env):
     
     def save_model(self, episode_num=None):
         """
-        Save the current model(s) with episode-specific naming.
+        Save the current model(s) with episode-specific naming in run directory.
         
         Parameters
         ----------
@@ -263,14 +302,14 @@ class DurotaxisEnv(gym.Env):
         if episode_num is None:
             episode_num = self.current_episode
         
-        # Create filename with algorithm, run timestamp, and episode
-        base_filename = f"{self.algorithm_name}_{self.run_timestamp}_ep{episode_num:05d}"
+        # Create filename with algorithm and episode (timestamp now in directory structure)
+        base_filename = f"{self.algorithm_name}_ep{episode_num:05d}"
         
         saved_files = []
         
         # Save external RL model if available (PPO, DQN, etc.)
         if self.external_model is not None:
-            model_file = os.path.join(self.model_path, f"{base_filename}")
+            model_file = os.path.join(self.run_directory, f"{base_filename}")
             self.external_model.save(model_file)
             saved_files.append(model_file + ".zip")
         
@@ -279,22 +318,24 @@ class DurotaxisEnv(gym.Env):
             self.policy_agent is not None and 
             hasattr(self.policy_agent, 'policy_network')):
             
-            policy_file = os.path.join(self.model_path, f"{base_filename}_policy.pth")
+            policy_file = os.path.join(self.run_directory, f"{base_filename}_policy.pth")
             torch.save({
                 'policy_state_dict': self.policy_agent.policy_network.state_dict(),
                 'encoder_state_dict': self.policy_agent.policy_network.encoder.state_dict(),
                 'episode': episode_num,
                 'hidden_dim': self.hidden_dim,
                 'embedding_dim': self.embedding_dim,
-                'timestamp': self.run_timestamp
+                'run_number': self.run_number,
+                'run_timestamp': self.run_timestamp
             }, policy_file)
             saved_files.append(policy_file)
         
         # Save environment metadata
-        metadata_file = os.path.join(self.model_path, f"{base_filename}_metadata.json")
+        metadata_file = os.path.join(self.run_directory, f"{base_filename}_metadata.json")
         metadata = {
             'algorithm': self.algorithm_name,
             'episode': episode_num,
+            'run_number': self.run_number,
             'run_timestamp': self.run_timestamp,
             'substrate_size': self.substrate_size,
             'max_nodes': self.max_nodes,
@@ -309,7 +350,7 @@ class DurotaxisEnv(gym.Env):
             json.dump(metadata, f, indent=2)
         saved_files.append(metadata_file)
         
-        print(f"💾 Saved model files for episode {episode_num}:")
+        print(f"💾 Saved model files for episode {episode_num} (Run #{self.run_number:04d}):")
         for file in saved_files:
             print(f"   📄 {os.path.basename(file)}")
         
@@ -351,36 +392,66 @@ class DurotaxisEnv(gym.Env):
     
     def list_saved_models(self):
         """
-        List all saved models in the model directory.
+        List all saved models organized by run directories.
         
         Returns
         -------
         dict
-            Dictionary with model types as keys and lists of files as values
+            Dictionary with run directories and their model files
         """
         if not os.path.exists(self.model_path):
             print(f"📁 Model directory does not exist: {self.model_path}")
             return {}
         
-        files = os.listdir(self.model_path)
-        models = {
-            'rl_models': [f for f in files if f.endswith('.zip')],
-            'policy_models': [f for f in files if f.endswith('.pth')],
-            'metadata': [f for f in files if f.endswith('.json')]
-        }
+        runs_info = {}
+        
+        # Look for run directories
+        for item in os.listdir(self.model_path):
+            item_path = os.path.join(self.model_path, item)
+            if os.path.isdir(item_path) and item.startswith('run'):
+                try:
+                    run_num_str = item[3:]  # Remove "run" prefix
+                    run_num = int(run_num_str)
+                    
+                    # Get files in this run directory
+                    run_files = os.listdir(item_path)
+                    models = {
+                        'rl_models': [f for f in run_files if f.endswith('.zip')],
+                        'policy_models': [f for f in run_files if f.endswith('.pth')],
+                        'metadata': [f for f in run_files if f.endswith('.json')]
+                    }
+                    
+                    runs_info[f"run{run_num:04d}"] = models
+                    
+                except ValueError:
+                    continue
+        
+        # Also check for legacy files in base directory (backward compatibility)
+        base_files = [f for f in os.listdir(self.model_path) 
+                      if os.path.isfile(os.path.join(self.model_path, f))]
+        if base_files:
+            legacy_models = {
+                'rl_models': [f for f in base_files if f.endswith('.zip')],
+                'policy_models': [f for f in base_files if f.endswith('.pth')],
+                'metadata': [f for f in base_files if f.endswith('.json')]
+            }
+            if any(legacy_models.values()):
+                runs_info['legacy'] = legacy_models
         
         print(f"📚 Models in {self.model_path}:")
-        for model_type, file_list in models.items():
-            if file_list:
-                print(f"  {model_type}: {len(file_list)} files")
-                for file in sorted(file_list)[:5]:  # Show first 5
-                    print(f"    📄 {file}")
-                if len(file_list) > 5:
-                    print(f"    ... and {len(file_list) - 5} more")
-            else:
-                print(f"  {model_type}: No files")
+        for run_name, models in sorted(runs_info.items()):
+            print(f"  📂 {run_name}:")
+            for model_type, file_list in models.items():
+                if file_list:
+                    print(f"    {model_type}: {len(file_list)} files")
+                    for file in sorted(file_list)[:5]:  # Show first 5 files
+                        print(f"      📄 {file}")
+                    if len(file_list) > 5:
+                        print(f"      ... and {len(file_list) - 5} more")
+                else:
+                    print(f"    {model_type}: No files")
         
-        return models
+        return runs_info
 
     def _setup_environment(self):
         """Initialize substrate, topology, state extractor, and policy components."""
@@ -1303,12 +1374,17 @@ class DurotaxisEnv(gym.Env):
         Returns:
             tuple: (terminated: bool, termination_reward: float)
         """
-        # 1. Terminate if number of nodes becomes 0 ('fail termination')
+        # 1. Terminate if number of nodes exceeds critical threshold ('fail termination')
+        if state['num_nodes'] > self.num_critical_nodes:
+            print(f"🚨 Episode terminated: Too many nodes ({state['num_nodes']} > {self.num_critical_nodes} critical threshold)")
+            return True, self.critical_nodes_penalty
+        
+        # 2. Terminate if number of nodes becomes 0 ('fail termination')
         if state['num_nodes'] == 0:
             print(f"⚪ Episode terminated: No nodes remaining")
             return True, self.no_nodes_penalty
 
-        # 2. Terminate if any node is out of bounds from the substrate ('fail termination')
+        # 3. Terminate if any node is out of bounds from the substrate ('fail termination')
         if state['num_nodes'] > 0:
             substrate_width = self.substrate.width
             substrate_height = self.substrate.height
@@ -1325,7 +1401,7 @@ class DurotaxisEnv(gym.Env):
                     print(f"   Substrate bounds: (0, 0) to ({substrate_width}, {substrate_height})")
                     return True, self.out_of_bounds_penalty
 
-        # 3. Terminate if graph's centroid keeps going left consequently for 2*self.delta_time times ('fail termination')
+        # 4. Terminate if graph's centroid keeps going left consequently for 2*self.delta_time times ('fail termination')
         if state['num_nodes'] > 0:
             # Get current centroid x-coordinate directly from graph_features
             centroid_x = state['graph_features'][3].item()
@@ -1349,7 +1425,7 @@ class DurotaxisEnv(gym.Env):
                     print(f"   Current centroid: {current_centroid:.2f}, Previous: {previous_centroid:.2f}")
                     return True, self.leftward_drift_penalty
 
-        # 4. Terminate if one node from the graph reaches the rightmost location ('success termination')
+        # 5. Terminate if one node from the graph reaches the rightmost location ('success termination')
         if state['num_nodes'] > 0:
             # Get substrate width to determine rightmost position
             substrate_width = self.substrate.width
@@ -1363,7 +1439,7 @@ class DurotaxisEnv(gym.Env):
                     print(f"🎯 Episode terminated: Node {i} reached rightmost location (x={node_x:.2f} >= {rightmost_x}) - SUCCESS!")
                     return True, self.success_reward
 
-        # 5. Terminate if max_time_steps is reached
+        # 6. Terminate if max_time_steps is reached
         if self.current_step >= self.max_steps:
             print(f"⏰ Episode terminated: Max time steps reached ({self.current_step}/{self.max_steps})")
             return True, self.timeout_penalty
@@ -1664,7 +1740,7 @@ if __name__ == '__main__':
     
     # Create the durotaxis environment with model saving
     env = DurotaxisEnv(
-        substrate_size=(600, 400),
+        substrate_size=(200, 200),
         substrate_type='linear',
         substrate_params={'m': 0.01, 'b': 1.0},
         init_num_nodes=5,
@@ -1754,8 +1830,9 @@ if __name__ == '__main__':
     
     # Test the graph transformer policy directly with model saving
     env2 = DurotaxisEnv(
-        init_num_nodes=8,
+        init_num_nodes=1,
         max_steps=50,
+        num_critical_nodes=200,
         embedding_dim=128,
         hidden_dim=128,
         render_mode="human",

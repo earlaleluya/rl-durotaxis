@@ -64,11 +64,11 @@ If agent reaches the rightmost area.
 
 ## Basic Usage
 ```python
-from durotaxis_sim import DurotaxisSimulation
+from durotaxis_sim import DurotaxisEnv
 from stable_baselines3 import PPO
 
 # Create environment with model saving enabled
-env = DurotaxisSimulation(
+env = DurotaxisEnv(
     substrate_size=(200, 150),
     max_nodes=50,
     max_steps=30,
@@ -110,7 +110,7 @@ PPO_20251004_104530_ep00002_metadata.json
 ### Setting Up Model Saving
 ```python
 # Initialize environment with model saving
-env = DurotaxisSimulation(
+env = DurotaxisEnv(
     substrate_size=(200, 150),
     max_nodes=50,
     max_steps=30,
@@ -173,7 +173,7 @@ Each saved model includes a JSON metadata file containing:
 #### Training with Custom Parameters
 ```python
 # Advanced training with model saving
-env = DurotaxisSimulation(
+env = DurotaxisEnv(
     substrate_size=(300, 200),
     max_nodes=100,
     max_steps=50,
@@ -200,7 +200,7 @@ for name, model in algorithms.items():
 #### Loading and Evaluating Models
 ```python
 # Load and evaluate a trained model
-env = DurotaxisSimulation(
+env = DurotaxisEnv(
     substrate_size=(200, 150),
     max_nodes=50,
     max_steps=30,
@@ -232,7 +232,7 @@ print(f"Average reward: {sum(total_rewards)/len(total_rewards):.2f}")
 #### Resuming Training from Saved Model
 ```python
 # Resume training from a previously saved model
-env = DurotaxisSimulation(
+env = DurotaxisEnv(
     substrate_size=(200, 150),
     max_nodes=50,
     max_steps=30,
@@ -269,10 +269,10 @@ your_project/
 ### Production Deployment
 ```python
 # Load trained model for production use
-from durotaxis_sim import DurotaxisSimulation
+from durotaxis_sim import DurotaxisEnv
 
 # Create environment (no model_path needed for inference only)
-env = DurotaxisSimulation(
+env = DurotaxisEnv(
     substrate_size=(200, 150),
     max_nodes=50,
     max_steps=30,

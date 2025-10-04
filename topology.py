@@ -545,7 +545,7 @@ class Topology:
                 # Highlight outmost nodes in red
                 outmost_positions = positions[outmost_indices]
                 self.ax.scatter(outmost_positions[:, 0], outmost_positions[:, 1], 
-                               c='red', s=50, marker='o', edgecolor='black', linewidth=1,
+                               c='red', s=10, marker='o', edgecolor='black', linewidth=1,
                                label=f'Outmost nodes ({len(outmost_indices)})')
                 # Draw convex hull boundary
                 if len(outmost_indices) >= 3:
