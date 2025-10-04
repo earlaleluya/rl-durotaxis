@@ -1,5 +1,33 @@
 '''
-    The agent herewith is a "topology of nodes". This program intends to represent topology as a "graph".
+    The agent herewith is a "topology of nodes". This program intends to represent topology as    def get_all_nodes(self):
+        """
+        Return a list of all node IDs in the graph.
+        
+        Returns
+        -------
+        list of int
+            Lis    def compute_    def get_node_positions(self):
+        """
+        Get all node positions as a dictionary.
+        
+        Returns
+        -------
+        dict
+            Dictionary mapping node index to position array [x, y]
+        """
+        return {i: self.graph.ndata['pos'][i].numpy() for i in range(self.graph.num_nodes())}troid(self):
+        """
+        Compute the centroid (center of mass) of all nodes.
+        
+        Returns
+        -------
+        np.ndarray
+            2D coordinates [x, y] of the topology centroid
+        """
+        centroid = torch.mean(self.graph.ndata['pos'], dim=0)
+        return centroid.numpy()ntaining all node indices in the current graph
+        """
+        return self.graph.nodes().tolist()"graph".
 
     Resources:
     - Deep Graph Library: Deep Graph learning at scale (https://www.youtube.com/watch?v=VmQkLro6UWo)
@@ -17,6 +45,35 @@ import numpy as np
 
 
 class Topology:
+    """
+    Dynamic graph topology representing cellular network with spawn/delete operations.
+    
+    This class manages a dynamic graph where nodes represent cells and edges represent
+    cell-cell connections. It provides methods for topology evolution through node
+    spawning (cell division/migration) and deletion (cell death/removal), along with
+    visualization capabilities.
+    
+    The topology integrates with a substrate to determine spawning behaviors based on
+    substrate intensity gradients (durotaxis simulation).
+    
+    Attributes
+    ----------
+    substrate : Substrate
+        The substrate environment providing intensity signals
+    graph : dgl.DGLGraph
+        The dynamic graph structure
+    fig : matplotlib.figure.Figure
+        Figure handle for visualization
+    ax : matplotlib.axes.Axes
+        Axes handle for visualization
+        
+    Examples
+    --------
+    >>> topology = Topology(substrate=substrate)
+    >>> topology.reset(init_num_nodes=5)
+    >>> topology.show()
+    >>> actions = topology.act()
+    """
     
     def __init__(self, dgl_graph=None, substrate=None, flush_delay=0.01):
         self.substrate = substrate
@@ -29,7 +86,24 @@ class Topology:
 
 
     def act(self):
-        """This method still simulates the sample actions to be taken, which based on random choice of either spawn or delete."""
+        """
+        Perform random spawn and delete actions on all nodes.
+        
+        This method simulates stochastic cellular behavior by randomly choosing
+        spawn or delete actions for each node in the graph. It processes spawns
+        first to avoid index shifting issues, then processes deletions in reverse
+        order for the same reason.
+        
+        Returns
+        -------
+        dict
+            Dictionary mapping node_id to action taken ('spawn' or 'delete')
+            
+        Notes
+        -----
+        This is a fallback method for random behavior. In the RL environment,
+        actions are typically determined by the policy network.
+        """
         all_nodes = self.get_all_nodes()
         sample_actions = {node_id: random.choice(['spawn', 'delete']) for node_id in all_nodes}
         
@@ -264,6 +338,35 @@ class Topology:
 
 
     def reset(self, init_num_nodes=5, init_bin=0.1):
+        """
+        Reset topology with initial nodes positioned in a specific substrate region.
+        
+        Creates a new graph with the specified number of initial nodes, positioned
+        randomly within the leftmost fraction of the substrate (defined by init_bin).
+        Nodes are connected in a left-to-right chain to establish initial connectivity.
+        
+        Parameters
+        ----------
+        init_num_nodes : int, optional
+            Number of initial nodes to create. Default is 5.
+        init_bin : float, optional
+            Fraction of substrate width from left edge where nodes will be placed.
+            For example, init_bin=0.1 places nodes in leftmost 10% of substrate.
+            Default is 0.1.
+            
+        Returns
+        -------
+        dgl.DGLGraph
+            The reset graph with initial topology
+            
+        Notes
+        -----
+        Each node gets:
+        - 'pos': 2D position coordinates
+        - 'persistent_id': Unique identifier that persists across operations
+        - 'new_node': Flag indicating if node was recently spawned (starts as 0)
+        - 'to_delete': Flag for deletion marking (starts as 0)
+        """
         """
         Reset topology with initial nodes.
         

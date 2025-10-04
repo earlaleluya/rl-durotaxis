@@ -16,7 +16,35 @@ from policy import GraphPolicyNetwork, TopologyPolicyAgent
 class DurotaxisEnv(gym.Env):
     """
     A durotaxis environment that uses graph transformer policy for topology evolution.
-    The environment simulates cellular durotaxis using a dynamic graph topology.
+    
+    This environment simulates cellular durotaxis (movement in response to substrate stiffness)
+    using a dynamic graph topology where nodes represent cells and edges represent connections.
+    The environment uses reinforcement learning with graph neural networks to learn optimal
+    cell migration and proliferation strategies.
+    
+    The environment provides:
+    - Dynamic graph topology with node spawn/delete operations
+    - Substrate with gradient-based intensity signals
+    - Comprehensive reward system for different behaviors
+    - Termination conditions for success/failure scenarios
+    - Real-time visualization capabilities
+    
+    Attributes
+    ----------
+    substrate : Substrate
+        The substrate environment with intensity gradients
+    topology : Topology
+        The dynamic graph representing cell topology
+    action_space : gym.Space
+        The action space (discrete actions)
+    observation_space : gym.Space
+        The observation space (graph embeddings)
+    
+    Examples
+    --------
+    >>> env = DurotaxisEnv(substrate_size=(600, 400), init_num_nodes=5)
+    >>> obs, info = env.reset()
+    >>> obs, reward, terminated, truncated, info = env.step(action)
     """
     metadata = {"render_modes": ["human"], "render_fps": 30}
 
@@ -305,6 +333,33 @@ class DurotaxisEnv(gym.Env):
 
     def _semantic_node_selection(self, node_embeddings, state, target_count):
         """
+        Perform semantic node selection using attention-based clustering.
+        
+        This method uses graph neural network embeddings to identify semantically
+        similar nodes and select a diverse subset based on attention weights.
+        The selection aims to choose nodes that are representative of different
+        regions or characteristics in the topology.
+        
+        Parameters
+        ----------
+        node_embeddings : torch.Tensor
+            Node embeddings from the graph neural network, shape (num_nodes, embedding_dim)
+        state : dict
+            Current state dictionary containing graph information
+        target_count : int
+            Desired number of nodes to select
+            
+        Returns
+        -------
+        torch.Tensor
+            Indices of selected nodes, shape (target_count,)
+            
+        Notes
+        -----
+        The algorithm uses attention mechanisms to compute node importance scores
+        and applies diversity constraints to avoid selecting clustered nodes.
+        """
+        """
         Intelligently select representative nodes using semantic features.
         
         Args:
@@ -432,7 +487,36 @@ class DurotaxisEnv(gym.Env):
     def step(self, action):
         """
         Execute one time step using the graph transformer policy.
-        The 'action' parameter is ignored as we use the policy network.
+        
+        The action parameter is ignored as this environment uses an internal
+        graph transformer policy to determine node actions (spawn/delete operations).
+        The policy analyzes the current graph state and substrate conditions to
+        make decisions about topology evolution.
+        
+        Parameters
+        ----------
+        action : Any
+            Ignored parameter (maintained for gym.Env compatibility)
+            
+        Returns
+        -------
+        observation : np.ndarray
+            Graph embedding observation from the encoder
+        reward : float
+            Scalar reward combining graph, node, and termination rewards
+        terminated : bool
+            True if episode terminated (success/failure conditions met)
+        truncated : bool
+            True if episode truncated (max steps reached)
+        info : dict
+            Additional information including reward breakdown and statistics
+            
+        Notes
+        -----
+        The reward system includes multiple components:
+        - Graph-level rewards (connectivity, growth penalties)
+        - Node-level rewards (movement, substrate interaction)
+        - Termination rewards (success/failure bonuses/penalties)
         """
         self.current_step += 1
         
