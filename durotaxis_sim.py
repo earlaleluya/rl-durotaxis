@@ -16,38 +16,211 @@ from policy import GraphPolicyNetwork, TopologyPolicyAgent
 
 
 
-class DurotaxisEnv(gym.Env):
+class Durotaxis(gym.Env):
     """
-    A durotaxis environment that uses graph transformer policy for topology evolution.
+    A sophisticated durotaxis environment using graph transformer policies for cellular topology evolution.
     
-    This environment simulates cellular durotaxis (movement in response to substrate stiffness)
-    using a dynamic graph topology where nodes represent cells and edges represent connections.
-    The environment uses reinforcement learning with graph neural networks to learn optimal
-    cell migration and proliferation strategies.
+    This environment simulates cellular durotaxis (directed migration in response to substrate stiffness gradients)
+    using dynamic graph topologies where nodes represent individual cells and edges represent cellular connections.
+    The environment employs reinforcement learning with graph neural networks to learn optimal cell migration,
+    proliferation, and deletion strategies that maximize rightward movement along substrate gradients.
     
-    The environment provides:
-    - Dynamic graph topology with node spawn/delete operations
-    - Substrate with gradient-based intensity signals
-    - Comprehensive reward system for different behaviors
-    - Termination conditions for success/failure scenarios
-    - Real-time visualization capabilities
+    The environment features a multi-component reward system that balances graph-level constraints (connectivity,
+    growth control), node-level behaviors (movement, substrate interaction), edge directionality preferences,
+    and sophisticated termination conditions. It includes semantic pooling for handling variable graph sizes
+    and run-based model organization for systematic experiment management.
+    
+    Key Features
+    ------------
+    - **Dynamic Graph Topology**: Real-time node spawn/delete operations with persistent node tracking
+    - **Substrate Gradients**: Configurable intensity fields (linear, exponential, custom) for durotaxis simulation
+    - **Multi-Component Rewards**: Graph, node, edge, spawn, deletion, and termination reward components
+    - **Semantic Pooling**: Intelligent node selection for large graphs using spatial and feature clustering
+    - **Termination Conditions**: Success (rightmost boundary), failure (node limits, drift), and timeout scenarios
+    - **Run Organization**: Automatic model saving with run directories (run0001, run0002, etc.)
+    - **Real-time Visualization**: Optional topology rendering with configurable update rates
+    
+    Parameters
+    ----------
+    substrate_size : tuple of int, default=(600, 400)
+        Dimensions of the substrate environment (width, height) in pixels.
+    substrate_type : str, default='linear'
+        Type of substrate gradient ('linear', 'exponential', 'gaussian', 'custom').
+    substrate_params : dict, default={'m': 0.01, 'b': 1.0}
+        Parameters for substrate generation. For linear: {'m': slope, 'b': intercept}.
+    init_num_nodes : int, default=1
+        Initial number of nodes (cells) when environment resets.
+    max_nodes : int, default=50
+        Maximum allowed nodes before applying growth penalties.
+    num_critical_nodes : int, default=200
+        Critical threshold - episode terminates if exceeded (fail condition).
+    max_steps : int, default=1000
+        Maximum steps per episode before timeout termination.
+    embedding_dim : int, default=64
+        Dimension of node embeddings for graph neural network processing.
+    hidden_dim : int, default=128
+        Hidden layer dimension for graph transformer networks.
+    delta_time : int, default=3
+        Time window for topology history comparison (affects reward calculations).
+    delta_intensity : float, default=2.50
+        Minimum intensity difference required for successful durotaxis spawning.
+    
+    graph_rewards : dict, default={'connectivity_penalty': 10.0, 'growth_penalty': 10.0, 'survival_reward': 0.01, 'action_reward': 0.005}
+        Graph-level reward components:
+        
+        - 'connectivity_penalty': Penalty when nodes < 2 (loss of connectivity)
+        - 'growth_penalty': Penalty when nodes > max_nodes (excessive growth)
+        - 'survival_reward': Base reward for maintaining valid topology
+        - 'action_reward': Reward multiplier per action taken (encourages exploration)
+    
+    node_rewards : dict, default={'movement_reward': 0.01, 'intensity_penalty': 5.0, 'intensity_bonus': 0.01, 'substrate_reward': 0.05}
+        Node-level reward components:
+        
+        - 'movement_reward': Reward multiplier for rightward movement (durotaxis)
+        - 'intensity_penalty': Penalty for nodes below average substrate intensity
+        - 'intensity_bonus': Bonus for nodes at/above average substrate intensity
+        - 'substrate_reward': Reward multiplier for substrate intensity values
+    
+    edge_reward : dict, default={'rightward_bonus': 0.1, 'leftward_penalty': 0.1}
+        Edge direction rewards:
+        
+        - 'rightward_bonus': Reward for edges pointing rightward (positive x-direction)
+        - 'leftward_penalty': Penalty for edges pointing leftward (negative x-direction)
+    
+    spawn_rewards : dict, default={'spawn_success_reward': 1.0, 'spawn_failure_penalty': 1.0}
+        Spawning behavior rewards:
+        
+        - 'spawn_success_reward': Reward for successful durotaxis-based spawning
+        - 'spawn_failure_penalty': Penalty for spawning without sufficient intensity gradient
+    
+    delete_reward : dict, default={'proper_deletion': 2.0, 'persistence_penalty': 2.0}
+        Deletion compliance rewards:
+        
+        - 'proper_deletion': Reward for deleting nodes marked with to_delete flag
+        - 'persistence_penalty': Penalty for keeping nodes marked for deletion
+    
+    position_rewards : dict, default={'boundary_bonus': 0.1, 'left_edge_penalty': 0.2, 'edge_position_penalty': 0.1}
+        Positional behavior rewards:
+        
+        - 'boundary_bonus': Bonus for nodes on topology boundary (frontier exploration)
+        - 'left_edge_penalty': Penalty for nodes near left substrate edge
+        - 'edge_position_penalty': Penalty for nodes near top/bottom substrate edges
+    
+    termination_rewards : dict, default={'success_reward': 100.0, 'out_of_bounds_penalty': -30.0, 'no_nodes_penalty': -30.0, 'leftward_drift_penalty': -30.0, 'timeout_penalty': -10.0, 'critical_nodes_penalty': -25.0}
+        Episode termination rewards:
+        
+        - 'success_reward': Large reward for reaching rightmost substrate boundary
+        - 'out_of_bounds_penalty': Penalty for nodes moving outside substrate bounds
+        - 'no_nodes_penalty': Penalty for losing all nodes (topology collapse)
+        - 'leftward_drift_penalty': Penalty for consistent leftward centroid movement
+        - 'timeout_penalty': Small penalty for reaching maximum time steps
+        - 'critical_nodes_penalty': Penalty for exceeding critical node threshold
+    
+    render_mode : str or None, default=None
+        Visualization mode ('human' for real-time rendering, None for headless).
+    policy_agent : TopologyPolicyAgent or None, default=None
+        External policy agent for action selection (auto-initialized if None).
+    flush_delay : float, default=0.01
+        Delay between visualization updates (seconds) for rendering control.
+    enable_visualization : bool, default=True
+        Enable/disable automatic topology visualization during episodes.
+    model_path : str, default="./saved_models"
+        Base directory for saving models with automatic run organization.
     
     Attributes
     ----------
     substrate : Substrate
-        The substrate environment with intensity gradients
+        The substrate environment containing intensity gradients and spatial information.
     topology : Topology
-        The dynamic graph representing cell topology
+        Dynamic graph structure representing cellular topology with DGL backend.
+    state_extractor : TopologyState
+        Component for extracting graph features and node attributes from topology.
+    observation_encoder : GraphInputEncoder
+        Graph neural network encoder for converting topology to fixed-size observations.
+    policy_agent : TopologyPolicyAgent
+        Graph transformer policy for intelligent action selection.
     action_space : gym.Space
-        The action space (discrete actions)
+        Discrete action space (dummy - actual actions determined by policy network).
     observation_space : gym.Space
-        The observation space (graph embeddings)
+        Box space for flattened graph embeddings with semantic pooling support.
+    run_number : int
+        Current run number for model organization (auto-incremented).
+    run_directory : str
+        Path to current run directory for model and metadata saving.
+    
+    Methods
+    -------
+    reset(seed=None, options=None)
+        Reset environment to initial state with optional seeding.
+    step(action)
+        Execute one timestep using graph transformer policy (action ignored).
+    render(mode='human')
+        Visualize current topology state with optional mode specification.
+    save_model(episode_num=None)
+        Save current models and metadata to run-specific directory.
+    load_model(model_file_path)
+        Load previously saved model from file path.
+    list_saved_models()
+        Display organized list of all saved models by run directories.
+    set_algorithm_name(algorithm_name)
+        Set algorithm name for model saving metadata.
+    set_external_model(model)
+        Register external RL model (PPO, DQN) for saving/loading.
+    
+    Notes
+    -----
+    **Observation Space**: The environment uses semantic pooling when the number of nodes exceeds max_nodes.
+    This intelligently selects representative nodes using spatial and feature clustering rather than arbitrary
+    truncation, preserving graph structure information for the policy network.
+    
+    **Reward System**: The multi-component reward system balances competing objectives:
+    
+    - Graph connectivity vs. growth control
+    - Individual cell movement vs. collective behavior  
+    - Exploration vs. exploitation of substrate gradients
+    - Short-term actions vs. long-term durotaxis success
+    
+    **Termination Logic**: Episodes can terminate due to:
+    
+    - Success: Any node reaches rightmost substrate boundary
+    - Failure: Node count exceeds critical threshold, all nodes lost, or persistent leftward drift
+    - Timeout: Maximum steps reached without success/failure
+    
+    **Model Organization**: Each environment instance automatically creates run directories (run0001, run0002, etc.)
+    for systematic experiment tracking. Models, metadata, and episode information are saved separately per run.
     
     Examples
     --------
-    >>> env = DurotaxisEnv(substrate_size=(600, 400), init_num_nodes=5)
+    Basic environment setup:
+    
+    >>> env = Durotaxis(substrate_size=(800, 600), init_num_nodes=3, max_nodes=30)
     >>> obs, info = env.reset()
-    >>> obs, reward, terminated, truncated, info = env.step(action)
+    >>> obs, reward, terminated, truncated, info = env.step(0)  # Action ignored
+    
+    Custom reward configuration:
+    
+    >>> custom_rewards = {
+    ...     'graph_rewards': {'connectivity_penalty': 15.0, 'survival_reward': 0.02},
+    ...     'node_rewards': {'movement_reward': 0.02, 'substrate_reward': 0.1},
+    ...     'termination_rewards': {'success_reward': 200.0}
+    ... }
+    >>> env = Durotaxis(**custom_rewards)
+    
+    Model saving and loading:
+    
+    >>> env.set_algorithm_name("PPO")
+    >>> env.save_model(episode_num=100)  # Saves to run directory
+    >>> models = env.list_saved_models()  # Shows organized model list
+    >>> env.load_model("./saved_models/run0001/PPO_ep00100.zip")
+    
+    Advanced substrate configuration:
+    
+    >>> env = Durotaxis(
+    ...     substrate_type='exponential',
+    ...     substrate_params={'base': 1.0, 'rate': 0.02, 'direction': 'x'},
+    ...     delta_intensity=3.0,  # Higher threshold for durotaxis
+    ...     num_critical_nodes=150  # Lower critical limit
+    ... )
     """
     metadata = {"render_modes": ["human"], "render_fps": 30}
 
@@ -1736,10 +1909,10 @@ class PolicyWrapper:
 
 
 if __name__ == '__main__':
-    print("Setting up DurotaxisEnv with Graph Transformer Policy and Model Saving...")
+    print("Setting up Durotaxis with Graph Transformer Policy and Model Saving...")
     
     # Create the durotaxis environment with model saving
-    env = DurotaxisEnv(
+    env = Durotaxis(
         substrate_size=(200, 200),
         substrate_type='linear',
         substrate_params={'m': 0.01, 'b': 1.0},
@@ -1829,7 +2002,7 @@ if __name__ == '__main__':
     print("\n--- Direct Policy Testing with Model Saving ---")
     
     # Test the graph transformer policy directly with model saving
-    env2 = DurotaxisEnv(
+    env2 = Durotaxis(
         init_num_nodes=1,
         max_steps=50,
         num_critical_nodes=200,
