@@ -4,6 +4,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from stable_baselines3 import DQN, PPO
+import os
+from datetime import datetime
+import json
 
 from topology import Topology
 from substrate import Substrate
@@ -97,7 +100,8 @@ class DurotaxisEnv(gym.Env):
                  render_mode=None,
                  policy_agent=None,
                  flush_delay=0.01,  # Visualization flush delay
-                 enable_visualization=True):  # Enable/disable topology.show() visualization
+                 enable_visualization=True,  # Enable/disable topology.show() visualization
+                 model_path="./saved_models"):  # Path to save models
         super().__init__()
         
         # Environment parameters
@@ -113,6 +117,13 @@ class DurotaxisEnv(gym.Env):
         self.delta_intensity = delta_intensity  
         self.flush_delay = flush_delay  # Store flush delay for visualization
         self.enable_visualization = enable_visualization  # Control topology.show() activation  
+        
+        # Model saving configuration
+        self.model_path = model_path
+        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.algorithm_name = "GraphTransformer"  # Default algorithm name
+        self.external_model = None  # Store external RL model (PPO, DQN, etc.)
+        self._ensure_model_directory()
         
         # Unpack directional reward dictionaries
         self.delete_reward = delete_reward
@@ -204,6 +215,172 @@ class DurotaxisEnv(gym.Env):
 
         # Store encoder output dimension for observation processing
         self.encoder_out_dim = 64
+
+    def _ensure_model_directory(self):
+        """
+        Ensure the model directory exists.
+        """
+        if not os.path.exists(self.model_path):
+            os.makedirs(self.model_path)
+            print(f"📁 Created model directory: {self.model_path}")
+    
+    def set_algorithm_name(self, algorithm_name):
+        """
+        Set the algorithm name for model saving.
+        
+        Parameters
+        ----------
+        algorithm_name : str
+            Name of the algorithm (e.g., 'PPO', 'DQN', 'GraphTransformer')
+        """
+        self.algorithm_name = algorithm_name
+        print(f"🔧 Algorithm name set to: {self.algorithm_name}")
+    
+    def set_external_model(self, model):
+        """
+        Set an external RL model for saving.
+        
+        Parameters
+        ----------
+        model : stable_baselines3 model
+            The RL model to save (PPO, DQN, etc.)
+        """
+        self.external_model = model
+        if hasattr(model, '__class__'):
+            # Automatically set algorithm name from model class
+            self.algorithm_name = model.__class__.__name__
+        print(f"🎯 External model set: {self.algorithm_name}")
+    
+    def save_model(self, episode_num=None):
+        """
+        Save the current model(s) with episode-specific naming.
+        
+        Parameters
+        ----------
+        episode_num : int, optional
+            Episode number for naming. If None, uses current episode.
+        """
+        if episode_num is None:
+            episode_num = self.current_episode
+        
+        # Create filename with algorithm, run timestamp, and episode
+        base_filename = f"{self.algorithm_name}_{self.run_timestamp}_ep{episode_num:05d}"
+        
+        saved_files = []
+        
+        # Save external RL model if available (PPO, DQN, etc.)
+        if self.external_model is not None:
+            model_file = os.path.join(self.model_path, f"{base_filename}")
+            self.external_model.save(model_file)
+            saved_files.append(model_file + ".zip")
+        
+        # Save internal graph policy network if available
+        if (hasattr(self, 'policy_agent') and 
+            self.policy_agent is not None and 
+            hasattr(self.policy_agent, 'policy_network')):
+            
+            policy_file = os.path.join(self.model_path, f"{base_filename}_policy.pth")
+            torch.save({
+                'policy_state_dict': self.policy_agent.policy_network.state_dict(),
+                'encoder_state_dict': self.policy_agent.policy_network.encoder.state_dict(),
+                'episode': episode_num,
+                'hidden_dim': self.hidden_dim,
+                'embedding_dim': self.embedding_dim,
+                'timestamp': self.run_timestamp
+            }, policy_file)
+            saved_files.append(policy_file)
+        
+        # Save environment metadata
+        metadata_file = os.path.join(self.model_path, f"{base_filename}_metadata.json")
+        metadata = {
+            'algorithm': self.algorithm_name,
+            'episode': episode_num,
+            'run_timestamp': self.run_timestamp,
+            'substrate_size': self.substrate_size,
+            'max_nodes': self.max_nodes,
+            'max_steps': self.max_steps,
+            'embedding_dim': self.embedding_dim,
+            'hidden_dim': self.hidden_dim,
+            'total_reward': getattr(self, 'episode_total_reward', 0.0),
+            'save_timestamp': datetime.now().isoformat()
+        }
+        
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        saved_files.append(metadata_file)
+        
+        print(f"💾 Saved model files for episode {episode_num}:")
+        for file in saved_files:
+            print(f"   📄 {os.path.basename(file)}")
+        
+        return saved_files
+    
+    def load_model(self, model_file_path):
+        """
+        Load a previously saved model.
+        
+        Parameters
+        ----------
+        model_file_path : str
+            Path to the saved model file
+        """
+        if not os.path.exists(model_file_path):
+            raise FileNotFoundError(f"Model file not found: {model_file_path}")
+        
+        if model_file_path.endswith('.zip'):
+            # Load stable-baselines3 model
+            if self.algorithm_name == 'PPO':
+                self.external_model = PPO.load(model_file_path, env=self)
+            elif self.algorithm_name == 'DQN':
+                self.external_model = DQN.load(model_file_path, env=self)
+            else:
+                raise ValueError(f"Unsupported algorithm for loading: {self.algorithm_name}")
+        
+        elif model_file_path.endswith('.pth'):
+            # Load PyTorch model (graph policy network)
+            checkpoint = torch.load(model_file_path)
+            if (hasattr(self, 'policy_agent') and 
+                self.policy_agent is not None and 
+                hasattr(self.policy_agent, 'policy_network')):
+                
+                self.policy_agent.policy_network.load_state_dict(checkpoint['policy_state_dict'])
+                self.policy_agent.policy_network.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+                print(f"✅ Loaded graph policy network from episode {checkpoint.get('episode', 'unknown')}")
+        
+        print(f"📥 Model loaded from: {os.path.basename(model_file_path)}")
+    
+    def list_saved_models(self):
+        """
+        List all saved models in the model directory.
+        
+        Returns
+        -------
+        dict
+            Dictionary with model types as keys and lists of files as values
+        """
+        if not os.path.exists(self.model_path):
+            print(f"📁 Model directory does not exist: {self.model_path}")
+            return {}
+        
+        files = os.listdir(self.model_path)
+        models = {
+            'rl_models': [f for f in files if f.endswith('.zip')],
+            'policy_models': [f for f in files if f.endswith('.pth')],
+            'metadata': [f for f in files if f.endswith('.json')]
+        }
+        
+        print(f"📚 Models in {self.model_path}:")
+        for model_type, file_list in models.items():
+            if file_list:
+                print(f"  {model_type}: {len(file_list)} files")
+                for file in sorted(file_list)[:5]:  # Show first 5
+                    print(f"    📄 {file}")
+                if len(file_list) > 5:
+                    print(f"    ... and {len(file_list) - 5} more")
+            else:
+                print(f"  {model_type}: No files")
+        
+        return models
 
     def _setup_environment(self):
         """Initialize substrate, topology, state extractor, and policy components."""
@@ -566,6 +743,9 @@ class DurotaxisEnv(gym.Env):
             if self.last_reward_breakdown:
                 self.last_reward_breakdown['termination_reward'] = termination_reward
                 self.last_reward_breakdown['total_reward'] = reward
+        
+        # Accumulate episode total reward
+        self.episode_total_reward += reward
         
         truncated = self.current_step >= self.max_steps
         
@@ -1283,9 +1463,22 @@ class DurotaxisEnv(gym.Env):
         """Reset the environment to initial state."""
         super().reset(seed=seed)
         
+        # Save model from previous episode if it completed
+        if (self.current_episode > 0 and 
+            hasattr(self, 'episode_total_reward') and
+            (self.external_model is not None or self._policy_initialized)):
+            
+            try:
+                self.save_model(episode_num=self.current_episode)
+            except Exception as e:
+                print(f"⚠️  Model saving failed for episode {self.current_episode}: {e}")
+        
         # Reset step counter and increment episode counter
         self.current_step = 0
         self.current_episode += 1
+        
+        # Initialize episode reward tracking
+        self.episode_total_reward = 0.0
         
         # Reset centroid tracking for fail termination
         self.centroid_history = []
@@ -1467,9 +1660,9 @@ class PolicyWrapper:
 
 
 if __name__ == '__main__':
-    print("Setting up DurotaxisEnv with Graph Transformer Policy...")
+    print("Setting up DurotaxisEnv with Graph Transformer Policy and Model Saving...")
     
-    # Create the durotaxis environment
+    # Create the durotaxis environment with model saving
     env = DurotaxisEnv(
         substrate_size=(600, 400),
         substrate_type='linear',
@@ -1481,10 +1674,13 @@ if __name__ == '__main__':
         hidden_dim=128,
         render_mode="human",  # Enable rendering
         enable_visualization=True,  # Enable topology.show()
-        flush_delay=0.0001
+        flush_delay=0.0001,
+        model_path="./saved_models"  # Model saving directory
     )
     
     print("Environment created successfully!")
+    print(f"🏠 Model saving directory: {env.model_path}")
+    print(f"⏰ Run timestamp: {env.run_timestamp}")
     
     # Test the environment
     print("\n--- Testing Environment ---")
@@ -1499,8 +1695,6 @@ if __name__ == '__main__':
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         
-        # print(f"Step {step + 1}: Reward={reward:.3f}, Nodes={info['num_nodes']}, Edges={info['num_edges']}")
-        
         # Render the environment to show visualization
         env.render()
         
@@ -1510,61 +1704,98 @@ if __name__ == '__main__':
     
     print(f"Total reward: {total_reward:.3f}")
     
-    # Example of training with a simple RL algorithm
-    print("\n--- Testing with PPO (Meta-Learning Approach) ---")
-    
-    # Note: This creates a meta-learning setup where PPO learns to optimize
-    # the high-level environment dynamics while the graph transformer policy
-    # handles the low-level graph actions
+    # Example of training with PPO and model saving
+    print("\n--- Testing with PPO (Meta-Learning Approach) + Model Saving ---")
     
     try: 
-        # Create a simple policy that works with the environment
+        # Create a PPO model and register it with the environment
         model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4)
+        env.set_external_model(model)  # Register the model for saving
         
-        print("Training for a short period...")
-        model.learn(total_timesteps=1000)
+        print("Training for a short period with model saving...")
         
-        print("Testing trained model...")
-        obs, info = env.reset()
-        for _ in range(20):
-            action, _states = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            env.render()
-            if terminated or truncated:
-                obs, info = env.reset()
+        # Train for multiple episodes to demonstrate saving
+        episodes_to_train = 3
+        steps_per_episode = 300
+        
+        for episode in range(episodes_to_train):
+            print(f"\n🎯 Training Episode {episode + 1}/{episodes_to_train}")
+            
+            # Train for one episode worth of steps
+            model.learn(total_timesteps=steps_per_episode)
+            
+            # Test the trained model for this episode
+            print(f"🧪 Testing episode {episode + 1}...")
+            obs, info = env.reset()  # This will save the model from previous episode
+            
+            episode_reward = 0
+            for step in range(20):
+                action, _states = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = env.step(action)
+                episode_reward += reward
+                env.render()
                 
+                if terminated or truncated:
+                    print(f"✅ Episode {episode + 1} completed with reward: {episode_reward:.3f}")
+                    break
+        
+        # Save final model
+        print(f"\n💾 Saving final model...")
+        env.save_model()
+        
     except Exception as e:
-        print(f"PPO training failed: {e}")
+        print(f"❌ PPO training failed: {e}")
         print("This is expected - the environment is primarily designed for the graph transformer policy")
     
     # Clean up
     env.close()
     
-    print("\n--- Direct Policy Testing ---")
+    print("\n--- Direct Policy Testing with Model Saving ---")
     
-    # Test the graph transformer policy directly
+    # Test the graph transformer policy directly with model saving
     env2 = DurotaxisEnv(
         init_num_nodes=8,
         max_steps=50,
         embedding_dim=128,
         hidden_dim=128,
         render_mode="human",
-        enable_visualization=True
+        enable_visualization=True,
+        model_path="./saved_models"
     )
     
-    obs, info = env2.reset()
-    print(f"Direct policy test - Initial: {info}")
+    env2.set_algorithm_name("GraphTransformerDirect")  # Set custom algorithm name
     
-    for step in range(15):
-        obs, reward, terminated, truncated, info = env2.step(0)
-        print(f"Step {step + 1}: Reward={reward:.3f}, Nodes={info['num_nodes']}, Edges={info['num_edges']}")
+    print(f"🔬 Direct policy test with saving to: {env2.model_path}")
+    
+    # Run multiple episodes to test saving
+    for episode in range(3):
+        print(f"\n🎮 Episode {episode + 1}/3")
+        obs, info = env2.reset()  # This will save previous episode's model
+        print(f"Initial: {info}")
         
-        # Render the environment to show visualization
-        env2.render()
-        
-        if terminated or truncated:
-            print("Episode ended")
-            obs, info = env2.reset()
+        episode_reward = 0
+        for step in range(15):
+            obs, reward, terminated, truncated, info = env2.step(0)
+            episode_reward += reward
+            
+            # Render the environment to show visualization
+            env2.render()
+            
+            if terminated or truncated:
+                print(f"✅ Episode {episode + 1} ended with reward: {episode_reward:.3f}")
+                break
+    
+    # Save final model
+    env2.save_model()
     
     env2.close()
-    print("\nDurotaxis environment integration test completed! 🚀")
+    print("\n🚀 Durotaxis environment with model saving test completed!")
+    
+    # Show saved models
+    import os
+    if os.path.exists("./saved_models"):
+        print(f"\n📁 Saved models in ./saved_models:")
+        for file in sorted(os.listdir("./saved_models")):
+            print(f"   � {file}")
+    else:
+        print("\n⚠️  No saved models directory found")
