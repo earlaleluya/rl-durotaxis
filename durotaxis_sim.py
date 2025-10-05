@@ -3,7 +3,6 @@ from gymnasium import spaces
 import numpy as np
 import torch
 import torch.nn as nn
-from stable_baselines3 import DQN, PPO
 import os
 from datetime import datetime
 import json
@@ -165,7 +164,7 @@ class Durotaxis(gym.Env):
     set_algorithm_name(algorithm_name)
         Set algorithm name for model saving metadata.
     set_external_model(model)
-        Register external RL model (PPO, DQN) for saving/loading.
+        Register external model for saving/loading (optional extension).
     
     Notes
     -----
@@ -208,10 +207,10 @@ class Durotaxis(gym.Env):
     
     Model saving and loading:
     
-    >>> env.set_algorithm_name("PPO")
+    >>> env.set_algorithm_name("GraphTransformer")
     >>> env.save_model(episode_num=100)  # Saves to run directory
     >>> models = env.list_saved_models()  # Shows organized model list
-    >>> env.load_model("./saved_models/run0001/PPO_ep00100.zip")
+    >>> env.load_model("./saved_models/run0001/GraphTransformer_ep00100.pth")
     
     Advanced substrate configuration:
     
@@ -298,7 +297,7 @@ class Durotaxis(gym.Env):
         self.model_path = model_path
         self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.algorithm_name = "GraphTransformer"  # Default algorithm name
-        self.external_model = None  # Store external RL model (PPO, DQN, etc.)
+        self.external_model = None  # Optional external model for extensions
         
         # Determine run number and create run-specific directory
         self.run_number = self._get_next_run_number()
@@ -443,19 +442,19 @@ class Durotaxis(gym.Env):
         Parameters
         ----------
         algorithm_name : str
-            Name of the algorithm (e.g., 'PPO', 'DQN', 'GraphTransformer')
+            Name of the algorithm (e.g., 'GraphTransformer', 'CustomPolicy')
         """
         self.algorithm_name = algorithm_name
         print(f"🔧 Algorithm name set to: {self.algorithm_name}")
     
     def set_external_model(self, model):
         """
-        Set an external RL model for saving.
+        Set an external model for saving (optional extension point).
         
         Parameters
         ----------
-        model : stable_baselines3 model
-            The RL model to save (PPO, DQN, etc.)
+        model : object
+            Any external model to save
         """
         self.external_model = model
         if hasattr(model, '__class__'):
@@ -480,11 +479,19 @@ class Durotaxis(gym.Env):
         
         saved_files = []
         
-        # Save external RL model if available (PPO, DQN, etc.)
-        if self.external_model is not None:
+        # Save external model if available (extension point)
+        if hasattr(self, 'external_model') and self.external_model is not None:
             model_file = os.path.join(self.run_directory, f"{base_filename}")
-            self.external_model.save(model_file)
-            saved_files.append(model_file + ".zip")
+            # Try to save external model (implementation depends on model type)
+            try:
+                if hasattr(self.external_model, 'save'):
+                    self.external_model.save(model_file)
+                    saved_files.append(model_file + ".zip")
+                elif hasattr(self.external_model, 'state_dict'):
+                    torch.save(self.external_model.state_dict(), model_file + ".pth")
+                    saved_files.append(model_file + ".pth")
+            except Exception as e:
+                print(f"⚠️  Could not save external model: {e}")
         
         # Save internal graph policy network if available
         if (hasattr(self, 'policy_agent') and 
@@ -541,14 +548,10 @@ class Durotaxis(gym.Env):
         if not os.path.exists(model_file_path):
             raise FileNotFoundError(f"Model file not found: {model_file_path}")
         
-        if model_file_path.endswith('.zip'):
-            # Load stable-baselines3 model
-            if self.algorithm_name == 'PPO':
-                self.external_model = PPO.load(model_file_path, env=self)
-            elif self.algorithm_name == 'DQN':
-                self.external_model = DQN.load(model_file_path, env=self)
-            else:
-                raise ValueError(f"Unsupported algorithm for loading: {self.algorithm_name}")
+        if model_file_path.endswith('.zip') or model_file_path.endswith('.pkl'):
+            # Load external model (extension point)
+            print(f"⚠️  External model loading not implemented for {self.algorithm_name}")
+            print(f"💡 Implement custom loading logic for your specific model type")
         
         elif model_file_path.endswith('.pth'):
             # Load PyTorch model (graph policy network)
@@ -1012,7 +1015,7 @@ class Durotaxis(gym.Env):
         print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction} | A={len(executed_actions):2d} | T={terminated} {truncated}")
         
         # Auto-render after each step to ensure visualization is always updated
-        # This ensures visualization works even when PPO doesn't call render()
+        # This ensures visualization works consistently
         if self.enable_visualization:
             self.render()
         
@@ -1768,7 +1771,7 @@ class Durotaxis(gym.Env):
     def render(self):
         """Render the current state of the environment."""
         # Always show visualization if enabled, regardless of render_mode
-        # This ensures visualization works even when wrapped by PPO/Monitor
+        # This ensures visualization works consistently across different usage patterns
         state = self.state_extractor.get_state_features(include_substrate=True)
         
         # Debug: Track render calls
@@ -1891,23 +1894,6 @@ class Durotaxis(gym.Env):
             self.topology.close()
 
 
-class PolicyWrapper:
-    """
-    A wrapper that makes the graph transformer policy compatible with stable-baselines3.
-    This allows training the policy network directly using RL algorithms.
-    """
-    
-    def __init__(self, env):
-        self.env = env
-        
-    def predict(self, obs, deterministic=True):
-        """
-        Make a prediction using the policy network.
-        Returns dummy action since actual actions come from policy network.
-        """
-        return np.array([0]), None  # Dummy action
-
-
 if __name__ == '__main__':
     print("Setting up Durotaxis with Graph Transformer Policy and Model Saving...")
     
@@ -1937,115 +1923,79 @@ if __name__ == '__main__':
     print(f"Initial observation shape: {obs.shape}")
     print(f"Initial info: {info}")
     
-    # Run a few steps to test the integration
-    total_reward = 0
-    for step in range(10):
-        action = 0  # Dummy action
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        
-        # Render the environment to show visualization
-        env.render()
-        
-        if terminated or truncated:
-            print(f"Episode ended at step {step + 1}")
-            break
+
+    # Training the Internal Graph Transformer Policy
+    print("\n--- Training Internal Graph Transformer Policy ---")
     
-    print(f"Total reward: {total_reward:.3f}")
+    env.set_algorithm_name("GraphTransformerPolicy")  # Set algorithm name for saving
     
-    # Example of training with PPO and model saving
-    print("\n--- Testing with PPO (Meta-Learning Approach) + Model Saving ---")
+    print("Training graph transformer policy through episode experience...")
     
-    try: 
-        # Create a PPO model and register it with the environment
-        model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4)
-        env.set_external_model(model)  # Register the model for saving
+    # Train for multiple episodes using internal policy
+    episodes_to_train = 5
+    max_steps_per_episode = 200
+    
+    for episode in range(episodes_to_train):
+        print(f"\n🎯 Training Episode {episode + 1}/{episodes_to_train}")
         
-        print("Training for a short period with model saving...")
+        obs, info = env.reset()  # Reset environment
+        episode_reward = 0
         
-        # Train for multiple episodes to demonstrate saving
-        episodes_to_train = 3
-        steps_per_episode = 300
-        
-        for episode in range(episodes_to_train):
-            print(f"\n🎯 Training Episode {episode + 1}/{episodes_to_train}")
+        # Run episode using internal graph transformer policy
+        for step in range(max_steps_per_episode):
+            # The internal policy_agent.act_with_policy() is called inside env.step()
+            obs, reward, terminated, truncated, info = env.step(0)  # Dummy action - internal policy used
+            episode_reward += reward
             
-            # Train for one episode worth of steps
-            model.learn(total_timesteps=steps_per_episode)
-            
-            # Test the trained model for this episode
-            print(f"🧪 Testing episode {episode + 1}...")
-            obs, info = env.reset()  # This will save the model from previous episode
-            
-            episode_reward = 0
-            for step in range(20):
-                action, _states = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = env.step(action)
-                episode_reward += reward
+            # Optional: render every few steps to see progress
+            if step % 10 == 0:
                 env.render()
-                
-                if terminated or truncated:
-                    print(f"✅ Episode {episode + 1} completed with reward: {episode_reward:.3f}")
-                    break
+            
+            if terminated or truncated:
+                print(f"✅ Episode {episode + 1} completed in {step + 1} steps with reward: {episode_reward:.3f}")
+                break
         
-        # Save final model
-        print(f"\n💾 Saving final model...")
-        env.save_model()
-        
-    except Exception as e:
-        print(f"❌ PPO training failed: {e}")
-        print("This is expected - the environment is primarily designed for the graph transformer policy")
+        # Save model after each episode
+        if episode > 0:  # Skip saving after first episode
+            env.save_model(episode_num=episode)
+    
+    # Save final model
+    print(f"\n💾 Saving final trained model...")
+    env.save_model()
     
     # Clean up
     env.close()
     
-    print("\n--- Direct Policy Testing with Model Saving ---")
+    print("\n--- Evaluating Trained Policy ---")
     
-    # Test the graph transformer policy directly with model saving
-    env2 = Durotaxis(
-        init_num_nodes=1,
-        max_steps=50,
-        num_critical_nodes=200,
-        embedding_dim=128,
-        hidden_dim=128,
-        render_mode="human",
-        enable_visualization=True,
-        model_path="./saved_models"
-    )
+    # Test the trained graph transformer policy
+    print(f"🧪 Testing trained policy from: {env.model_path}")
     
-    env2.set_algorithm_name("GraphTransformerDirect")  # Set custom algorithm name
-    
-    print(f"🔬 Direct policy test with saving to: {env2.model_path}")
-    
-    # Run multiple episodes to test saving
-    for episode in range(3):
-        print(f"\n🎮 Episode {episode + 1}/3")
-        obs, info = env2.reset()  # This will save previous episode's model
-        print(f"Initial: {info}")
+    # Run evaluation episodes
+    evaluation_episodes = 3
+    for episode in range(evaluation_episodes):
+        print(f"\n🎮 Evaluation Episode {episode + 1}/{evaluation_episodes}")
+        obs, info = env.reset()
+        print(f"Initial state: {info}")
         
         episode_reward = 0
-        for step in range(15):
-            obs, reward, terminated, truncated, info = env2.step(0)
+        for step in range(50):
+            obs, reward, terminated, truncated, info = env.step(0)  # Internal policy handles everything
             episode_reward += reward
             
-            # Render the environment to show visualization
-            env2.render()
+            # Render to show the trained policy in action
+            if step % 5 == 0:  # Render every 5 steps
+                env.render()
             
             if terminated or truncated:
-                print(f"✅ Episode {episode + 1} ended with reward: {episode_reward:.3f}")
+                print(f"✅ Evaluation episode {episode + 1} ended with reward: {episode_reward:.3f}")
                 break
     
-    # Save final model
-    env2.save_model()
-    
-    env2.close()
-    print("\n🚀 Durotaxis environment with model saving test completed!")
+    env.close()
+    print("\n🚀 Graph Transformer Policy Training and Evaluation Completed!")
     
     # Show saved models
-    import os
-    if os.path.exists("./saved_models"):
-        print(f"\n📁 Saved models in ./saved_models:")
-        for file in sorted(os.listdir("./saved_models")):
-            print(f"   � {file}")
-    else:
-        print("\n⚠️  No saved models directory found")
+    print("\n� Listing all saved models:")
+    env.list_saved_models()
+
+    # TODO create train and test functions
