@@ -49,9 +49,9 @@ class Durotaxis(gym.Env):
         Parameters for substrate generation. For linear: {'m': slope, 'b': intercept}.
     init_num_nodes : int, default=1
         Initial number of nodes (cells) when environment resets.
-    max_nodes : int, default=50
+    max_critical_nodes : int, default=50
         Maximum allowed nodes before applying growth penalties.
-    num_critical_nodes : int, default=200
+    threshold_critical_nodes : int, default=200
         Critical threshold - episode terminates if exceeded (fail condition).
     max_steps : int, default=1000
         Maximum steps per episode before timeout termination.
@@ -68,7 +68,7 @@ class Durotaxis(gym.Env):
         Graph-level reward components:
         
         - 'connectivity_penalty': Penalty when nodes < 2 (loss of connectivity)
-        - 'growth_penalty': Penalty when nodes > max_nodes (excessive growth)
+        - 'growth_penalty': Penalty when nodes > max_critical_nodes (excessive growth)
         - 'survival_reward': Base reward for maintaining valid topology
         - 'action_reward': Reward multiplier per action taken (encourages exploration)
     
@@ -117,8 +117,6 @@ class Durotaxis(gym.Env):
     
     render_mode : str or None, default=None
         Visualization mode ('human' for real-time rendering, None for headless).
-    policy_agent : TopologyPolicyAgent or None, default=None
-        External policy agent for action selection (auto-initialized if None).
     flush_delay : float, default=0.01
         Delay between visualization updates (seconds) for rendering control.
     enable_visualization : bool, default=True
@@ -168,7 +166,7 @@ class Durotaxis(gym.Env):
     
     Notes
     -----
-    **Observation Space**: The environment uses semantic pooling when the number of nodes exceeds max_nodes.
+    **Observation Space**: The environment uses semantic pooling when the number of nodes exceeds max_critical_nodes.
     This intelligently selects representative nodes using spatial and feature clustering rather than arbitrary
     truncation, preserving graph structure information for the policy network.
     
@@ -192,7 +190,7 @@ class Durotaxis(gym.Env):
     --------
     Basic environment setup:
     
-    >>> env = Durotaxis(substrate_size=(800, 600), init_num_nodes=3, max_nodes=30)
+    >>> env = Durotaxis(substrate_size=(800, 600), init_num_nodes=3, max_critical_nodes=30)
     >>> obs, info = env.reset()
     >>> obs, reward, terminated, truncated, info = env.step(0)  # Action ignored
     
@@ -218,7 +216,7 @@ class Durotaxis(gym.Env):
     ...     substrate_type='exponential',
     ...     substrate_params={'base': 1.0, 'rate': 0.02, 'direction': 'x'},
     ...     delta_intensity=3.0,  # Higher threshold for durotaxis
-    ...     num_critical_nodes=150  # Lower critical limit
+    ...     threshold_critical_nodes=150  # Lower critical limit
     ... )
     """
     metadata = {"render_modes": ["human"], "render_fps": 30}
@@ -228,8 +226,8 @@ class Durotaxis(gym.Env):
                  substrate_type='linear',
                  substrate_params={'m': 0.01, 'b': 1.0},
                  init_num_nodes=1,
-                 max_nodes=50,
-                 num_critical_nodes=200,
+                 max_critical_nodes=50,
+                 threshold_critical_nodes=200,
                  max_steps=1000,
                  embedding_dim=64,
                  hidden_dim=128,  
@@ -238,7 +236,7 @@ class Durotaxis(gym.Env):
                  # Grouped reward parameters
                  graph_rewards={
                      'connectivity_penalty': 10.0,  # Penalty for losing connectivity (N < 2)
-                     'growth_penalty': 10.0,  # Penalty for excessive growth (N > max_nodes)
+                     'growth_penalty': 10.0,  # Penalty for excessive growth (N > max_critical_nodes)
                      'survival_reward': 0.01,  # Basic survival reward for valid topology
                      'action_reward': 0.005,  # Reward multiplier per action taken
                  },
@@ -272,7 +270,6 @@ class Durotaxis(gym.Env):
                      'critical_nodes_penalty': -25.0,  # Penalty for exceeding critical node threshold
                  },
                  render_mode=None,
-                 policy_agent=None,
                  flush_delay=0.01,  # Visualization flush delay
                  enable_visualization=True,  # Enable/disable topology.show() visualization
                  model_path="./saved_models"):  # Path to save models
@@ -283,8 +280,8 @@ class Durotaxis(gym.Env):
         self.substrate_type = substrate_type
         self.substrate_params = substrate_params
         self.init_num_nodes = init_num_nodes
-        self.max_nodes = max_nodes
-        self.num_critical_nodes = num_critical_nodes
+        self.max_critical_nodes = max_critical_nodes
+        self.threshold_critical_nodes = threshold_critical_nodes
         self.max_steps = max_steps
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim 
@@ -369,9 +366,9 @@ class Durotaxis(gym.Env):
         # 2. Observation Space
         # The observation space uses output from GraphInputEncoder directly.
         # Shape: [num_nodes+1, out_dim] where first element is graph token, rest are node embeddings
-        max_nodes_plus_graph = self.max_nodes + 1  # +1 for graph token
+        max_critical_nodes_plus_graph = self.max_critical_nodes + 1  # +1 for graph token
         encoder_out_dim = 64  # Default out_dim from GraphInputEncoder
-        obs_dim = max_nodes_plus_graph * encoder_out_dim
+        obs_dim = max_critical_nodes_plus_graph * encoder_out_dim
         
         self.observation_space = spaces.Box(
             low=-np.inf, 
@@ -518,7 +515,7 @@ class Durotaxis(gym.Env):
             'run_number': self.run_number,
             'run_timestamp': self.run_timestamp,
             'substrate_size': self.substrate_size,
-            'max_nodes': self.max_nodes,
+            'max_critical_nodes': self.max_critical_nodes,
             'max_steps': self.max_steps,
             'embedding_dim': self.embedding_dim,
             'hidden_dim': self.hidden_dim,
@@ -674,7 +671,7 @@ class Durotaxis(gym.Env):
             np.ndarray: Fixed-size observation vector from encoder output
             
         Note:
-            Uses semantic pooling when num_nodes > max_nodes to preserve representative
+            Uses semantic pooling when num_nodes > max_critical_nodes to preserve representative
             nodes based on their features rather than arbitrary truncation.
         """
         try:
@@ -693,7 +690,7 @@ class Durotaxis(gym.Env):
             
             # Handle empty graphs
             if node_features.shape[0] == 0:
-                return np.zeros((self.max_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
+                return np.zeros((self.max_critical_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
             
             # Get encoder output directly
             encoder_out = self.observation_encoder(
@@ -705,11 +702,11 @@ class Durotaxis(gym.Env):
             
             # Check for potential information reduction
             actual_nodes = encoder_out.shape[0] - 1  # -1 for graph token
-            max_size = (self.max_nodes + 1) * self.encoder_out_dim
+            max_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
             
-            if actual_nodes <= self.max_nodes:
+            if actual_nodes <= self.max_critical_nodes:
                 # Normal case: no pooling needed
-                # print(f"✅ No pooling needed: {actual_nodes} nodes ≤ {self.max_nodes} max_nodes")
+                # print(f"✅ No pooling needed: {actual_nodes} nodes ≤ {self.max_critical_nodes} max_critical_nodes")
                 encoder_flat = encoder_out.flatten().detach().cpu().numpy()
                 
                 # Pad with zeros if smaller than max size
@@ -719,7 +716,7 @@ class Durotaxis(gym.Env):
             
             else:
                 # 🧠 SEMANTIC POOLING: Intelligently select representative nodes
-                # print(f"🧠 Applying semantic pooling: {actual_nodes} nodes > {self.max_nodes} max_nodes")
+                # print(f"🧠 Applying semantic pooling: {actual_nodes} nodes > {self.max_critical_nodes} max_critical_nodes")
                 
                 graph_token = encoder_out[0:1]  # [1, out_dim] - Always preserve graph token
                 node_embeddings = encoder_out[1:]  # [actual_nodes, out_dim]
@@ -728,7 +725,7 @@ class Durotaxis(gym.Env):
                 selected_indices = self._semantic_node_selection(
                     node_embeddings, 
                     state, 
-                    target_count=self.max_nodes
+                    target_count=self.max_critical_nodes
                 )
                 
                 # Select representative nodes
@@ -753,7 +750,7 @@ class Durotaxis(gym.Env):
         except Exception as e:
             print(f"Error getting encoder observation: {e}")
             # Fallback to zero observation
-            return np.zeros((self.max_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
+            return np.zeros((self.max_critical_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
 
     def _semantic_node_selection(self, node_embeddings, state, target_count):
         """
@@ -1036,7 +1033,7 @@ class Durotaxis(gym.Env):
         num_nodes = new_state['num_nodes']
         if num_nodes < 2:
             graph_reward -= self.connectivity_penalty  # Strong penalty for losing all connectivity
-        elif num_nodes > self.max_nodes:
+        elif num_nodes > self.max_critical_nodes:
             graph_reward -= self.growth_penalty  # Penalty for excessive growth, N > Nc
         else:
             graph_reward += self.survival_reward # Basic survival reward
@@ -1148,7 +1145,7 @@ class Durotaxis(gym.Env):
             # total_node_reward = sum(node_rewards) / len(node_rewards)
             
             # Strategy 3: Weighted combination (uncomment to use)
-            # total_node_reward = sum(node_rewards) * (num_nodes / self.max_nodes)
+            # total_node_reward = sum(node_rewards) * (num_nodes / self.max_critical_nodes)
         else:
             total_node_reward = 0.0
         
@@ -1551,8 +1548,8 @@ class Durotaxis(gym.Env):
             tuple: (terminated: bool, termination_reward: float)
         """
         # 1. Terminate if number of nodes exceeds critical threshold ('fail termination')
-        if state['num_nodes'] > self.num_critical_nodes:
-            print(f"🚨 Episode terminated: Too many nodes ({state['num_nodes']} > {self.num_critical_nodes} critical threshold)")
+        if state['num_nodes'] > self.threshold_critical_nodes:
+            print(f"🚨 Episode terminated: Too many nodes ({state['num_nodes']} > {self.threshold_critical_nodes} critical threshold)")
             return True, self.critical_nodes_penalty
         
         # 2. Terminate if number of nodes becomes 0 ('fail termination')
@@ -1786,9 +1783,9 @@ class Durotaxis(gym.Env):
                 # Set step counter for visualization
                 self.topology._step_counter = self.current_step
                 
-                # Show additional info if nodes exceed max_nodes
-                if actual_num_nodes > self.max_nodes:
-                    print(f"  🔍 Visualizing full topology: {actual_num_nodes} nodes (exceeds max_nodes={self.max_nodes})")
+                # Show additional info if nodes exceed max_critical_nodes
+                if actual_num_nodes > self.max_critical_nodes:
+                    print(f"  🔍 Visualizing full topology: {actual_num_nodes} nodes (exceeds max_critical_nodes={self.max_critical_nodes})")
                 elif actual_num_nodes == 0:
                     print(f"  🔍 Showing substrate-only: 0 nodes")
                 
@@ -1903,7 +1900,7 @@ if __name__ == '__main__':
         substrate_type='linear',
         substrate_params={'m': 0.01, 'b': 1.0},
         init_num_nodes=5,
-        max_nodes=30,
+        max_critical_nodes=30,
         max_steps=100,
         embedding_dim=64,
         hidden_dim=128,
