@@ -228,6 +228,7 @@ class Durotaxis(gym.Env):
                  init_num_nodes=1,
                  max_critical_nodes=50,
                  threshold_critical_nodes=200,
+                 max_episodes=500,
                  max_steps=1000,
                  embedding_dim=64,
                  hidden_dim=128,  
@@ -282,6 +283,7 @@ class Durotaxis(gym.Env):
         self.init_num_nodes = init_num_nodes
         self.max_critical_nodes = max_critical_nodes
         self.threshold_critical_nodes = threshold_critical_nodes
+        self.max_episodes = max_episodes
         self.max_steps = max_steps
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim 
@@ -1891,108 +1893,133 @@ class Durotaxis(gym.Env):
             self.topology.close()
 
 
-if __name__ == '__main__':
-    print("Setting up Durotaxis with Graph Transformer Policy and Model Saving...")
+    def train(self):
+        """Train the policy agent for multiple episodes using internal policy."""
+        for episode in range(self.max_episodes):
+            
+            # Reset environment
+            obs, info = self.reset()  # This will save the model from previous episode
+            episode_reward = 0
+            
+            # Run episode using internal graph transformer policy
+            for step in range(self.max_steps):
+                # The internal policy_agent.act_with_policy() is called inside self.step()
+                obs, reward, terminated, truncated, info = self.step(0)  # Dummy action - internal policy used
+                episode_reward += reward
+                
+                self.render()
+                
+                if terminated or truncated:
+                    print(f"✅ Episode {episode + 1} completed in {step + 1} steps with reward: {episode_reward:.3f}")
+                    break
+            
+            # Save model after each episode
+            if episode > 0:  # Skip saving after first episode
+                self.save_model(episode_num=episode)
+        
+        # Save final model
+        print(f"\n💾 Saving final trained model...")
+        self.save_model()
+        
+        # Clean up
+        self.close()
+        
+        # Show saved models
+        print("\n🚀 Listing all saved models:")
+        self.list_saved_models()
+
     
-    # Create the durotaxis environment with model saving
+
+    def test(self, evaluation_episodes=None, evaluation_steps=None):
+        # Test the trained graph transformer policy
+        print(f"🧪 Testing trained policy from: {self.model_path}")
+
+        # Define the number of episodes abd steps for the testing
+        max_episodes = evaluation_episodes if evaluation_episodes is not None else self.max_episodes
+        max_steps = evaluation_steps if evaluation_steps is not None else self.max_steps
+
+        for episode in range(max_episodes):
+            obs, info = self.reset()
+            episode_reward = 0
+
+            for step in range(max_steps):
+                obs, reward, terminated, truncated, info = self.step(0)  # Internal policy handles everything
+                episode_reward += reward
+                
+                self.render()
+                
+                if terminated or truncated:
+                    print(f"✅ Episode {episode + 1} completed in {step + 1} steps with reward: {episode_reward:.3f}")
+                    break
+            
+        self.close()
+        
+
+
+
+
+
+
+
+if __name__ == '__main__':
+    
+    # Create the durotaxis environment 
     env = Durotaxis(
         substrate_size=(200, 200),
         substrate_type='linear',
         substrate_params={'m': 0.01, 'b': 1.0},
-        init_num_nodes=5,
-        max_critical_nodes=30,
+        init_num_nodes=1,
+        max_critical_nodes=50,
+        threshold_critical_nodes=200,
         max_steps=100,
         embedding_dim=64,
-        hidden_dim=128,
-        render_mode="human",  # Enable rendering
-        enable_visualization=True,  # Enable topology.show()
-        flush_delay=0.0001,
-        model_path="./saved_models"  # Model saving directory
+        hidden_dim=128,  
+        delta_time=3,
+        delta_intensity=2.50,
+        graph_rewards={
+            'connectivity_penalty': 10.0,  
+            'growth_penalty': 10.0,  
+            'survival_reward': 0.01,  
+            'action_reward': 0.005,  
+        },
+        node_rewards={
+            'movement_reward': 0.01,  
+            'intensity_penalty': 5.0,  
+            'intensity_bonus': 0.01,  
+            'substrate_reward': 0.05, 
+        },
+        edge_reward={
+        'rightward_bonus': 0.1, 
+        'leftward_penalty': 0.1},  
+        spawn_rewards={
+            'spawn_success_reward': 1.0, 
+            'spawn_failure_penalty': 1.0,  
+        },
+        delete_reward={
+        'proper_deletion': 2.0, 
+        'persistence_penalty': 2.0},  
+        position_rewards={
+            'boundary_bonus': 0.1,  
+            'left_edge_penalty': 0.2,  
+            'edge_position_penalty': 0.1, 
+        },
+        termination_rewards={
+            'success_reward': 100.0, 
+            'out_of_bounds_penalty': -30.0,  
+            'no_nodes_penalty': -30.0,  
+            'leftward_drift_penalty': -30.0,  
+            'timeout_penalty': -10.0,  
+            'critical_nodes_penalty': -25.0,  
+        },
+        enable_visualization=False,
+        render_mode=None,  
+        model_path="./saved_models"  
     )
-    
-    print("Environment created successfully!")
-    print(f"🏠 Model saving directory: {env.model_path}")
-    print(f"⏰ Run timestamp: {env.run_timestamp}")
-    
-    # Test the environment
-    print("\n--- Testing Environment ---")
-    obs, info = env.reset()
-    print(f"Initial observation shape: {obs.shape}")
-    print(f"Initial info: {info}")
-    
 
-    # Training the Internal Graph Transformer Policy
-    print("\n--- Training Internal Graph Transformer Policy ---")
-    
-    env.set_algorithm_name("GraphTransformerPolicy")  # Set algorithm name for saving
-    
-    print("Training graph transformer policy through episode experience...")
-    
-    # Train for multiple episodes using internal policy
-    episodes_to_train = 5
-    max_steps_per_episode = 200
-    
-    for episode in range(episodes_to_train):
-        print(f"\n🎯 Training Episode {episode + 1}/{episodes_to_train}")
+    env.enable_visualization=True
         
-        obs, info = env.reset()  # Reset environment
-        episode_reward = 0
-        
-        # Run episode using internal graph transformer policy
-        for step in range(max_steps_per_episode):
-            # The internal policy_agent.act_with_policy() is called inside env.step()
-            obs, reward, terminated, truncated, info = env.step(0)  # Dummy action - internal policy used
-            episode_reward += reward
-            
-            # Optional: render every few steps to see progress
-            if step % 10 == 0:
-                env.render()
-            
-            if terminated or truncated:
-                print(f"✅ Episode {episode + 1} completed in {step + 1} steps with reward: {episode_reward:.3f}")
-                break
-        
-        # Save model after each episode
-        if episode > 0:  # Skip saving after first episode
-            env.save_model(episode_num=episode)
-    
-    # Save final model
-    print(f"\n💾 Saving final trained model...")
-    env.save_model()
-    
-    # Clean up
-    env.close()
-    
-    print("\n--- Evaluating Trained Policy ---")
-    
-    # Test the trained graph transformer policy
-    print(f"🧪 Testing trained policy from: {env.model_path}")
-    
-    # Run evaluation episodes
-    evaluation_episodes = 3
-    for episode in range(evaluation_episodes):
-        print(f"\n🎮 Evaluation Episode {episode + 1}/{evaluation_episodes}")
-        obs, info = env.reset()
-        print(f"Initial state: {info}")
-        
-        episode_reward = 0
-        for step in range(50):
-            obs, reward, terminated, truncated, info = env.step(0)  # Internal policy handles everything
-            episode_reward += reward
-            
-            # Render to show the trained policy in action
-            if step % 5 == 0:  # Render every 5 steps
-                env.render()
-            
-            if terminated or truncated:
-                print(f"✅ Evaluation episode {episode + 1} ended with reward: {episode_reward:.3f}")
-                break
-    
-    env.close()
-    print("\n🚀 Graph Transformer Policy Training and Evaluation Completed!")
-    
-    # Show saved models
-    print("\n� Listing all saved models:")
     env.list_saved_models()
 
-    # TODO create train and test functions
+    # env.load_model("./saved_models/run0005/GraphTransformerPolicy_ep00500.pth")
+
+    # env.test()
