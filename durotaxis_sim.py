@@ -495,19 +495,31 @@ class Durotaxis(gym.Env):
         # Save internal graph policy network if available
         if (hasattr(self, 'policy_agent') and 
             self.policy_agent is not None and 
-            hasattr(self.policy_agent, 'policy_network')):
+            hasattr(self.policy_agent, 'policy')):
             
             policy_file = os.path.join(self.run_directory, f"{base_filename}_policy.pth")
-            torch.save({
-                'policy_state_dict': self.policy_agent.policy_network.state_dict(),
-                'encoder_state_dict': self.policy_agent.policy_network.encoder.state_dict(),
+            
+            # Save complete policy state including optimizer if available
+            policy_checkpoint = {
+                'policy_state_dict': self.policy_agent.policy.state_dict(),
+                'encoder_state_dict': self.policy_agent.policy.encoder.state_dict(),
                 'episode': episode_num,
                 'hidden_dim': self.hidden_dim,
                 'embedding_dim': self.embedding_dim,
                 'run_number': self.run_number,
-                'run_timestamp': self.run_timestamp
-            }, policy_file)
+                'run_timestamp': self.run_timestamp,
+                'policy_config': {
+                    'noise_scale': getattr(self.policy_agent.policy, 'noise_scale', 0.1),
+                    'encoder_out_dim': getattr(self.policy_agent.policy.encoder, 'out_dim', 64),
+                    'encoder_num_layers': getattr(self.policy_agent.policy.encoder, 'num_layers', 4)
+                }
+            }
+            
+            torch.save(policy_checkpoint, policy_file)
             saved_files.append(policy_file)
+            print(f"   ✅ Saved policy network: {os.path.basename(policy_file)}")
+        else:
+            print(f"   ⚠️  Policy not available for saving (policy_initialized: {getattr(self, '_policy_initialized', False)})")
         
         # Save environment metadata
         metadata_file = os.path.join(self.run_directory, f"{base_filename}_metadata.json")
@@ -543,6 +555,11 @@ class Durotaxis(gym.Env):
         ----------
         model_file_path : str
             Path to the saved model file
+            
+        Returns
+        -------
+        dict
+            Loaded checkpoint information
         """
         if not os.path.exists(model_file_path):
             raise FileNotFoundError(f"Model file not found: {model_file_path}")
@@ -551,19 +568,43 @@ class Durotaxis(gym.Env):
             # Load external model (extension point)
             print(f"⚠️  External model loading not implemented for {self.algorithm_name}")
             print(f"💡 Implement custom loading logic for your specific model type")
+            return None
         
         elif model_file_path.endswith('.pth'):
             # Load PyTorch model (graph policy network)
-            checkpoint = torch.load(model_file_path)
+            checkpoint = torch.load(model_file_path, map_location='cpu')
+            
+            # Initialize policy if not already done
+            if not hasattr(self, 'policy_agent') or self.policy_agent is None:
+                print("🔧 Initializing policy for model loading...")
+                self._initialize_policy()
+            
             if (hasattr(self, 'policy_agent') and 
                 self.policy_agent is not None and 
-                hasattr(self.policy_agent, 'policy_network')):
+                hasattr(self.policy_agent, 'policy')):
                 
-                self.policy_agent.policy_network.load_state_dict(checkpoint['policy_state_dict'])
-                self.policy_agent.policy_network.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+                # Load the model states
+                self.policy_agent.policy.load_state_dict(checkpoint['policy_state_dict'])
+                self.policy_agent.policy.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+                
+                # Restore configuration if available
+                if 'policy_config' in checkpoint:
+                    config = checkpoint['policy_config']
+                    if hasattr(self.policy_agent.policy, 'noise_scale'):
+                        self.policy_agent.policy.noise_scale = config.get('noise_scale', 0.1)
+                
                 print(f"✅ Loaded graph policy network from episode {checkpoint.get('episode', 'unknown')}")
+                print(f"   📊 Hidden dim: {checkpoint.get('hidden_dim', 'unknown')}")
+                print(f"   � Embedding dim: {checkpoint.get('embedding_dim', 'unknown')}")
+                print(f"   📊 Run: {checkpoint.get('run_number', 'unknown')}")
+                
+                return checkpoint
+            else:
+                print("❌ Failed to initialize policy for loading")
+                return None
         
-        print(f"📥 Model loaded from: {os.path.basename(model_file_path)}")
+        print(f"�📥 Model loaded from: {os.path.basename(model_file_path)}")
+        return None
     
     def list_saved_models(self):
         """
@@ -1968,8 +2009,8 @@ if __name__ == '__main__':
         substrate_size=(200, 200),
         substrate_type='linear',
         substrate_params={'m': 0.01, 'b': 1.0},
-        init_num_nodes=1,
-        max_critical_nodes=50,
+        init_num_nodes=5,
+        max_critical_nodes=30,
         threshold_critical_nodes=200,
         max_steps=100,
         embedding_dim=64,
