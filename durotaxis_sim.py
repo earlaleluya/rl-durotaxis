@@ -2087,12 +2087,11 @@ if __name__ == '__main__':
     )
 
 
-    env.save_per_episode = True
-    env.max_episodes = 3
-    env.max_steps = 4
-    env.train()
+    # env.save_per_episode = True
+    # env.max_episodes = 3
+    # env.max_steps = 4
+    # env.train()
 
-    # env.enable_visualization=True
-    # env.list_saved_models()
-    # env.load_model("./saved_models/run0001/GraphTransformerPolicy_ep00002_policy.pth")
-    # env.test()
+    env.enable_visualization=True
+    env.load_model("./saved_models/run0001/GraphTransformerPolicy_ep00002_policy.pth")
+    env.test()
