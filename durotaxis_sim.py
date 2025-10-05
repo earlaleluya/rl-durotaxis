@@ -115,14 +115,14 @@ class Durotaxis(gym.Env):
         - 'timeout_penalty': Small penalty for reaching maximum time steps
         - 'critical_nodes_penalty': Penalty for exceeding critical node threshold
     
-    render_mode : str or None, default=None
-        Visualization mode ('human' for real-time rendering, None for headless).
-    flush_delay : float, default=0.01
+    flush_delay : float, default=0.0001
         Delay between visualization updates (seconds) for rendering control.
     enable_visualization : bool, default=True
         Enable/disable automatic topology visualization during episodes.
     model_path : str, default="./saved_models"
         Base directory for saving models with automatic run organization.
+    save_per_episode : bool, default=False
+        Whether to save model after every episode. If False, only saves at the final episode.
     
     Attributes
     ----------
@@ -206,9 +206,17 @@ class Durotaxis(gym.Env):
     Model saving and loading:
     
     >>> env.set_algorithm_name("GraphTransformer")
-    >>> env.save_model(episode_num=100)  # Saves to run directory
+    >>> saved_files = env.save_model(episode_num=100)  # Manual save
+    >>> saved_files = env.auto_save_model(episode_num=100, is_final_episode=True)  # Auto save
     >>> models = env.list_saved_models()  # Shows organized model list
-    >>> env.load_model("./saved_models/run0001/GraphTransformer_ep00100.pth")
+    >>> checkpoint = env.load_model("./saved_models/run0001/GraphTransformer_ep00100_policy.pth")
+    
+    Configure automatic saving:
+    
+    >>> # Save every episode
+    >>> env = Durotaxis(save_per_episode=True)
+    >>> # Save only final episode (default)
+    >>> env = Durotaxis(save_per_episode=False)
     
     Advanced substrate configuration:
     
@@ -219,7 +227,7 @@ class Durotaxis(gym.Env):
     ...     threshold_critical_nodes=150  # Lower critical limit
     ... )
     """
-    metadata = {"render_modes": ["human"], "render_fps": 30}
+    metadata = {"render_fps": 30}
 
     def __init__(self, 
                  substrate_size=(600, 400),
@@ -270,10 +278,11 @@ class Durotaxis(gym.Env):
                      'timeout_penalty': -10.0,  # Small penalty for reaching max time steps
                      'critical_nodes_penalty': -25.0,  # Penalty for exceeding critical node threshold
                  },
-                 render_mode=None,
-                 flush_delay=0.01,  # Visualization flush delay
+                 flush_delay=0.0001,  # Visualization flush delay
                  enable_visualization=True,  # Enable/disable topology.show() visualization
-                 model_path="./saved_models"):  # Path to save models
+                 model_path="./saved_models",  # Path to save models
+                 save_per_episode=False, # Whether to save model per episode, but regardless of value, the final model is saved.
+            ):
         super().__init__()
         
         # Environment parameters
@@ -294,6 +303,7 @@ class Durotaxis(gym.Env):
         
         # Model saving configuration
         self.model_path = model_path
+        self.save_per_episode = save_per_episode
         self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.algorithm_name = "GraphTransformer"  # Default algorithm name
         self.external_model = None  # Optional external model for extensions
@@ -382,9 +392,7 @@ class Durotaxis(gym.Env):
         # 3. Initialize environment components
         self._setup_environment()
         
-        # 4. Rendering
-        assert render_mode is None or render_mode in self.metadata["render_modes"]
-        self.render_mode = render_mode
+        # 4. Rendering setup complete
         
         # Create GraphInputEncoder for observations
         self.observation_encoder = GraphInputEncoder(
@@ -546,6 +554,31 @@ class Durotaxis(gym.Env):
             print(f"   📄 {os.path.basename(file)}")
         
         return saved_files
+    
+    def auto_save_model(self, episode_num=None, is_final_episode=False):
+        """
+        Automatically save model based on save_per_episode setting.
+        
+        Parameters
+        ----------
+        episode_num : int, optional
+            Episode number for naming. If None, uses current episode.
+        is_final_episode : bool, default=False
+            Whether this is the final episode (always saves regardless of save_per_episode)
+            
+        Returns
+        -------
+        list or None
+            List of saved files if saving occurred, None otherwise
+        """
+        if self.save_per_episode or is_final_episode:
+            return self.save_model(episode_num=episode_num)
+        else:
+            # Skip saving for non-final episodes when save_per_episode=False
+            if episode_num is None:
+                episode_num = self.current_episode
+            print(f"🔄 Skipping model save for episode {episode_num} (save_per_episode=False)")
+            return None
     
     def load_model(self, model_file_path):
         """
@@ -1761,7 +1794,7 @@ class Durotaxis(gym.Env):
             (self.external_model is not None or self._policy_initialized)):
             
             try:
-                self.save_model(episode_num=self.current_episode)
+                self.auto_save_model(episode_num=self.current_episode)
             except Exception as e:
                 print(f"⚠️  Model saving failed for episode {self.current_episode}: {e}")
         
@@ -1809,8 +1842,8 @@ class Durotaxis(gym.Env):
         return observation, info
 
     def render(self):
-        """Render the current state of the environment."""
-        # Always show visualization if enabled, regardless of render_mode
+        """Render the current state of the environment using enable_visualization setting."""
+        # Always show visualization if enabled, based on enable_visualization setting
         # This ensures visualization works consistently across different usage patterns
         state = self.state_extractor.get_state_features(include_substrate=True)
         
@@ -1953,21 +1986,17 @@ class Durotaxis(gym.Env):
                 if terminated or truncated:
                     print(f"✅ Episode {episode + 1} completed in {step + 1} steps with reward: {episode_reward:.3f}")
                     break
-            
-            # Save model after each episode
-            if episode > 0:  # Skip saving after first episode
-                self.save_model(episode_num=episode)
         
-        # Save final model
+        # Save final model (always save the last episode)
         print(f"\n💾 Saving final trained model...")
-        self.save_model()
+        self.auto_save_model(episode_num=self.current_episode, is_final_episode=True)
         
         # Clean up
         self.close()
         
-        # Show saved models
-        print("\n🚀 Listing all saved models:")
-        self.list_saved_models()
+        # # Show saved models
+        # print("\n🚀 Listing all saved models:")
+        # self.list_saved_models()
 
     
 
@@ -2053,14 +2082,17 @@ if __name__ == '__main__':
             'critical_nodes_penalty': -25.0,  
         },
         enable_visualization=False,
-        render_mode=None,  
-        model_path="./saved_models"  
+        model_path="./saved_models",
+        save_per_episode=False  
     )
 
-    env.enable_visualization=True
-        
-    env.list_saved_models()
 
-    # env.load_model("./saved_models/run0005/GraphTransformerPolicy_ep00500.pth")
+    env.save_per_episode = True
+    env.max_episodes = 3
+    env.max_steps = 4
+    env.train()
 
+    # env.enable_visualization=True
+    # env.list_saved_models()
+    # env.load_model("./saved_models/run0001/GraphTransformerPolicy_ep00002_policy.pth")
     # env.test()
