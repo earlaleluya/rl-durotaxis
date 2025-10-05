@@ -1022,8 +1022,17 @@ class Durotaxis(gym.Env):
         -------
         observation : np.ndarray
             Graph embedding observation from the encoder
-        reward : float
-            Scalar reward combining graph, node, and termination rewards
+        reward : dict
+            Dictionary containing reward components with keys:
+            - 'total_reward': float - Total scalar reward (sum of all components)
+            - 'graph_reward': float - Graph-level rewards (connectivity, growth, actions)
+            - 'spawn_reward': float - Durotaxis-based spawning rewards
+            - 'delete_reward': float - Deletion compliance rewards
+            - 'edge_reward': float - Edge direction rewards
+            - 'total_node_reward': float - Aggregated node-level rewards
+            - 'node_rewards': list - Individual node reward values
+            - 'num_nodes': int - Number of nodes in current state
+            - 'termination_reward': float - Termination reward (only if episode terminated)
         terminated : bool
             True if episode terminated (success/failure conditions met)
         truncated : bool
@@ -1070,8 +1079,8 @@ class Durotaxis(gym.Env):
         # Get observation from GraphInputEncoder output
         observation = self._get_encoder_observation(new_state)
         
-        # Calculate reward 
-        reward = self._calculate_reward(prev_state, new_state, executed_actions)
+        # Calculate reward components (returns detailed breakdown)
+        reward_components = self._calculate_reward(prev_state, new_state, executed_actions)
         
         # Reset new_node flags after reward calculation (they've served their purpose)
         self._reset_new_node_flags()
@@ -1079,16 +1088,15 @@ class Durotaxis(gym.Env):
         # Check termination conditions
         terminated, termination_reward = self._check_terminated(new_state)
         
-        # Add termination reward to the total reward
+        # Add termination reward to the reward components
         if terminated:
-            reward += termination_reward
-            # Update reward breakdown to include termination reward
-            if self.last_reward_breakdown:
-                self.last_reward_breakdown['termination_reward'] = termination_reward
-                self.last_reward_breakdown['total_reward'] = reward
+            reward_components['termination_reward'] = termination_reward
+            # Update total reward to include termination reward
+            reward_components['total_reward'] += termination_reward
         
-        # Accumulate episode total reward
-        self.episode_total_reward += reward
+        # Accumulate episode total reward (using scalar total for tracking)
+        scalar_reward = reward_components['total_reward']
+        self.episode_total_reward += scalar_reward
         
         truncated = self.current_step >= self.max_steps
         
@@ -1099,23 +1107,23 @@ class Durotaxis(gym.Env):
             'actions_taken': len(executed_actions),
             'step': self.current_step,
             'policy_initialized': self._policy_initialized,
-            'reward_breakdown': self.last_reward_breakdown  # Detailed reward information
+            'reward_breakdown': reward_components  # Detailed reward information as dictionary
         }
         
         # 📊 One-line performance summary
         centroid_x = new_state.get('graph_features', [0, 0, 0, 0])[3] if new_state['num_nodes'] > 0 else 0
         centroid_direction = "→" if len(self.centroid_history) >= 2 and centroid_x > self.centroid_history[-2] else "←" if len(self.centroid_history) >= 2 and centroid_x < self.centroid_history[-2] else "="
-        spawn_r = self.last_reward_breakdown.get('spawn_reward', 0) if self.last_reward_breakdown else 0
-        node_r = self.last_reward_breakdown.get('total_node_reward', 0) if self.last_reward_breakdown else 0
-        edge_r = self.last_reward_breakdown.get('edge_reward', 0) if self.last_reward_breakdown else 0
-        print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction} | A={len(executed_actions):2d} | T={terminated} {truncated}")
+        spawn_r = reward_components.get('spawn_reward', 0)
+        node_r = reward_components.get('total_node_reward', 0)
+        edge_r = reward_components.get('edge_reward', 0)
+        print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction} | A={len(executed_actions):2d} | T={terminated} {truncated}")
         
         # Auto-render after each step to ensure visualization is always updated
         # This ensures visualization works consistently
         if self.enable_visualization:
             self.render()
         
-        return observation, reward, terminated, truncated, info
+        return observation, reward_components, terminated, truncated, info
 
     def _calculate_reward(self, prev_state, new_state, actions):
         """
@@ -1251,8 +1259,8 @@ class Durotaxis(gym.Env):
         # Final combined reward
         total_reward = graph_reward + total_node_reward
         
-        # Store detailed reward information for analysis
-        self.last_reward_breakdown = {
+        # Create detailed reward information dictionary
+        reward_breakdown = {
             'total_reward': total_reward,
             'graph_reward': graph_reward,
             'spawn_reward': spawn_reward,
@@ -1263,7 +1271,10 @@ class Durotaxis(gym.Env):
             'num_nodes': num_nodes
         }
         
-        return total_reward
+        # Store for backward compatibility (some methods might still use this)
+        self.last_reward_breakdown = reward_breakdown
+        
+        return reward_breakdown
 
     def _calculate_spawn_reward(self, prev_state, new_state, actions):
         """
