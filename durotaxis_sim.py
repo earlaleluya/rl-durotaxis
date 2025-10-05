@@ -532,17 +532,40 @@ class Durotaxis(gym.Env):
         # Save environment metadata
         metadata_file = os.path.join(self.run_directory, f"{base_filename}_metadata.json")
         metadata = {
+            # Algorithm and episode info
             'algorithm': self.algorithm_name,
             'episode': episode_num,
             'run_number': self.run_number,
             'run_timestamp': self.run_timestamp,
+            'save_timestamp': datetime.now().isoformat(),
+            'total_reward': getattr(self, 'episode_total_reward', 0.0),
+            
+            # Environment parameters
             'substrate_size': self.substrate_size,
+            'substrate_type': self.substrate_type,
+            'substrate_params': self.substrate_params,
+            'init_num_nodes': self.init_num_nodes,
             'max_critical_nodes': self.max_critical_nodes,
+            'threshold_critical_nodes': self.threshold_critical_nodes,
+            'max_episodes': self.max_episodes,
             'max_steps': self.max_steps,
             'embedding_dim': self.embedding_dim,
             'hidden_dim': self.hidden_dim,
-            'total_reward': getattr(self, 'episode_total_reward', 0.0),
-            'save_timestamp': datetime.now().isoformat()
+            'delta_time': self.delta_time,
+            'delta_intensity': self.delta_intensity,
+            'flush_delay': self.flush_delay,
+            'enable_visualization': self.enable_visualization,
+            'model_path': self.model_path,
+            'save_per_episode': self.save_per_episode,
+            
+            # Grouped reward parameters
+            'graph_rewards': self.graph_rewards,
+            'node_rewards': self.node_rewards,
+            'edge_reward': self.edge_reward,
+            'spawn_rewards': self.spawn_rewards,
+            'delete_reward': self.delete_reward,
+            'position_rewards': self.position_rewards,
+            'termination_rewards': self.termination_rewards,
         }
         
         with open(metadata_file, 'w') as f:
