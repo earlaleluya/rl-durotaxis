@@ -13,6 +13,7 @@ This is designed to run immediately and show real training progress.
 
 import sys
 import os
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,7 +51,20 @@ class DurotaxisTrainer:
                  weight_momentum: float = 0.9,
                  normalize_weights_every: int = 10,
                  moving_avg_window: int = 20,
-                 log_every: int = 50):
+                 log_every: int = 50,
+                 progress_print_every: int = 5,
+                 checkpoint_every: Optional[int] = None,
+                 substrate_type: str = 'linear',
+                 max_episode_length: int = 200,
+                 # Environment setup parameters (HIGH PRIORITY)
+                 substrate_size: tuple = (400, 300),
+                 init_num_nodes: int = 2,
+                 max_critical_nodes: int = 15,
+                 # Random substrate parameter ranges (HIGH PRIORITY)
+                 linear_m_range: tuple = (0.01, 0.1),
+                 linear_b_range: tuple = (0.5, 2.0),
+                 exponential_m_range: tuple = (0.01, 0.05),
+                 exponential_b_range: tuple = (0.5, 1.5)):
         
         self.total_episodes = total_episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,14 +72,32 @@ class DurotaxisTrainer:
         self.entropy_bonus_coeff = entropy_bonus_coeff
         self.moving_avg_window = moving_avg_window  # Window size for moving averages
         self.log_every = log_every                  # Logging frequency
-        os.makedirs(save_dir, exist_ok=True)
+        self.progress_print_every = progress_print_every  # One-line progress frequency
+        self.checkpoint_every = checkpoint_every    # Model checkpoint frequency
+        self.substrate_type = substrate_type        # Substrate type for training
+        self.max_episode_length = max_episode_length  # Maximum episode length
+        
+        # Environment setup parameters
+        self.substrate_size = substrate_size
+        self.init_num_nodes = init_num_nodes
+        self.max_critical_nodes = max_critical_nodes
+        
+        # Random substrate parameter ranges
+        self.linear_m_range = linear_m_range
+        self.linear_b_range = linear_b_range
+        self.exponential_m_range = exponential_m_range
+        self.exponential_b_range = exponential_b_range
+        
+        # Create run directory with automatic numbering
+        self.run_dir = self.create_run_directory(save_dir)
+        print(f"📁 Created run directory: {self.run_dir} (Run #{self.run_number})")
         
         # Environment setup
         self.env = Durotaxis(
-            substrate_size=(400, 300),
-            init_num_nodes=2,
-            max_critical_nodes=15,
-            max_steps=200,
+            substrate_size=self.substrate_size,
+            init_num_nodes=self.init_num_nodes,
+            max_critical_nodes=self.max_critical_nodes,
+            max_steps=self.max_episode_length,
             # Balanced reward settings for learning
             graph_rewards={
                 'connectivity_penalty': 5.0,
@@ -78,6 +110,9 @@ class DurotaxisTrainer:
                 'spawn_failure_penalty': 0.5
             }
         )
+        
+        # Initialize substrate based on type
+        self._initialize_substrate()
         
         # Initialize the state extractor with the environment's topology
         self.state_extractor = TopologyState()
@@ -142,6 +177,28 @@ class DurotaxisTrainer:
         self.losses = defaultdict(list)
         self.best_total_reward = float('-inf')
         
+        # Spawn parameter tracking for each episode
+        self.current_episode_spawn_params = {
+            'gamma': [],
+            'alpha': [],
+            'noise': [],
+            'theta': []
+        }
+        
+        # Reward component tracking for each episode
+        self.current_episode_rewards = {
+            'graph_reward': [],
+            'spawn_reward': [],
+            'delete_reward': [],
+            'edge_reward': [],
+            'total_node_reward': [],
+            'total_reward': []
+        }
+        
+        # Summary attributes for consolidated one-line logging
+        self.current_spawn_summary = {'count': 0}
+        self.current_reward_summary = []
+        
         # Adaptive reward scaling
         self.component_running_stats = {
             component: {
@@ -158,6 +215,16 @@ class DurotaxisTrainer:
         print(f"   Device: {self.device}")
         print(f"   Network parameters: {sum(p.numel() for p in self.network.parameters()):,}")
         print(f"   Component names: {self.component_names}")
+        print(f"   Substrate type: {self.substrate_type}")
+        if self.substrate_type == 'random':
+            print(f"   Substrate updates: Every episode with random type and parameters")
+        else:
+            print(f"   Substrate config: Fixed {self.substrate_type} substrate")
+        if self.checkpoint_every is not None:
+            print(f"   Checkpoint frequency: every {self.checkpoint_every} episodes")
+        else:
+            print(f"   Checkpoint frequency: disabled (only best + final models saved)")
+        print(f"   Progress print frequency: every {self.progress_print_every} episodes")
     
     def create_action_mask(self, state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         """Create action mask to prevent invalid topology operations"""
@@ -472,10 +539,42 @@ class DurotaxisTrainer:
         
         return stats
     
+    def create_run_directory(self, base_dir: str) -> str:
+        """Create a new run directory with automatic numbering (run0001, run0002, etc.)"""
+        import glob
+        import re
+        
+        # Ensure base directory exists
+        os.makedirs(base_dir, exist_ok=True)
+        
+        # Find existing run directories
+        existing_runs = glob.glob(os.path.join(base_dir, "run[0-9][0-9][0-9][0-9]"))
+        
+        # Extract run numbers
+        run_numbers = []
+        for run_path in existing_runs:
+            run_name = os.path.basename(run_path)
+            match = re.match(r"run(\d{4})", run_name)
+            if match:
+                run_numbers.append(int(match.group(1)))
+        
+        # Determine next run number
+        if run_numbers:
+            next_run_number = max(run_numbers) + 1
+        else:
+            next_run_number = 1
+        
+        # Create run directory
+        self.run_number = next_run_number
+        run_dir = os.path.join(base_dir, f"run{next_run_number:04d}")
+        os.makedirs(run_dir, exist_ok=True)
+        
+        return run_dir
+    
     def save_training_statistics(self, filepath: str = None) -> str:
         """Save comprehensive training statistics to file"""
         if filepath is None:
-            filepath = os.path.join(self.save_dir, f"training_stats_episode_{len(self.episode_rewards['total_reward'])}.json")
+            filepath = os.path.join(self.run_dir, f"training_stats_episode_{len(self.episode_rewards['total_reward'])}.json")
         
         stats = self.get_training_statistics(window=self.moving_avg_window)
         
@@ -511,8 +610,51 @@ class DurotaxisTrainer:
         
         return filepath
     
+    def get_checkpoint_info(self) -> Dict[str, any]:
+        """Get information about checkpoint configuration and saved models"""
+        import glob
+        
+        # Find saved models in run directory
+        best_models = glob.glob(os.path.join(self.run_dir, "best_model_*.pt"))
+        checkpoints = glob.glob(os.path.join(self.run_dir, "checkpoint_*.pt"))
+        final_model = os.path.join(self.run_dir, "final_model.pt")
+        
+        return {
+            'checkpoint_frequency': self.checkpoint_every if self.checkpoint_every is not None else 'disabled',
+            'run_number': self.run_number,
+            'run_directory': self.run_dir,
+            'best_models_count': len(best_models),
+            'periodic_checkpoints_count': len(checkpoints),
+            'final_model_exists': os.path.exists(final_model),
+            'total_saved_models': len(best_models) + len(checkpoints) + (1 if os.path.exists(final_model) else 0),
+            'best_reward_so_far': self.best_total_reward,
+            'save_directory': self.save_dir
+        }
+    
     def collect_episode(self) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], bool, bool]:
         """Collect one episode of experience"""
+        # Reset spawn parameter tracking for this episode
+        self.current_episode_spawn_params = {
+            'gamma': [],
+            'alpha': [],
+            'noise': [],
+            'theta': []
+        }
+        
+        # Reset reward component tracking for this episode
+        self.current_episode_rewards = {
+            'graph_reward': [],
+            'spawn_reward': [],
+            'delete_reward': [],
+            'edge_reward': [],
+            'total_node_reward': [],
+            'total_reward': []
+        }
+        
+        # Update substrate if using random type
+        if self.substrate_type == 'random':
+            self._update_random_substrate()
+        
         states = []
         actions_taken = []
         rewards = []
@@ -527,7 +669,7 @@ class DurotaxisTrainer:
         terminated = False
         truncated = False
         
-        while not done and episode_length < 200:
+        while not done and episode_length < self.max_episode_length:
             # Get current state
             state_dict = self.state_extractor.get_state_features(include_substrate=True)
             state_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
@@ -574,6 +716,12 @@ class DurotaxisTrainer:
                     try:
                         if action_type == 'spawn':
                             params = self.network.get_spawn_parameters(output, node_id)
+                            # Track spawn parameters for statistics
+                            self.current_episode_spawn_params['gamma'].append(params[0])
+                            self.current_episode_spawn_params['alpha'].append(params[1])
+                            self.current_episode_spawn_params['noise'].append(params[2])
+                            self.current_episode_spawn_params['theta'].append(params[3])
+                            
                             self.env.topology.spawn(node_id, gamma=params[0], alpha=params[1], 
                                                   noise=params[2], theta=params[3])
                         elif action_type == 'delete':
@@ -585,6 +733,11 @@ class DurotaxisTrainer:
             # Environment step
             next_obs, reward_components, terminated, truncated, info = self.env.step(0)
             done = terminated or truncated
+            
+            # Track reward components for statistics
+            for component, value in reward_components.items():
+                if component in self.current_episode_rewards:
+                    self.current_episode_rewards[component].append(value)
             
             # Store reward components
             rewards.append(reward_components)
@@ -930,7 +1083,11 @@ class DurotaxisTrainer:
     
     def train(self):
         """Main training loop"""
-        print(f"🏋️ Starting training for {self.total_episodes} episodes")
+        # Create run directory for this training session
+        self.run_dir = self.create_run_directory(self.save_dir)
+        print(f"🏋️ Starting training for {self.total_episodes} episodes (Run #{self.run_number:04d})")
+        print(f"📁 Saving to: {self.run_dir}")
+        print(f"📊 Progress format: Ep | R: Current (MA: MovingAvg, Best: Best) Trend | Loss | Entropy | Steps | Success | Focus: Component(Weight)")
         
         for episode in range(self.total_episodes):
             # Collect episode
@@ -962,97 +1119,298 @@ class DurotaxisTrainer:
             for loss_name, loss_value in losses.items():
                 self.losses[loss_name].append(loss_value)
             
-            # Logging
-            if episode % self.log_every == 0:
-                # Use moving averages for smoother trend tracking
-                recent_reward = moving_average(self.episode_rewards['total_reward'], self.moving_avg_window)
+            # Compute and save spawn parameter statistics
+            self.save_spawn_statistics(episode)
+            
+            # Compute and save reward component statistics
+            self.save_reward_statistics(episode)
+            
+            # One-line comprehensive progress print (includes spawn & reward stats)
+            if episode % self.progress_print_every == 0 or episode < 10:
+                recent_reward = moving_average(self.episode_rewards['total_reward'], min(10, len(self.episode_rewards['total_reward'])))
+                best_so_far = max(self.episode_rewards['total_reward']) if self.episode_rewards['total_reward'] else 0.0
+                total_loss = losses.get('total_loss', 0.0)
+                entropy_bonus = losses.get('entropy_bonus', 0.0)
+                dominant_comp = max(self.component_weights.items(), key=lambda x: x[1])[0]
+                dominant_weight = self.component_weights[dominant_comp]
                 
-                print(f"\n📊 Episode {episode}")
-                print(f"   Total reward (moving avg): {recent_reward:.3f}")
-                print(f"   Episode length: {len(rewards)}")
-                print(f"   Success: {success}")
+                # Show progress with trend indicator
+                trend = "↗" if len(self.episode_rewards['total_reward']) > 1 and recent_reward > self.episode_rewards['total_reward'][-2] else "→"
                 
-                # Show component reward trends with moving averages
-                print(f"   📈 Component Rewards (moving avg, window={self.moving_avg_window}):")
-                for comp in self.component_names:
-                    comp_avg = moving_average(self.episode_rewards[comp], self.moving_avg_window)
-                    print(f"      {comp}: {comp_avg:.3f}")
+                # Build spawn info
+                spawn_info = ""
+                if hasattr(self, 'current_spawn_summary') and self.current_spawn_summary['count'] > 0:
+                    spawn_info = f" | Spawns: {self.current_spawn_summary['count']}(γ:{self.current_spawn_summary['gamma']} α:{self.current_spawn_summary['alpha']})"
                 
-                # Show adaptive component weights
-                print(f"   🎯 Adaptive Component Weights:")
-                for comp, weight in self.component_weights.items():
-                    print(f"      {comp}: {weight:.4f}")
+                # Build reward breakdown info  
+                reward_info = ""
+                if hasattr(self, 'current_reward_summary') and self.current_reward_summary:
+                    total_r = next((r for r in self.current_reward_summary if r['name'] == 'total_reward'), None)
+                    graph_r = next((r for r in self.current_reward_summary if r['name'] == 'graph_reward'), None)
+                    if total_r and graph_r:
+                        reward_info = f" | Rewards: T:{total_r['sum']:.1f} G:{graph_r['sum']:.1f}"
                 
-                # Show loss trends with moving averages
-                print(f"   📉 Loss Trends (moving avg, window={self.moving_avg_window}):")
-                for loss_name in ['total_loss', 'policy_loss_discrete', 'policy_loss_continuous', 'entropy_bonus']:
-                    if loss_name in self.losses and self.losses[loss_name]:
-                        loss_avg = moving_average(self.losses[loss_name], self.moving_avg_window)
-                        print(f"      {loss_name}: {loss_avg:.6f}")
+                # Build substrate info
+                substrate_info = ""
+                if self.substrate_type == 'random':
+                    params = self.current_substrate_params
+                    substrate_info = f" | Sub: {params['kind'][:3]}(m:{params['m']:.3f} b:{params['b']:.2f})"
+                elif self.substrate_type in ['linear', 'exponential']:
+                    substrate_info = f" | Sub: {self.substrate_type[:3]}"
                 
-                # Show recent weight normalization if it happened
-                if self.weight_updates_count % self.normalize_weights_every == 0:
-                    print(f"   🔄 Weights normalized (update #{self.weight_updates_count})")
-                
-                # Component breakdown
-                print("   Component rewards (recent avg):")
-                for component in ['graph_reward', 'spawn_reward', 'edge_reward', 'total_node_reward']:
-                    if self.episode_rewards[component]:
-                        avg_reward = np.mean(self.episode_rewards[component][-10:])
-                        print(f"     {component}: {avg_reward:.3f}")
-                
-                # Show adaptive scaling information
-                if self.enable_adaptive_scaling and episode >= self.scaling_warmup_episodes:
-                    scaling_factors = self.get_component_scaling_factors()
-                    print("   🎯 Adaptive scaling factors:")
-                    for component in ['graph_reward', 'spawn_reward', 'edge_reward', 'total_node_reward']:
-                        if component in scaling_factors:
-                            factor = scaling_factors[component]
-                            stats = self.component_running_stats[component]
-                            recent_std = np.std(list(stats['raw_rewards'])) if len(stats['raw_rewards']) >= 10 else 0
-                            print(f"     {component}: {factor:.2f}x (std: {recent_std:.3f})")
-                
-                if losses:
-                    print(f"   📉 Losses:")
-                    if 'policy_loss_discrete' in losses:
-                        print(f"     Policy (discrete): {losses['policy_loss_discrete']:.4f} (weight: {losses.get('discrete_weight', 0.7):.1f})")
-                    if 'policy_loss_continuous' in losses:
-                        print(f"     Policy (continuous): {losses['policy_loss_continuous']:.4f} (weight: {losses.get('continuous_weight', 0.3):.1f})")
-                    if 'total_policy_loss' in losses:
-                        print(f"     Policy (total): {losses['total_policy_loss']:.4f}")
-                    if 'total_value_loss' in losses:
-                        print(f"     Value (total): {losses['total_value_loss']:.4f}")
-                    if 'entropy_loss' in losses:
-                        print(f"     Entropy: {losses['entropy_loss']:.4f}")
+                print(f"Ep {episode:4d} | R: {episode_total_reward:6.3f} (MA: {recent_reward:6.3f}, Best: {best_so_far:6.3f}) {trend} | "
+                      f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | Steps: {len(rewards):3d} | "
+                      f"Success: {'✓' if success else '✗'} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){spawn_info}{reward_info}{substrate_info}")
             
             # Save best model
             if episode_total_reward > self.best_total_reward:
                 self.best_total_reward = episode_total_reward
                 self.save_model(f"best_model_ep{episode}.pt")
             
-            # Periodic saves
-            if episode % 200 == 0 and episode > 0:
+            # Periodic saves (only if checkpoint_every is configured)
+            if self.checkpoint_every is not None and episode % self.checkpoint_every == 0 and episode > 0:
                 self.save_model(f"checkpoint_ep{episode}.pt")
+                print(f"💾 Checkpoint saved at episode {episode}")
         
         print(f"🎉 Training completed!")
         print(f"   Best total reward: {self.best_total_reward:.3f}")
         self.save_model("final_model.pt")
         self.save_metrics()
     
+    def create_run_directory(self, base_dir: str) -> str:
+        """Create a new run directory with automatic numbering (run0001, run0002, etc.)"""
+        import glob
+        import re
+        
+        # Ensure base directory exists
+        os.makedirs(base_dir, exist_ok=True)
+        
+        # Find existing run directories
+        existing_runs = glob.glob(os.path.join(base_dir, "run[0-9][0-9][0-9][0-9]"))
+        
+        # Extract run numbers
+        run_numbers = []
+        for run_path in existing_runs:
+            run_name = os.path.basename(run_path)
+            match = re.match(r"run(\d{4})", run_name)
+            if match:
+                run_numbers.append(int(match.group(1)))
+        
+        # Determine next run number
+        if run_numbers:
+            next_run_number = max(run_numbers) + 1
+        else:
+            next_run_number = 1
+        
+        # Create run directory
+        self.run_number = next_run_number
+        run_dir = os.path.join(base_dir, f"run{next_run_number:04d}")
+        os.makedirs(run_dir, exist_ok=True)
+        
+        return run_dir
+    
+    def compute_spawn_statistics(self, episode: int) -> dict:
+        """Compute statistics for spawn parameters from current episode"""
+        import statistics
+        
+        stats = {
+            'episode': episode,
+            'timestamp': time.time(),
+            'parameters': {}
+        }
+        
+        for param_name, values in self.current_episode_spawn_params.items():
+            if values:  # Only compute stats if we have values
+                try:
+                    param_stats = {
+                        'count': len(values),
+                        'mean': statistics.mean(values),
+                        'std': statistics.stdev(values) if len(values) > 1 else 0.0,
+                        'min': min(values),
+                        'max': max(values),
+                        'median': statistics.median(values),
+                        'mode': statistics.mode(values) if len(values) > 0 else values[0],
+                        'range': max(values) - min(values),
+                        'variance': statistics.variance(values) if len(values) > 1 else 0.0
+                    }
+                    
+                    # Add quartiles if we have enough data
+                    if len(values) >= 4:
+                        sorted_vals = sorted(values)
+                        n = len(sorted_vals)
+                        param_stats['q25'] = sorted_vals[n//4]
+                        param_stats['q75'] = sorted_vals[3*n//4]
+                        param_stats['iqr'] = param_stats['q75'] - param_stats['q25']
+                    
+                    stats['parameters'][param_name] = param_stats
+                    
+                except statistics.StatisticsError:
+                    # Handle edge cases (e.g., mode with no clear mode)
+                    stats['parameters'][param_name] = {
+                        'count': len(values),
+                        'mean': statistics.mean(values),
+                        'std': statistics.stdev(values) if len(values) > 1 else 0.0,
+                        'min': min(values),
+                        'max': max(values),
+                        'median': statistics.median(values),
+                        'range': max(values) - min(values),
+                        'variance': statistics.variance(values) if len(values) > 1 else 0.0
+                    }
+            else:
+                # No spawn actions in this episode
+                stats['parameters'][param_name] = {
+                    'count': 0,
+                    'mean': None,
+                    'std': None,
+                    'min': None,
+                    'max': None,
+                    'median': None,
+                    'range': None,
+                    'variance': None
+                }
+        
+        return stats
+    
+    def save_spawn_statistics(self, episode: int) -> None:
+        """Compute and save spawn parameter statistics to JSON file (overwrites each episode)"""
+        stats = self.compute_spawn_statistics(episode)
+        
+        # Save to run directory
+        stats_filepath = os.path.join(self.run_dir, 'spawn_parameters_stats.json')
+        
+        with open(stats_filepath, 'w') as f:
+            json.dump(stats, f, indent=2)
+        
+        # Optional: Print summary if there were spawn actions (silent for one-line logging)
+        total_spawns = sum(stats['parameters'][param]['count'] for param in stats['parameters'] 
+                          if stats['parameters'][param]['count'] > 0)
+        
+        # Store spawn summary for consolidated logging
+        if total_spawns > 0:
+            self.current_spawn_summary = {
+                'count': total_spawns,
+                'gamma': f"{stats['parameters']['gamma']['mean']:.2f}±{stats['parameters']['gamma']['std']:.2f}",
+                'alpha': f"{stats['parameters']['alpha']['mean']:.2f}±{stats['parameters']['alpha']['std']:.2f}",
+                'noise': f"{stats['parameters']['noise']['mean']:.2f}±{stats['parameters']['noise']['std']:.2f}",
+                'theta': f"{stats['parameters']['theta']['mean']:.2f}±{stats['parameters']['theta']['std']:.2f}"
+            }
+        else:
+            self.current_spawn_summary = {'count': 0}
+    
+    def compute_reward_statistics(self, episode: int) -> dict:
+        """Compute statistics for reward components from current episode"""
+        import statistics
+        
+        stats = {
+            'episode': episode,
+            'timestamp': time.time(),
+            'substrate_params': self.current_substrate_params,
+            'reward_components': {}
+        }
+        
+        for component_name, values in self.current_episode_rewards.items():
+            if values:  # Only compute stats if we have values
+                try:
+                    component_stats = {
+                        'count': len(values),
+                        'mean': statistics.mean(values),
+                        'std': statistics.stdev(values) if len(values) > 1 else 0.0,
+                        'min': min(values),
+                        'max': max(values),
+                        'median': statistics.median(values),
+                        'mode': statistics.mode(values) if len(values) > 0 else values[0],
+                        'range': max(values) - min(values),
+                        'variance': statistics.variance(values) if len(values) > 1 else 0.0,
+                        'sum': sum(values)  # Total reward for this component
+                    }
+                    
+                    # Add quartiles if we have enough data
+                    if len(values) >= 4:
+                        sorted_vals = sorted(values)
+                        n = len(sorted_vals)
+                        component_stats['q25'] = sorted_vals[n//4]
+                        component_stats['q75'] = sorted_vals[3*n//4]
+                        component_stats['iqr'] = component_stats['q75'] - component_stats['q25']
+                    
+                    # Add percentiles for detailed analysis
+                    if len(values) >= 10:
+                        sorted_vals = sorted(values)
+                        n = len(sorted_vals)
+                        component_stats['p10'] = sorted_vals[n//10]
+                        component_stats['p90'] = sorted_vals[9*n//10]
+                        
+                    stats['reward_components'][component_name] = component_stats
+                    
+                except statistics.StatisticsError:
+                    # Handle edge cases (e.g., mode with no clear mode)
+                    stats['reward_components'][component_name] = {
+                        'count': len(values),
+                        'mean': statistics.mean(values),
+                        'std': statistics.stdev(values) if len(values) > 1 else 0.0,
+                        'min': min(values),
+                        'max': max(values),
+                        'median': statistics.median(values),
+                        'range': max(values) - min(values),
+                        'variance': statistics.variance(values) if len(values) > 1 else 0.0,
+                        'sum': sum(values)
+                    }
+            else:
+                # No rewards recorded for this component
+                stats['reward_components'][component_name] = {
+                    'count': 0,
+                    'mean': None,
+                    'std': None,
+                    'min': None,
+                    'max': None,
+                    'median': None,
+                    'range': None,
+                    'variance': None,
+                    'sum': 0.0
+                }
+        
+        return stats
+    
+    def save_reward_statistics(self, episode: int) -> None:
+        """Compute and save reward component statistics to JSON file (overwrites each episode)"""
+        stats = self.compute_reward_statistics(episode)
+        
+        # Save to run directory
+        stats_filepath = os.path.join(self.run_dir, 'reward_components_stats.json')
+        
+        with open(stats_filepath, 'w') as f:
+            json.dump(stats, f, indent=2)
+        
+        # Store reward summary for consolidated logging (silent for one-line logging)
+        key_components = ['total_reward', 'graph_reward', 'spawn_reward', 'edge_reward']
+        active_components = []
+        
+        for comp in key_components:
+            if comp in stats['reward_components'] and stats['reward_components'][comp]['count'] > 0:
+                comp_stats = stats['reward_components'][comp]
+                active_components.append({
+                    'name': comp,
+                    'sum': comp_stats['sum'],
+                    'mean': comp_stats['mean'],
+                    'std': comp_stats['std']
+                })
+        
+        self.current_reward_summary = active_components
+    
     def save_model(self, filename: str):
-        """Save model checkpoint"""
+        """Save model checkpoint to run directory"""
         checkpoint = {
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'episode_rewards': dict(self.episode_rewards),
             'losses': dict(self.losses),
             'best_reward': self.best_total_reward,
-            'component_weights': self.component_weights
+            'component_weights': self.component_weights,
+            'run_number': self.run_number
         }
         
-        filepath = os.path.join(self.save_dir, filename)
+        filepath = os.path.join(self.run_dir, filename)
         torch.save(checkpoint, filepath)
-        print(f"💾 Saved: {filepath}")
+        print(f"💾 Saved: {filename} (Run #{self.run_number})")
     
     def save_metrics(self):
         """Save training metrics"""
@@ -1080,10 +1438,62 @@ class DurotaxisTrainer:
             'final_scaling_factors': self.get_component_scaling_factors()
         }
         
-        with open(os.path.join(self.save_dir, 'training_metrics.json'), 'w') as f:
+        with open(os.path.join(self.run_dir, 'training_metrics.json'), 'w') as f:
             json.dump(metrics, f, indent=2)
         
-        print(f"📊 Saved training metrics")
+        print(f"📊 Saved training metrics to run{self.run_number:04d}")
+    
+    def _initialize_substrate(self):
+        """Initialize substrate based on substrate_type"""
+        # Validate substrate type
+        if self.substrate_type not in ['linear', 'exponential', 'random']:
+            raise ValueError(f"Invalid substrate_type: {self.substrate_type}. "
+                           f"Supported types: ['linear', 'exponential', 'random']")
+        
+        if self.substrate_type == 'random':
+            # For random, we'll update the substrate each episode
+            # Start with a default linear substrate
+            self.env.substrate.create('linear', m=0.05, b=1.0)
+            print(f"   Substrate initialized as random (starting with linear)")
+        else:
+            # Fixed substrate type
+            self.env.substrate.create(self.substrate_type, m=0.05, b=1.0)
+            print(f"   Substrate initialized as fixed {self.substrate_type}")
+        
+        # Initialize tracking for random substrate parameters
+        self.current_substrate_params = {
+            'kind': self.substrate_type,
+            'm': 0.05,
+            'b': 1.0
+        }
+    
+    def _update_random_substrate(self):
+        """Update substrate with random parameters (only for substrate_type='random')"""
+        import random
+        
+        # Random substrate type selection
+        substrate_types = ['linear', 'exponential']
+        chosen_type = random.choice(substrate_types)
+        
+        # Random parameter ranges based on substrate type (now configurable)
+        if chosen_type == 'linear':
+            # Linear substrate: y = mx + b
+            m = random.uniform(*self.linear_m_range)   # Configurable slope range
+            b = random.uniform(*self.linear_b_range)   # Configurable intercept range
+        else:  # exponential
+            # Exponential substrate: y = b * exp(mx)
+            m = random.uniform(*self.exponential_m_range)  # Configurable growth rate range
+            b = random.uniform(*self.exponential_b_range)  # Configurable base value range
+        
+        # Update the substrate
+        self.env.substrate.create(chosen_type, m=m, b=b)
+        
+        # Store current parameters for logging
+        self.current_substrate_params = {
+            'kind': chosen_type,
+            'm': m,
+            'b': b
+        }
 
 
 def main():
@@ -1094,7 +1504,17 @@ def main():
     trainer = DurotaxisTrainer(
         total_episodes=1000,
         learning_rate=3e-4,
-        hidden_dim=128
+        hidden_dim=128,
+        max_episode_length=200,  # Now configurable!
+        substrate_size=(400, 300),  # Now configurable!
+        init_num_nodes=2,  # Now configurable!
+        max_critical_nodes=15,  # Now configurable!
+        substrate_type='random',  # Try 'linear', 'exponential', or 'random'
+        # Custom random substrate ranges (optional)
+        linear_m_range=(0.01, 0.1),
+        linear_b_range=(0.5, 2.0),
+        exponential_m_range=(0.01, 0.05),
+        exponential_b_range=(0.5, 1.5)
     )
     
     trainer.train()
