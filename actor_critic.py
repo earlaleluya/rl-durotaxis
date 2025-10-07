@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import math
 from typing import Dict, Tuple, Optional, List
 from encoder import GraphInputEncoder
+from config_loader import ConfigLoader
 
 
 class HybridActorCritic(nn.Module):
@@ -49,20 +50,39 @@ class HybridActorCritic(nn.Module):
     
     def __init__(self, 
                  encoder: GraphInputEncoder,
-                 hidden_dim: int = 128,
-                 num_discrete_actions: int = 2,
-                 continuous_dim: int = 4,
-                 value_components: Optional[List[str]] = None,
-                 dropout_rate: float = 0.1):
+                 config_path: str = "config.yaml",
+                 **overrides):
+        """
+        Initialize HybridActorCritic with configuration from YAML file
+        
+        Parameters
+        ----------
+        encoder : GraphInputEncoder
+            Pre-configured graph input encoder
+        config_path : str
+            Path to configuration YAML file
+        **overrides
+            Parameter overrides for any configuration values
+        """
         super().__init__()
         
-        self.encoder = encoder
-        self.hidden_dim = hidden_dim
-        self.num_discrete_actions = num_discrete_actions
-        self.continuous_dim = continuous_dim
-        self.dropout_rate = dropout_rate
+        # Load configuration
+        config_loader = ConfigLoader(config_path)
+        config = config_loader.get_actor_critic_config()
         
-        # Default value components if not specified
+        # Apply overrides
+        for key, value in overrides.items():
+            if value is not None:
+                config[key] = value
+        
+        self.encoder = encoder
+        self.hidden_dim = config.get('hidden_dim', 128)
+        self.num_discrete_actions = config.get('num_discrete_actions', 2)
+        self.continuous_dim = config.get('continuous_dim', 4)
+        self.dropout_rate = config.get('dropout_rate', 0.1)
+        
+        # Value components configuration
+        value_components = config.get('value_components', ['total_value'])
         if value_components is None:
             value_components = ['total_value']
         self.value_components = value_components
@@ -71,53 +91,53 @@ class HybridActorCritic(nn.Module):
         # Shared feature extractor for node-level processing
         # Input: [node_features + graph_context] = [encoder.out_dim * 2]
         self.shared_node_mlp = nn.Sequential(
-            nn.Linear(encoder.out_dim * 2, hidden_dim),
+            nn.Linear(self.encoder.out_dim * 2, self.hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
+            nn.Dropout(self.dropout_rate),
         )
         
         # === ACTOR HEADS ===
         
         # Discrete action head (spawn/delete per node)
         self.discrete_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, num_discrete_actions)
+            nn.Linear(self.hidden_dim // 2, self.num_discrete_actions)
         )
         
         # Continuous action heads (spawn parameters)
         # Mean values for continuous actions
         self.continuous_mu_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, continuous_dim)
+            nn.Linear(self.hidden_dim // 2, self.continuous_dim)
         )
         
         # Log standard deviation for continuous actions
         self.continuous_logstd_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, continuous_dim)
+            nn.Linear(self.hidden_dim // 2, self.continuous_dim)
         )
         
         # === CRITIC HEADS ===
         
         # Graph-level value estimation using graph token
         self.graph_value_mlp = nn.Sequential(
-            nn.Linear(encoder.out_dim, hidden_dim),
+            nn.Linear(self.encoder.out_dim, self.hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
             nn.ReLU(),
         )
         
         # Multi-component value heads
         self.value_heads = nn.ModuleDict()
-        for component in value_components:
-            self.value_heads[component] = nn.Linear(hidden_dim // 2, 1)
+        for component in self.value_components:
+            self.value_heads[component] = nn.Linear(self.hidden_dim // 2, 1)
         
         # Parameter bounds for continuous actions
         self.register_buffer('action_bounds', torch.tensor([

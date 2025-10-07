@@ -1,0 +1,198 @@
+# Configuration file for Durotaxis Reinforcement Learning Training
+# This file contains default parameters for all necessary classes used in DurotaxisTrainer
+
+# ============================================================================
+# DurotaxisTrainer Configuration
+# ============================================================================
+trainer:
+  # Training parameters
+  total_episodes: 1000
+  max_steps: 200
+  learning_rate: 0.0003  # 3e-4
+  save_dir: "./training_results"
+  
+  # Loss weighting and optimization
+  entropy_bonus_coeff: 0.01
+  weight_momentum: 0.9
+  normalize_weights_every: 10
+  
+  # Logging and checkpointing
+  moving_avg_window: 20
+  log_every: 50
+  progress_print_every: 5
+  checkpoint_every: null  # Set to integer for periodic checkpoints, null for disabled
+  
+  # Environment setup parameters
+  substrate_type: 'random'  # 'linear', 'exponential', or 'random'
+  
+  # Encoder configuration
+  encoder_hidden_dim: 128
+  encoder_output_dim: 64
+  encoder_num_layers: 4
+  
+  # Random substrate parameter ranges (only used when substrate_type='random')
+  random_substrate:
+    linear_m_range: [0.01, 0.1]    # Slope range for linear substrate
+    linear_b_range: [0.5, 2.0]     # Intercept range for linear substrate
+    exponential_m_range: [0.01, 0.05]  # Growth rate range for exponential substrate
+    exponential_b_range: [0.5, 1.5]    # Base value range for exponential substrate
+  
+  # Component weights for multi-objective learning (adaptive)
+  component_weights:
+    total_reward: 1.0
+    graph_reward: 0.4
+    spawn_reward: 0.3
+    delete_reward: 0.2
+    edge_reward: 0.2
+    total_node_reward: 0.3
+  
+  # Hybrid policy loss weights
+  policy_loss_weights:
+    discrete_weight: 0.7     # Weight for discrete actions (spawn/delete)
+    continuous_weight: 0.3   # Weight for continuous parameters
+    entropy_weight: 0.01     # Exploration bonus weight
+  
+  # Adaptive reward scaling
+  adaptive_scaling:
+    enable_adaptive_scaling: true
+    scaling_warmup_episodes: 50
+
+# ============================================================================
+# DurotaxisEnv Configuration
+# ============================================================================
+environment:
+  # Basic environment parameters
+  substrate_size: [200, 200]
+  substrate_type: 'linear'
+  substrate_params:
+    m: 0.01
+    b: 1.0
+  
+  # Node and topology parameters
+  init_num_nodes: 1
+  max_critical_nodes: 50
+  threshold_critical_nodes: 200
+  
+  # Simulation parameters
+  delta_time: 3
+  delta_intensity: 2.50
+  
+  # Visualization
+  flush_delay: 0.0001
+  enable_visualization: true
+  
+  # Reward structure - Graph rewards
+  graph_rewards:
+    connectivity_penalty: 10.0    # Penalty for losing connectivity (N < 2)
+    growth_penalty: 10.0          # Penalty for excessive growth (N > max_critical_nodes)
+    survival_reward: 0.01         # Basic survival reward for valid topology
+    action_reward: 0.005          # Reward multiplier per action taken
+  
+  # Reward structure - Node rewards
+  node_rewards:
+    movement_reward: 0.01         # Reward multiplier for rightward movement
+    intensity_penalty: 5.0        # Penalty for below-average substrate intensity
+    intensity_bonus: 0.01         # Bonus for above-average substrate intensity
+    substrate_reward: 0.05        # Reward multiplier for substrate intensity
+  
+  # Reward structure - Edge rewards
+  edge_reward:
+    rightward_bonus: 0.1          # Bonus for rightward edges
+    leftward_penalty: 0.1         # Penalty for leftward edges
+  
+  # Reward structure - Spawn rewards
+  spawn_rewards:
+    spawn_success_reward: 1.0     # Reward for successful durotaxis spawning
+    spawn_failure_penalty: 1.0    # Penalty for failed durotaxis spawning
+  
+  # Reward structure - Delete rewards
+  delete_reward:
+    proper_deletion: 2.0          # Reward for proper node deletion
+    persistence_penalty: 2.0      # Penalty for inappropriate persistence
+  
+  # Reward structure - Position rewards
+  position_rewards:
+    boundary_bonus: 0.1           # Bonus for boundary/frontier nodes
+    left_edge_penalty: 0.2        # Penalty for being near left edge
+    edge_position_penalty: 0.1    # Penalty for being near top/bottom edges
+  
+  # Reward structure - Termination rewards
+  termination_rewards:
+    success_reward: 100.0         # Large reward for reaching rightmost location
+    out_of_bounds_penalty: -30.0  # Large penalty for nodes going out of bounds
+    no_nodes_penalty: -30.0       # Penalty for losing all nodes
+    leftward_drift_penalty: -30.0 # Penalty for consistent leftward movement
+    timeout_penalty: -10.0        # Small penalty for reaching max time steps
+    critical_nodes_penalty: -25.0 # Penalty for exceeding critical node threshold
+
+# ============================================================================
+# GraphInputEncoder Configuration
+# ============================================================================
+encoder:
+  out_dim: 64                   # Output embedding dimension per node
+  num_layers: 4                 # Number of transformer layers
+
+# ============================================================================
+# HybridActorCritic Configuration
+# ============================================================================
+actor_critic:
+  hidden_dim: 128               # Hidden dimension for actor-critic networks
+  num_discrete_actions: 2       # Number of discrete actions (spawn/delete)
+  continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)
+  dropout_rate: 0.1             # Dropout rate for regularization
+  
+  # Value function components (list of reward components to predict)
+  value_components:
+    - 'total_reward'
+    - 'graph_reward'
+    - 'spawn_reward'
+    - 'delete_reward'
+    - 'edge_reward'
+    - 'total_node_reward'
+
+# ============================================================================
+# Training Algorithm Configuration
+# ============================================================================
+algorithm:
+  # GAE (Generalized Advantage Estimation) parameters
+  gamma: 0.99                   # Discount factor
+  gae_lambda: 0.95              # GAE lambda parameter
+  
+  # PPO (Proximal Policy Optimization) parameters
+  ppo_epochs: 1                 # Number of PPO epochs per update
+  clip_epsilon: 0.2             # PPO clipping parameter
+  value_loss_coeff: 0.5         # Value function loss coefficient
+  
+  # Optimization parameters
+  max_grad_norm: 0.5            # Maximum gradient norm for clipping
+
+# ============================================================================
+# Device and Performance Configuration
+# ============================================================================
+system:
+  device: 'auto'                # 'cuda', 'cpu', or 'auto' for automatic detection
+  num_workers: 1                # Number of parallel workers (if applicable)
+  seed: null                    # Random seed (null for no seeding)
+
+# ============================================================================
+# Logging and Monitoring Configuration
+# ============================================================================
+logging:
+  tensorboard: false            # Enable TensorBoard logging
+  wandb: false                  # Enable Weights & Biases logging
+  save_model_every: null        # Save model every N episodes (null for disabled)
+  save_best_model: true         # Save best performing model
+  verbose: true                 # Verbose logging
+
+# ============================================================================
+# Experimental Configuration
+# ============================================================================
+experimental:
+  # Action masking
+  use_action_masking: true      # Enable action masking for invalid actions
+  
+  # Adaptive component weighting
+  adaptive_component_weights: true    # Enable adaptive component weight updates
+  
+  # Substrate variation
+  substrate_variation: true     # Enable substrate parameter variation during training

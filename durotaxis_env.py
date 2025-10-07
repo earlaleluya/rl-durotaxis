@@ -4,14 +4,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import os
-from datetime import datetime
-import json
 
 from topology import Topology
 from substrate import Substrate
 from state import TopologyState
 from encoder import GraphInputEncoder
 from policy import GraphPolicyNetwork, TopologyPolicyAgent
+from config_loader import ConfigLoader
 
 
 
@@ -55,10 +54,12 @@ class DurotaxisEnv(gym.Env):
         Critical threshold - episode terminates if exceeded (fail condition).
     max_steps : int, default=1000
         Maximum steps per episode before timeout termination.
-    embedding_dim : int, default=64
-        Dimension of node embeddings for graph neural network processing.
-    hidden_dim : int, default=128
-        Hidden layer dimension for graph transformer networks.
+    encoder_hidden_dim : int, default=128
+        Hidden layer dimension for the GraphInputEncoder network.
+    encoder_output_dim : int, default=64
+        Output dimension for the GraphInputEncoder network embeddings.
+    encoder_num_layers : int, default=4
+        Number of layers in the GraphInputEncoder network.
     delta_time : int, default=3
         Time window for topology history comparison (affects reward calculations).
     delta_intensity : float, default=2.50
@@ -119,10 +120,6 @@ class DurotaxisEnv(gym.Env):
         Delay between visualization updates (seconds) for rendering control.
     enable_visualization : bool, default=True
         Enable/disable automatic topology visualization during episodes.
-    model_path : str, default="./saved_models"
-        Base directory for saving models with automatic run organization.
-    save_per_episode : bool, default=False
-        Whether to save model after every episode. If False, only saves at the final episode.
     
     Attributes
     ----------
@@ -140,10 +137,6 @@ class DurotaxisEnv(gym.Env):
         Discrete action space (dummy - actual actions determined by policy network).
     observation_space : gym.Space
         Box space for flattened graph embeddings with semantic pooling support.
-    run_number : int
-        Current run number for model organization (auto-incremented).
-    run_directory : str
-        Path to current run directory for model and metadata saving.
     
     Methods
     -------
@@ -153,16 +146,6 @@ class DurotaxisEnv(gym.Env):
         Execute one timestep using graph transformer policy (action ignored).
     render(mode='human')
         Visualize current topology state with optional mode specification.
-    save_model(episode_num=None)
-        Save current models and metadata to run-specific directory.
-    load_model(model_file_path)
-        Load previously saved model from file path.
-    list_saved_models()
-        Display organized list of all saved models by run directories.
-    set_algorithm_name(algorithm_name)
-        Set algorithm name for model saving metadata.
-    set_external_model(model)
-        Register external model for saving/loading (optional extension).
     
     Notes
     -----
@@ -205,19 +188,6 @@ class DurotaxisEnv(gym.Env):
     
     Model saving and loading:
     
-    >>> env.set_algorithm_name("GraphTransformer")
-    >>> saved_files = env.save_model(episode_num=100)  # Manual save
-    >>> saved_files = env.auto_save_model(episode_num=100, is_final_episode=True)  # Auto save
-    >>> models = env.list_saved_models()  # Shows organized model list
-    >>> checkpoint = env.load_model("./saved_models/run0001/GraphTransformer_ep00100_policy.pth")
-    
-    Configure automatic saving:
-    
-    >>> # Save every episode
-    >>> env = Durotaxis(save_per_episode=True)
-    >>> # Save only final episode (default)
-    >>> env = Durotaxis(save_per_episode=False)
-    
     Advanced substrate configuration:
     
     >>> env = Durotaxis(
@@ -230,128 +200,127 @@ class DurotaxisEnv(gym.Env):
     metadata = {"render_fps": 30}
 
     def __init__(self, 
-                 substrate_size=(600, 400),
-                 substrate_type='linear',
-                 substrate_params={'m': 0.01, 'b': 1.0},
-                 init_num_nodes=1,
-                 max_critical_nodes=50,
-                 threshold_critical_nodes=200,
-                 max_episodes=500,
-                 max_steps=1000,
-                 embedding_dim=64,
-                 hidden_dim=128,  
-                 delta_time=3,
-                 delta_intensity=2.50,
-                 # Grouped reward parameters
-                 graph_rewards={
-                     'connectivity_penalty': 10.0,  # Penalty for losing connectivity (N < 2)
-                     'growth_penalty': 10.0,  # Penalty for excessive growth (N > max_critical_nodes)
-                     'survival_reward': 0.01,  # Basic survival reward for valid topology
-                     'action_reward': 0.005,  # Reward multiplier per action taken
-                 },
-                 node_rewards={
-                     'movement_reward': 0.01,  # Reward multiplier for rightward movement
-                     'intensity_penalty': 5.0,  # Penalty for below-average substrate intensity
-                     'intensity_bonus': 0.01,  # Bonus for above-average substrate intensity
-                     'substrate_reward': 0.05,  # Reward multiplier for substrate intensity
-                 },
-                 edge_reward={
-                    'rightward_bonus': 0.1, 
-                    'leftward_penalty': 0.1},  # Edge direction rewards
-                 spawn_rewards={
-                     'spawn_success_reward': 1.0,  # Reward for successful durotaxis spawning
-                     'spawn_failure_penalty': 1.0,  # Penalty for failed durotaxis spawning
-                 },
-                 delete_reward={
-                    'proper_deletion': 2.0, 
-                    'persistence_penalty': 2.0},  # Deletion compliance rewards
-                 position_rewards={
-                     'boundary_bonus': 0.1,  # Bonus for boundary/frontier nodes
-                     'left_edge_penalty': 0.2,  # Penalty for being near left edge
-                     'edge_position_penalty': 0.1,  # Penalty for being near top/bottom edges
-                 },
-                 termination_rewards={
-                     'success_reward': 100.0,  # Large reward for reaching rightmost location
-                     'out_of_bounds_penalty': -30.0,  # Large penalty for nodes going out of bounds
-                     'no_nodes_penalty': -30.0,  # Penalty for losing all nodes
-                     'leftward_drift_penalty': -30.0,  # Penalty for consistent leftward movement
-                     'timeout_penalty': -10.0,  # Small penalty for reaching max time steps
-                     'critical_nodes_penalty': -25.0,  # Penalty for exceeding critical node threshold
-                 },
-                 flush_delay=0.0001,  # Visualization flush delay
-                 enable_visualization=True,  # Enable/disable topology.show() visualization
-                 model_path="./saved_models",  # Path to save models
-                 save_per_episode=False, # Whether to save model per episode, but regardless of value, the final model is saved.
-            ):
+                 config_path: str = "config.yaml",
+                 **overrides):
+        """
+        Initialize DurotaxisEnv with configuration from YAML file
+        
+        Parameters
+        ----------
+        config_path : str
+            Path to configuration YAML file
+        **overrides
+            Parameter overrides for any configuration values
+        """
         super().__init__()
         
+        # Load configuration
+        config_loader = ConfigLoader(config_path)
+        config = config_loader.get_environment_config()
+        
+        # Apply overrides
+        for key, value in overrides.items():
+            if value is not None:
+                config[key] = value
+        
         # Environment parameters
-        self.substrate_size = substrate_size
-        self.substrate_type = substrate_type
-        self.substrate_params = substrate_params
-        self.init_num_nodes = init_num_nodes
-        self.max_critical_nodes = max_critical_nodes
-        self.threshold_critical_nodes = threshold_critical_nodes
-        self.max_episodes = max_episodes
-        self.max_steps = max_steps
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim 
-        self.delta_time = delta_time
-        self.delta_intensity = delta_intensity  
-        self.flush_delay = flush_delay  # Store flush delay for visualization
-        self.enable_visualization = enable_visualization  # Control topology.show() activation  
+        self.substrate_size = tuple(config.get('substrate_size', [200, 200]))
+        self.substrate_type = config.get('substrate_type', 'linear')
+        self.substrate_params = config.get('substrate_params', {'m': 0.01, 'b': 1.0})
+        self.init_num_nodes = config.get('init_num_nodes', 1)
+        self.max_critical_nodes = config.get('max_critical_nodes', 50)
+        self.threshold_critical_nodes = config.get('threshold_critical_nodes', 200)
+        self.max_steps = config.get('max_steps', 200)
         
-        # Model saving configuration
-        self.model_path = model_path
-        self.save_per_episode = save_per_episode
-        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.algorithm_name = "GraphTransformer"  # Default algorithm name
-        self.external_model = None  # Optional external model for extensions
+        # Encoder configuration from trainer overrides or config
+        encoder_config = config_loader.get_encoder_config()
+        # Note: hidden_dim was moved to actor_critic section, so we use trainer overrides or fallback
+        self.encoder_hidden_dim = overrides.get('encoder_hidden_dim', 128)  # Default fallback since hidden_dim was removed from encoder config
+        self.encoder_out_dim = overrides.get('encoder_output_dim', encoder_config.get('out_dim', 64))
+        self.encoder_num_layers = overrides.get('encoder_num_layers', encoder_config.get('num_layers', 4))
         
-        # Determine run number and create run-specific directory
-        self.run_number = self._get_next_run_number()
-        self.run_directory = os.path.join(self.model_path, f"run{self.run_number:04d}")
-        self._ensure_model_directory()
+        # Simulation parameters
+        self.delta_time = config.get('delta_time', 3)
+        self.delta_intensity = config.get('delta_intensity', 2.50)
+        self.flush_delay = config.get('flush_delay', 0.0001)
+        self.enable_visualization = config.get('enable_visualization', True)
         
-        # Unpack directional reward dictionaries
-        self.delete_reward = delete_reward
-        self.delete_proper_reward = delete_reward['proper_deletion']
-        self.delete_persistence_penalty = delete_reward['persistence_penalty']
+        # Unpack reward dictionaries from config
+        self.graph_rewards = config.get('graph_rewards', {
+            'connectivity_penalty': 10.0,
+            'growth_penalty': 10.0,
+            'survival_reward': 0.01,
+            'action_reward': 0.005
+        })
         
-        self.edge_reward = edge_reward
-        self.edge_rightward_bonus = edge_reward['rightward_bonus']
-        self.edge_leftward_penalty = edge_reward['leftward_penalty']
+        self.node_rewards = config.get('node_rewards', {
+            'movement_reward': 0.01,
+            'intensity_penalty': 5.0,
+            'intensity_bonus': 0.01,
+            'substrate_reward': 0.05
+        })
+        
+        self.edge_reward = config.get('edge_reward', {
+            'rightward_bonus': 0.1,
+            'leftward_penalty': 0.1
+        })
+        
+        self.spawn_rewards = config.get('spawn_rewards', {
+            'spawn_success_reward': 1.0,
+            'spawn_failure_penalty': 1.0
+        })
+        
+        self.delete_reward = config.get('delete_reward', {
+            'proper_deletion': 2.0,
+            'persistence_penalty': 2.0
+        })
+        
+        self.position_rewards = config.get('position_rewards', {
+            'boundary_bonus': 0.1,
+            'left_edge_penalty': 0.2,
+            'edge_position_penalty': 0.1
+        })
+        
+        self.termination_rewards = config.get('termination_rewards', {
+            'success_reward': 100.0,
+            'out_of_bounds_penalty': -30.0,
+            'no_nodes_penalty': -30.0,
+            'leftward_drift_penalty': -30.0,
+            'timeout_penalty': -10.0,
+            'critical_nodes_penalty': -25.0
+        })
+        
+        # Unpack reward component values for direct access
+        self.delete_proper_reward = self.delete_reward['proper_deletion']
+        self.delete_persistence_penalty = self.delete_reward['persistence_penalty']
+        
+        self.edge_rightward_bonus = self.edge_reward['rightward_bonus']
+        self.edge_leftward_penalty = self.edge_reward['leftward_penalty']
         
         # Unpack grouped reward parameters
-        self.graph_rewards = graph_rewards
-        self.connectivity_penalty = graph_rewards['connectivity_penalty']
-        self.growth_penalty = graph_rewards['growth_penalty']
-        self.survival_reward = graph_rewards['survival_reward']
-        self.action_reward = graph_rewards['action_reward']
+        self.connectivity_penalty = self.graph_rewards['connectivity_penalty']
+        self.growth_penalty = self.graph_rewards['growth_penalty']
+        self.survival_reward = self.graph_rewards['survival_reward']
+        self.action_reward = self.graph_rewards['action_reward']
         
-        self.node_rewards = node_rewards
-        self.movement_reward = node_rewards['movement_reward']
-        self.intensity_penalty = node_rewards['intensity_penalty']
-        self.intensity_bonus = node_rewards['intensity_bonus']
-        self.substrate_reward = node_rewards['substrate_reward']
+        self.movement_reward = self.node_rewards['movement_reward']
+        self.intensity_penalty = self.node_rewards['intensity_penalty']
+        self.intensity_bonus = self.node_rewards['intensity_bonus']
+        self.substrate_reward = self.node_rewards['substrate_reward']
         
-        self.position_rewards = position_rewards
-        self.boundary_bonus = position_rewards['boundary_bonus']
-        self.left_edge_penalty = position_rewards['left_edge_penalty']
-        self.edge_position_penalty = position_rewards['edge_position_penalty']
+        self.boundary_bonus = self.position_rewards['boundary_bonus']
+        self.left_edge_penalty = self.position_rewards['left_edge_penalty']
+        self.edge_position_penalty = self.position_rewards['edge_position_penalty']
         
-        self.spawn_rewards = spawn_rewards
-        self.spawn_success_reward = spawn_rewards['spawn_success_reward']
-        self.spawn_failure_penalty = spawn_rewards['spawn_failure_penalty']
+        self.spawn_success_reward = self.spawn_rewards['spawn_success_reward']
+        self.spawn_failure_penalty = self.spawn_rewards['spawn_failure_penalty']
         
-        self.termination_rewards = termination_rewards
-        self.success_reward = termination_rewards['success_reward']
-        self.out_of_bounds_penalty = termination_rewards['out_of_bounds_penalty']
-        self.no_nodes_penalty = termination_rewards['no_nodes_penalty']
-        self.leftward_drift_penalty = termination_rewards['leftward_drift_penalty']
-        self.timeout_penalty = termination_rewards['timeout_penalty']
-        self.critical_nodes_penalty = termination_rewards['critical_nodes_penalty']
-        self.critical_nodes_penalty = termination_rewards['critical_nodes_penalty']
+        self.success_reward = self.termination_rewards['success_reward']
+        self.out_of_bounds_penalty = self.termination_rewards['out_of_bounds_penalty']
+        self.no_nodes_penalty = self.termination_rewards['no_nodes_penalty']
+        self.leftward_drift_penalty = self.termination_rewards['leftward_drift_penalty']
+        self.timeout_penalty = self.termination_rewards['timeout_penalty']
+        self.critical_nodes_penalty = self.termination_rewards['critical_nodes_penalty']
         
         self.current_step = 0
         self.current_episode = 0
@@ -379,8 +348,7 @@ class DurotaxisEnv(gym.Env):
         # The observation space uses output from GraphInputEncoder directly.
         # Shape: [num_nodes+1, out_dim] where first element is graph token, rest are node embeddings
         max_critical_nodes_plus_graph = self.max_critical_nodes + 1  # +1 for graph token
-        encoder_out_dim = 64  # Default out_dim from GraphInputEncoder
-        obs_dim = max_critical_nodes_plus_graph * encoder_out_dim
+        obs_dim = max_critical_nodes_plus_graph * self.encoder_out_dim
         
         self.observation_space = spaces.Box(
             low=-np.inf, 
@@ -396,334 +364,12 @@ class DurotaxisEnv(gym.Env):
         
         # Create GraphInputEncoder for observations
         self.observation_encoder = GraphInputEncoder(
-            hidden_dim=self.hidden_dim,
-            out_dim=64,  # This matches encoder_out_dim above
-            num_layers=4
+            hidden_dim=self.encoder_hidden_dim,
+            out_dim=self.encoder_out_dim,
+            num_layers=self.encoder_num_layers
         )
 
         # Store encoder output dimension for observation processing
-        self.encoder_out_dim = 64
-
-    def _get_next_run_number(self):
-        """
-        Get the next run number by finding existing run directories.
-        
-        Returns
-        -------
-        int
-            Next available run number (1, 2, 3, ...)
-        """
-        if not os.path.exists(self.model_path):
-            return 1
-        
-        existing_runs = []
-        for item in os.listdir(self.model_path):
-            if os.path.isdir(os.path.join(self.model_path, item)) and item.startswith('run'):
-                try:
-                    run_num_str = item[3:]  # Remove "run" prefix
-                    run_num = int(run_num_str)
-                    existing_runs.append(run_num)
-                except ValueError:
-                    continue
-        
-        return max(existing_runs) + 1 if existing_runs else 1
-
-    def _ensure_model_directory(self):
-        """
-        Ensure the model directory and run-specific directory exist.
-        """
-        # Create base model directory
-        if not os.path.exists(self.model_path):
-            os.makedirs(self.model_path)
-            print(f"📁 Created base model directory: {self.model_path}")
-        
-        # Create run-specific directory
-        if not os.path.exists(self.run_directory):
-            os.makedirs(self.run_directory)
-            print(f"📁 Created run directory: {self.run_directory} (Run #{self.run_number})")
-    
-    def set_algorithm_name(self, algorithm_name):
-        """
-        Set the algorithm name for model saving.
-        
-        Parameters
-        ----------
-        algorithm_name : str
-            Name of the algorithm (e.g., 'GraphTransformer', 'CustomPolicy')
-        """
-        self.algorithm_name = algorithm_name
-        print(f"🔧 Algorithm name set to: {self.algorithm_name}")
-    
-    def set_external_model(self, model):
-        """
-        Set an external model for saving (optional extension point).
-        
-        Parameters
-        ----------
-        model : object
-            Any external model to save
-        """
-        self.external_model = model
-        if hasattr(model, '__class__'):
-            # Automatically set algorithm name from model class
-            self.algorithm_name = model.__class__.__name__
-        print(f"🎯 External model set: {self.algorithm_name}")
-    
-    def save_model(self, episode_num=None):
-        """
-        Save the current model(s) with episode-specific naming in run directory.
-        
-        Parameters
-        ----------
-        episode_num : int, optional
-            Episode number for naming. If None, uses current episode.
-        """
-        if episode_num is None:
-            episode_num = self.current_episode
-        
-        # Create filename with algorithm and episode (timestamp now in directory structure)
-        base_filename = f"{self.algorithm_name}_ep{episode_num:05d}"
-        
-        saved_files = []
-        
-        # Save external model if available (extension point)
-        if hasattr(self, 'external_model') and self.external_model is not None:
-            model_file = os.path.join(self.run_directory, f"{base_filename}")
-            # Try to save external model (implementation depends on model type)
-            try:
-                if hasattr(self.external_model, 'save'):
-                    self.external_model.save(model_file)
-                    saved_files.append(model_file + ".zip")
-                elif hasattr(self.external_model, 'state_dict'):
-                    torch.save(self.external_model.state_dict(), model_file + ".pth")
-                    saved_files.append(model_file + ".pth")
-            except Exception as e:
-                print(f"⚠️  Could not save external model: {e}")
-        
-        # Save internal graph policy network if available
-        if (hasattr(self, 'policy_agent') and 
-            self.policy_agent is not None and 
-            hasattr(self.policy_agent, 'policy')):
-            
-            policy_file = os.path.join(self.run_directory, f"{base_filename}_policy.pth")
-            
-            # Save complete policy state including optimizer if available
-            policy_checkpoint = {
-                'policy_state_dict': self.policy_agent.policy.state_dict(),
-                'encoder_state_dict': self.policy_agent.policy.encoder.state_dict(),
-                'episode': episode_num,
-                'hidden_dim': self.hidden_dim,
-                'embedding_dim': self.embedding_dim,
-                'run_number': self.run_number,
-                'run_timestamp': self.run_timestamp,
-                'policy_config': {
-                    'noise_scale': getattr(self.policy_agent.policy, 'noise_scale', 0.1),
-                    'encoder_out_dim': getattr(self.policy_agent.policy.encoder, 'out_dim', 64),
-                    'encoder_num_layers': getattr(self.policy_agent.policy.encoder, 'num_layers', 4)
-                }
-            }
-            
-            torch.save(policy_checkpoint, policy_file)
-            saved_files.append(policy_file)
-            print(f"   ✅ Saved policy network: {os.path.basename(policy_file)}")
-        else:
-            print(f"   ⚠️  Policy not available for saving (policy_initialized: {getattr(self, '_policy_initialized', False)})")
-        
-        # Save environment metadata
-        metadata_file = os.path.join(self.run_directory, f"{base_filename}_metadata.json")
-        metadata = {
-            # Algorithm and episode info
-            'algorithm': self.algorithm_name,
-            'episode': episode_num,
-            'run_number': self.run_number,
-            'run_timestamp': self.run_timestamp,
-            'save_timestamp': datetime.now().isoformat(),
-            'total_reward': getattr(self, 'episode_total_reward', 0.0),
-            
-            # Environment parameters
-            'substrate_size': self.substrate_size,
-            'substrate_type': self.substrate_type,
-            'substrate_params': self.substrate_params,
-            'init_num_nodes': self.init_num_nodes,
-            'max_critical_nodes': self.max_critical_nodes,
-            'threshold_critical_nodes': self.threshold_critical_nodes,
-            'max_episodes': self.max_episodes,
-            'max_steps': self.max_steps,
-            'embedding_dim': self.embedding_dim,
-            'hidden_dim': self.hidden_dim,
-            'delta_time': self.delta_time,
-            'delta_intensity': self.delta_intensity,
-            'flush_delay': self.flush_delay,
-            'enable_visualization': self.enable_visualization,
-            'model_path': self.model_path,
-            'save_per_episode': self.save_per_episode,
-            
-            # Grouped reward parameters
-            'graph_rewards': self.graph_rewards,
-            'node_rewards': self.node_rewards,
-            'edge_reward': self.edge_reward,
-            'spawn_rewards': self.spawn_rewards,
-            'delete_reward': self.delete_reward,
-            'position_rewards': self.position_rewards,
-            'termination_rewards': self.termination_rewards,
-        }
-        
-        with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        saved_files.append(metadata_file)
-        
-        print(f"💾 Saved model files for episode {episode_num} (Run #{self.run_number:04d}):")
-        for file in saved_files:
-            print(f"   📄 {os.path.basename(file)}")
-        
-        return saved_files
-    
-    def auto_save_model(self, episode_num=None, is_final_episode=False):
-        """
-        Automatically save model based on save_per_episode setting.
-        
-        Parameters
-        ----------
-        episode_num : int, optional
-            Episode number for naming. If None, uses current episode.
-        is_final_episode : bool, default=False
-            Whether this is the final episode (always saves regardless of save_per_episode)
-            
-        Returns
-        -------
-        list or None
-            List of saved files if saving occurred, None otherwise
-        """
-        if self.save_per_episode or is_final_episode:
-            return self.save_model(episode_num=episode_num)
-        else:
-            # Skip saving for non-final episodes when save_per_episode=False
-            if episode_num is None:
-                episode_num = self.current_episode
-            print(f"🔄 Skipping model save for episode {episode_num} (save_per_episode=False)")
-            return None
-    
-    def load_model(self, model_file_path):
-        """
-        Load a previously saved model.
-        
-        Parameters
-        ----------
-        model_file_path : str
-            Path to the saved model file
-            
-        Returns
-        -------
-        dict
-            Loaded checkpoint information
-        """
-        if not os.path.exists(model_file_path):
-            raise FileNotFoundError(f"Model file not found: {model_file_path}")
-        
-        if model_file_path.endswith('.zip') or model_file_path.endswith('.pkl'):
-            # Load external model (extension point)
-            print(f"⚠️  External model loading not implemented for {self.algorithm_name}")
-            print(f"💡 Implement custom loading logic for your specific model type")
-            return None
-        
-        elif model_file_path.endswith('.pth'):
-            # Load PyTorch model (graph policy network)
-            checkpoint = torch.load(model_file_path, map_location='cpu')
-            
-            # Initialize policy if not already done
-            if not hasattr(self, 'policy_agent') or self.policy_agent is None:
-                print("🔧 Initializing policy for model loading...")
-                self._initialize_policy()
-            
-            if (hasattr(self, 'policy_agent') and 
-                self.policy_agent is not None and 
-                hasattr(self.policy_agent, 'policy')):
-                
-                # Load the model states
-                self.policy_agent.policy.load_state_dict(checkpoint['policy_state_dict'])
-                self.policy_agent.policy.encoder.load_state_dict(checkpoint['encoder_state_dict'])
-                
-                # Restore configuration if available
-                if 'policy_config' in checkpoint:
-                    config = checkpoint['policy_config']
-                    if hasattr(self.policy_agent.policy, 'noise_scale'):
-                        self.policy_agent.policy.noise_scale = config.get('noise_scale', 0.1)
-                
-                print(f"✅ Loaded graph policy network from episode {checkpoint.get('episode', 'unknown')}")
-                print(f"   📊 Hidden dim: {checkpoint.get('hidden_dim', 'unknown')}")
-                print(f"   � Embedding dim: {checkpoint.get('embedding_dim', 'unknown')}")
-                print(f"   📊 Run: {checkpoint.get('run_number', 'unknown')}")
-                
-                return checkpoint
-            else:
-                print("❌ Failed to initialize policy for loading")
-                return None
-        
-        print(f"�📥 Model loaded from: {os.path.basename(model_file_path)}")
-        return None
-    
-    def list_saved_models(self):
-        """
-        List all saved models organized by run directories.
-        
-        Returns
-        -------
-        dict
-            Dictionary with run directories and their model files
-        """
-        if not os.path.exists(self.model_path):
-            print(f"📁 Model directory does not exist: {self.model_path}")
-            return {}
-        
-        runs_info = {}
-        
-        # Look for run directories
-        for item in os.listdir(self.model_path):
-            item_path = os.path.join(self.model_path, item)
-            if os.path.isdir(item_path) and item.startswith('run'):
-                try:
-                    run_num_str = item[3:]  # Remove "run" prefix
-                    run_num = int(run_num_str)
-                    
-                    # Get files in this run directory
-                    run_files = os.listdir(item_path)
-                    models = {
-                        'rl_models': [f for f in run_files if f.endswith('.zip')],
-                        'policy_models': [f for f in run_files if f.endswith('.pth')],
-                        'metadata': [f for f in run_files if f.endswith('.json')]
-                    }
-                    
-                    runs_info[f"run{run_num:04d}"] = models
-                    
-                except ValueError:
-                    continue
-        
-        # Also check for legacy files in base directory (backward compatibility)
-        base_files = [f for f in os.listdir(self.model_path) 
-                      if os.path.isfile(os.path.join(self.model_path, f))]
-        if base_files:
-            legacy_models = {
-                'rl_models': [f for f in base_files if f.endswith('.zip')],
-                'policy_models': [f for f in base_files if f.endswith('.pth')],
-                'metadata': [f for f in base_files if f.endswith('.json')]
-            }
-            if any(legacy_models.values()):
-                runs_info['legacy'] = legacy_models
-        
-        print(f"📚 Models in {self.model_path}:")
-        for run_name, models in sorted(runs_info.items()):
-            print(f"  📂 {run_name}:")
-            for model_type, file_list in models.items():
-                if file_list:
-                    print(f"    {model_type}: {len(file_list)} files")
-                    for file in sorted(file_list)[:5]:  # Show first 5 files
-                        print(f"      📄 {file}")
-                    if len(file_list) > 5:
-                        print(f"      ... and {len(file_list) - 5} more")
-                else:
-                    print(f"    {model_type}: No files")
-        
-        return runs_info
 
     def _setup_environment(self):
         """Initialize substrate, topology, state extractor, and policy components."""
@@ -748,12 +394,12 @@ class DurotaxisEnv(gym.Env):
             
         # Create policy network using GraphInputEncoder
         encoder = GraphInputEncoder(
-            hidden_dim=self.hidden_dim,
-            out_dim=64,
-            num_layers=4
+            hidden_dim=self.encoder_hidden_dim,
+            out_dim=self.encoder_out_dim,
+            num_layers=self.encoder_num_layers
         )
         
-        policy = GraphPolicyNetwork(encoder, hidden_dim=self.hidden_dim, noise_scale=0.1)
+        policy = GraphPolicyNetwork(encoder, hidden_dim=self.encoder_hidden_dim, noise_scale=0.1)
         
         # Create policy agent
         self.policy_agent = TopologyPolicyAgent(self.topology, self.state_extractor, policy)
@@ -863,7 +509,7 @@ class DurotaxisEnv(gym.Env):
         Parameters
         ----------
         node_embeddings : torch.Tensor
-            Node embeddings from the graph neural network, shape (num_nodes, embedding_dim)
+            Node embeddings from the graph neural network, shape (num_nodes, out_dim)
         state : dict
             Current state dictionary containing graph information
         target_count : int
@@ -1063,7 +709,6 @@ class DurotaxisEnv(gym.Env):
         if self.policy_agent is not None and prev_num_nodes > 0:
             try:
                 executed_actions = self.policy_agent.act_with_policy(
-                    embedding_dim=self.embedding_dim, 
                     deterministic=False
                 )
             except Exception as e:
@@ -1823,15 +1468,6 @@ class DurotaxisEnv(gym.Env):
         super().reset(seed=seed)
         
         # Save model from previous episode if it completed
-        if (self.current_episode > 0 and 
-            hasattr(self, 'episode_total_reward') and
-            (self.external_model is not None or self._policy_initialized)):
-            
-            try:
-                self.auto_save_model(episode_num=self.current_episode)
-            except Exception as e:
-                print(f"⚠️  Model saving failed for episode {self.current_episode}: {e}")
-        
         # Reset step counter and increment episode counter
         self.current_step = 0
         self.current_episode += 1

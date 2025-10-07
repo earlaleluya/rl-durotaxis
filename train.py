@@ -28,6 +28,7 @@ from durotaxis_env import DurotaxisEnv
 from state import TopologyState  
 from encoder import GraphInputEncoder
 from actor_critic import HybridActorCritic
+from config_loader import ConfigLoader
 
 
 def moving_average(data, window=20):
@@ -41,72 +42,97 @@ class DurotaxisTrainer:
     """Streamlined trainer for hybrid actor-critic with component rewards"""
     
     def __init__(self, 
-                 total_episodes: int = 1000,
-                 learning_rate: float = 3e-4,
-                 hidden_dim: int = 128,
-                 save_dir: str = "./training_results",
-                 entropy_bonus_coeff: float = 0.01,
-                 weight_momentum: float = 0.9,
-                 normalize_weights_every: int = 10,
-                 moving_avg_window: int = 20,
-                 log_every: int = 50,
-                 progress_print_every: int = 5,
-                 checkpoint_every: Optional[int] = None,
-                 substrate_type: str = 'random',
-                 max_episode_length: int = 200,
-                 # Environment setup parameters (HIGH PRIORITY)
-                 substrate_size: tuple = (200, 200),
-                 init_num_nodes: int = 1,
-                 max_critical_nodes: int = 50,
-                 # Random substrate parameter ranges (HIGH PRIORITY)
-                 linear_m_range: tuple = (0.01, 0.1),
-                 linear_b_range: tuple = (0.5, 2.0),
-                 exponential_m_range: tuple = (0.01, 0.05),
-                 exponential_b_range: tuple = (0.5, 1.5)):
+                 config_path: str = "config.yaml",
+                 **overrides):
+        """
+        Initialize trainer with configuration from YAML file
         
-        self.total_episodes = total_episodes
+        Parameters
+        ----------
+        config_path : str
+            Path to configuration YAML file
+        **overrides
+            Parameter overrides for any configuration values
+        """
+        
+        # Load configuration
+        self.config_loader = ConfigLoader(config_path)
+        
+        # Get trainer configuration with overrides
+        config = self.config_loader.get_trainer_config()
+        for key, value in overrides.items():
+            if value is not None:
+                config[key] = value
+        
+        # Apply configuration
+        self.total_episodes = config.get('total_episodes', 1000)
+        self.max_steps = config.get('max_steps', 200)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.save_dir = save_dir
-        self.entropy_bonus_coeff = entropy_bonus_coeff
-        self.moving_avg_window = moving_avg_window  # Window size for moving averages
-        self.log_every = log_every                  # Logging frequency
-        self.progress_print_every = progress_print_every  # One-line progress frequency
-        self.checkpoint_every = checkpoint_every    # Model checkpoint frequency
-        self.substrate_type = substrate_type        # Substrate type for training
-        self.max_episode_length = max_episode_length  # Maximum episode length
+        self.save_dir = config.get('save_dir', "./training_results")
+        self.entropy_bonus_coeff = config.get('entropy_bonus_coeff', 0.01)
+        self.moving_avg_window = config.get('moving_avg_window', 20)
+        self.log_every = config.get('log_every', 50)
+        self.progress_print_every = config.get('progress_print_every', 5)
+        self.checkpoint_every = config.get('checkpoint_every', None)
+        self.substrate_type = config.get('substrate_type', 'random')
         
-        # Environment setup parameters
-        self.substrate_size = substrate_size
-        self.init_num_nodes = init_num_nodes
-        self.max_critical_nodes = max_critical_nodes
+        # Environment setup parameters (load from environment section)
+        env_config = self.config_loader.get_environment_config()
+        self.substrate_size = tuple(env_config.get('substrate_size', [200, 200]))
+        self.init_num_nodes = env_config.get('init_num_nodes', 1)
+        self.max_critical_nodes = env_config.get('max_critical_nodes', 50)
+        self.threshold_critical_nodes = env_config.get('threshold_critical_nodes', 200)
+        self.delta_time = env_config.get('delta_time', 3)
+        self.delta_intensity = env_config.get('delta_intensity', 2.50)
+        
+        # Encoder configuration parameters
+        self.encoder_hidden_dim = config.get('encoder_hidden_dim', 128)
+        self.encoder_output_dim = config.get('encoder_output_dim', 64)
+        self.encoder_num_layers = config.get('encoder_num_layers', 4)
         
         # Random substrate parameter ranges
-        self.linear_m_range = linear_m_range
-        self.linear_b_range = linear_b_range
-        self.exponential_m_range = exponential_m_range
-        self.exponential_b_range = exponential_b_range
+        self.linear_m_range = tuple(config.get('linear_m_range', [0.01, 0.1]))
+        self.linear_b_range = tuple(config.get('linear_b_range', [0.5, 2.0]))
+        self.exponential_m_range = tuple(config.get('exponential_m_range', [0.01, 0.05]))
+        self.exponential_b_range = tuple(config.get('exponential_b_range', [0.5, 1.5]))
+        
+        # Component weights and policy weights from config
+        self.component_weights = config.get('component_weights', {
+            'total_reward': 1.0,
+            'graph_reward': 0.4,
+            'spawn_reward': 0.3,
+            'delete_reward': 0.2,
+            'edge_reward': 0.2,
+            'total_node_reward': 0.3
+        })
+        
+        self.policy_loss_weights = config.get('policy_loss_weights', {
+            'discrete_weight': 0.7,
+            'continuous_weight': 0.3,
+            'entropy_weight': 0.01
+        })
+        
+        # Load clip_epsilon from algorithm section
+        algorithm_config = self.config_loader.get_algorithm_config()
+        self.policy_loss_weights['clip_epsilon'] = algorithm_config.get('clip_epsilon', 0.2)
+        
+        # Adaptive weighting parameters
+        self.weight_update_momentum = config.get('weight_momentum', 0.9)
+        self.normalize_weights_every = config.get('normalize_weights_every', 10)
+        self.enable_adaptive_scaling = config.get('enable_adaptive_scaling', True)
+        self.scaling_warmup_episodes = config.get('scaling_warmup_episodes', 50)
         
         # Create run directory with automatic numbering
-        self.run_dir = self.create_run_directory(save_dir)
+        self.run_dir = self.create_run_directory(self.save_dir)
         print(f"📁 Created run directory: {self.run_dir} (Run #{self.run_number})")
+        
+        # Get environment configuration
+        env_config = self.config_loader.get_environment_config()
         
         # Environment setup
         self.env = DurotaxisEnv(
-            substrate_size=self.substrate_size,
-            init_num_nodes=self.init_num_nodes,
-            max_critical_nodes=self.max_critical_nodes,
-            max_steps=self.max_episode_length,
-            # Balanced reward settings for learning
-            graph_rewards={
-                'connectivity_penalty': 5.0,
-                'growth_penalty': 2.0,
-                'survival_reward': 0.1,
-                'action_reward': 0.02
-            },
-            spawn_rewards={
-                'spawn_success_reward': 1.0,
-                'spawn_failure_penalty': 0.5
-            }
+            config_path=config_path,
+            **overrides  # Allow overrides for environment parameters too
         )
         
         # Initialize substrate based on type
@@ -120,6 +146,8 @@ class DurotaxisTrainer:
         self.state_extractor.set_topology(self.env.topology)
         print(f"   Environment initialized: {self.env.topology.graph.num_nodes()} nodes")
         
+        self.weight_updates_count = 0                     # Track number of updates for normalization
+        
         # Component configuration - match your environment's components
         self.component_names = [
             'total_reward',
@@ -130,45 +158,26 @@ class DurotaxisTrainer:
             'total_node_reward'
         ]
         
-        # Component weights for balanced learning (adaptive)
-        self.component_weights = {
-            'total_reward': 1.0,      # Main optimization target
-            'graph_reward': 0.4,      # Topology structure
-            'spawn_reward': 0.3,      # Spawning decisions
-            'delete_reward': 0.2,     # Deletion strategy
-            'edge_reward': 0.2,       # Movement direction
-            'total_node_reward': 0.3  # Node behaviors
-        }
-        
-        # Adaptive weighting parameters
-        self.weight_update_momentum = weight_momentum     # Momentum for weight updates
-        self.weight_updates_count = 0                     # Track number of updates for normalization
-        self.normalize_weights_every = normalize_weights_every  # Normalize weights every N updates
-        
-        # Hybrid policy loss weights - balance discrete vs continuous actions
-        self.policy_loss_weights = {
-            'discrete_weight': 0.7,    # Spawn/delete decisions (typically more important)
-            'continuous_weight': 0.3,  # Continuous parameters (fine-tuning)
-            'entropy_weight': 0.01,    # Exploration bonus
-            'clip_epsilon': 0.2        # PPO clipping parameter
-        }
-        
         # Create network
+        encoder_config = self.config_loader.get_encoder_config()
+        actor_critic_config = self.config_loader.get_actor_critic_config()
+        
         self.encoder = GraphInputEncoder(
-            hidden_dim=64,
-            out_dim=64, 
-            num_layers=2
+            hidden_dim=encoder_config.get('hidden_dim', 128),
+            out_dim=encoder_config.get('out_dim', 64),
+            num_layers=encoder_config.get('num_layers', 4)
         ).to(self.device)
         
         self.network = HybridActorCritic(
             encoder=self.encoder,
-            hidden_dim=hidden_dim,
-            value_components=self.component_names,
-            dropout_rate=0.1
+            hidden_dim=actor_critic_config.get('hidden_dim', 128),
+            value_components=actor_critic_config.get('value_components', self.component_names),
+            dropout_rate=actor_critic_config.get('dropout_rate', 0.1)
         ).to(self.device)
         
         # Optimizer
-        self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate)
+        self.learning_rate = config.get('learning_rate', 3e-4)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
         
         # Training tracking
         self.episode_rewards = defaultdict(list)
@@ -667,7 +676,7 @@ class DurotaxisTrainer:
         terminated = False
         truncated = False
         
-        while not done and episode_length < self.max_episode_length:
+        while not done and episode_length < self.max_steps:
             # Get current state
             state_dict = self.state_extractor.get_state_features(include_substrate=True)
             state_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
@@ -1500,19 +1509,11 @@ def main():
     print("=" * 50)
     
     trainer = DurotaxisTrainer(
-        total_episodes=1000,
-        learning_rate=3e-4,
-        hidden_dim=128,
-        max_episode_length=200,  # Now configurable!
-        substrate_size=(400, 300),  # Now configurable!
-        init_num_nodes=2,  # Now configurable!
-        max_critical_nodes=15,  # Now configurable!
-        substrate_type='random',  # Try 'linear', 'exponential', or 'random'
-        # Custom random substrate ranges (optional)
-        linear_m_range=(0.01, 0.1),
-        linear_b_range=(0.5, 2.0),
-        exponential_m_range=(0.01, 0.05),
-        exponential_b_range=(0.5, 1.5)
+        config_path="config.yaml",
+        # Example of parameter overrides (optional)
+        # total_episodes=500,
+        # learning_rate=1e-4,
+        # substrate_type='linear'
     )
     
     trainer.train()

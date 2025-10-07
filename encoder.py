@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 from typing import Dict, Tuple
 from torch_geometric.nn import TransformerConv
+from config_loader import ConfigLoader
 
 
 class GraphInputEncoder(nn.Module):
@@ -49,36 +50,64 @@ class GraphInputEncoder(nn.Module):
         >>> print(out.shape)  # torch.Size([6, 64]) = [5 nodes + 1 graph token, 64]
     """
     
-    def __init__(self, hidden_dim=128, out_dim=64, num_layers=4):
+    def __init__(self, config_path="config.yaml", **overrides):
+        """
+        Initialize GraphInputEncoder with configuration from YAML file
+        
+        Parameters
+        ----------
+        config_path : str
+            Path to configuration YAML file
+        **overrides
+            Parameter overrides for any configuration values
+        """
         super().__init__()
+        
+        # Load configuration if not provided as overrides
+        if not overrides or any(param not in overrides for param in ['hidden_dim', 'out_dim', 'num_layers']):
+            config_loader = ConfigLoader(config_path)
+            config = config_loader.get_encoder_config()
+            
+            # Apply overrides
+            for key, value in overrides.items():
+                if value is not None:
+                    config[key] = value
+                    
+            # Note: hidden_dim was moved to actor_critic section, use fallback default
+            self.hidden_dim = config.get('hidden_dim', 128)  # Fallback since removed from encoder config
+            self.out_dim = config.get('out_dim', 64)
+            self.num_layers = config.get('num_layers', 4)
+        else:
+            # Use overrides directly (for backward compatibility)
+            self.hidden_dim = overrides.get('hidden_dim', 128)
+            self.out_dim = overrides.get('out_dim', 64)
+            self.num_layers = overrides.get('num_layers', 4)
+            
         # Graph-level MLP → virtual node
         self.graph_mlp = nn.Sequential(
-            nn.Linear(14, hidden_dim),
+            nn.Linear(14, self.hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
         # Node projection
-        self.node_proj = nn.Linear(9, hidden_dim)
+        self.node_proj = nn.Linear(9, self.hidden_dim)
         # Edge projection
         self.edge_mlp = nn.Sequential(
-            nn.Linear(3, hidden_dim),
+            nn.Linear(3, self.hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
 
         # GraphTransformer backbone (using PyTorch Geometric's TransformerConv)
         self.gnn = MyGraphTransformer(
-            in_channels=hidden_dim,
-            hidden_channels=hidden_dim,
-            out_channels=out_dim,
-            num_layers=num_layers,
+            in_channels=self.hidden_dim,
+            hidden_channels=self.hidden_dim,
+            out_channels=self.out_dim,
+            num_layers=self.num_layers,
             heads=4,
             dropout=0.1,
-            edge_dim=hidden_dim   # must match edge_emb size
+            edge_dim=self.hidden_dim  
         )
-        
-        self.hidden_dim = hidden_dim
-        self.out_dim = out_dim
 
     def forward(self, graph_features, node_features, edge_features, edge_index, batch=None):
         """
@@ -143,8 +172,26 @@ class GraphInputEncoder(nn.Module):
 
 class MyGraphTransformer(nn.Module):
     """
-    Graph Transformer implementation using PyTorch Geometric's TransformerConv.
-    This provides proper residual connections and multi-head attention.
+    MyGraphTransformer implements a multi-layer Graph Transformer using PyTorch Geometric's TransformerConv.
+    It supports multi-head attention, residual connections, layer normalization, and dropout.
+        in_channels (int): Number of input node features.
+        hidden_channels (int): Number of hidden node features for intermediate layers.
+        out_channels (int): Number of output node features.
+        num_layers (int, optional): Number of transformer layers. Default is 3.
+        heads (int, optional): Number of attention heads in each TransformerConv. Default is 4.
+        dropout (float, optional): Dropout probability applied after each layer. Default is 0.1.
+        edge_dim (int, optional): Dimensionality of edge features (if any). Default is None.
+    Forward Args:
+        x (Tensor): Node feature matrix of shape [num_nodes, in_channels].
+        edge_index (LongTensor): Graph connectivity in COO format with shape [2, num_edges].
+        edge_attr (Tensor, optional): Edge feature matrix of shape [num_edges, edge_dim]. Default is None.
+        batch (LongTensor, optional): Batch vector assigning each node to a specific graph. Default is None.
+    Returns:
+        Tensor: Output node features of shape [num_nodes, out_channels].
+    Notes:
+        - Residual connections are applied when input and output dimensions match.
+        - Layer normalization and dropout are applied after each layer.
+        - ReLU activation is used after all layers except the final layer.
     """
     
     def __init__(self, in_channels, hidden_channels, out_channels,
