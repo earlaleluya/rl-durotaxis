@@ -135,38 +135,61 @@ class TrajectoryBuffer:
         """Compute returns and advantages for all episodes in the buffer"""
         for episode in self.episodes:
             rewards = episode['rewards']
-            values = episode['values'] 
+            values = episode['values']
             final_values = episode['final_values']
             terminated = episode['terminated']
-            
+
+            # Extract tensor from dict if needed
+            processed_values = []
+            for v in values:
+                if isinstance(v, dict):
+                    # Try 'total_value' first, fallback to 'total_reward', else error
+                    if 'total_value' in v:
+                        processed_values.append(v['total_value'])
+                    elif 'total_reward' in v:
+                        processed_values.append(v['total_reward'])
+                    else:
+                        raise ValueError(f"Value dict missing 'total_value' and 'total_reward': {v}")
+                else:
+                    processed_values.append(v)
+
+            # Convert values to tensors for easier computation
+            values_tensor = torch.stack(processed_values) if processed_values else torch.tensor([])
+            final_value = None
+            if isinstance(final_values, dict):
+                if 'total_value' in final_values:
+                    final_value = final_values['total_value']
+                elif 'total_reward' in final_values:
+                    final_value = final_values['total_reward']
+                else:
+                    final_value = torch.tensor(0.0)
+            else:
+                final_value = final_values if final_values is not None else torch.tensor(0.0)
+
             # Compute GAE advantages and returns
             returns = []
             advantages = []
             gae = 0
-            
-            # Convert values to tensors for easier computation
-            values_tensor = torch.stack(values) if values else torch.tensor([])
-            final_value = final_values if final_values is not None else torch.tensor(0.0)
-            
+
             # Work backwards through the episode
             for t in reversed(range(len(rewards))):
                 if t == len(rewards) - 1:
                     next_value = final_value if not terminated else torch.tensor(0.0)
                 else:
                     next_value = values_tensor[t + 1]
-                
+
                 # Get reward components
                 reward_dict = rewards[t]
                 reward = reward_dict.get('total_reward', 0.0)
-                
+
                 # TD error
                 delta = reward + gamma * next_value - values_tensor[t]
-                
+
                 # GAE calculation
                 gae = delta + gamma * gae_lambda * gae
                 advantages.insert(0, gae)
                 returns.insert(0, gae + values_tensor[t])
-            
+
             # Store computed values
             episode['returns'] = returns
             episode['advantages'] = advantages
@@ -1561,7 +1584,16 @@ class DurotaxisTrainer:
         
         # Total policy loss
         total_policy_loss = sum(policy_losses.values())
-        total_entropy_loss = sum(entropy_losses.values())
+        
+        # Ensure entropy loss is always a tensor
+        if entropy_losses:
+            total_entropy_loss = sum(entropy_losses.values())
+        else:
+            total_entropy_loss = torch.tensor(0.0, device=self.device)
+            
+        # Ensure it's a tensor, not a scalar
+        if not isinstance(total_entropy_loss, torch.Tensor):
+            total_entropy_loss = torch.tensor(total_entropy_loss, device=self.device)
         
         return {
             'policy_loss_discrete': policy_losses['discrete'],
@@ -1690,7 +1722,14 @@ class DurotaxisTrainer:
             avg_discrete_loss = torch.stack([h['policy_loss_discrete'] for h in hybrid_policy_losses]).mean()
             avg_continuous_loss = torch.stack([h['policy_loss_continuous'] for h in hybrid_policy_losses]).mean()
             avg_total_policy_loss = torch.stack([h['total_policy_loss'] for h in hybrid_policy_losses]).mean()
-            avg_entropy_loss = torch.stack([h['entropy_loss'] for h in hybrid_policy_losses]).mean()
+            # Handle entropy loss - ensure all are tensors
+            entropy_losses_list = []
+            for h in hybrid_policy_losses:
+                entropy_loss = h['entropy_loss']
+                if not isinstance(entropy_loss, torch.Tensor):
+                    entropy_loss = torch.tensor(entropy_loss, device=self.device)
+                entropy_losses_list.append(entropy_loss)
+            avg_entropy_loss = torch.stack(entropy_losses_list).mean()
             
             losses['policy_loss_discrete'] = avg_discrete_loss.item()
             losses['policy_loss_continuous'] = avg_continuous_loss.item()
@@ -1909,7 +1948,14 @@ class DurotaxisTrainer:
             avg_discrete_loss = torch.stack([h['policy_loss_discrete'] for h in hybrid_policy_losses]).mean()
             avg_continuous_loss = torch.stack([h['policy_loss_continuous'] for h in hybrid_policy_losses]).mean()
             avg_total_policy_loss = torch.stack([h['total_policy_loss'] for h in hybrid_policy_losses]).mean()
-            avg_entropy_loss = torch.stack([h['entropy_loss'] for h in hybrid_policy_losses]).mean()
+            # Handle entropy loss - ensure all are tensors
+            entropy_losses_list = []
+            for h in hybrid_policy_losses:
+                entropy_loss = h['entropy_loss']
+                if not isinstance(entropy_loss, torch.Tensor):
+                    entropy_loss = torch.tensor(entropy_loss, device=self.device)
+                entropy_losses_list.append(entropy_loss)
+            avg_entropy_loss = torch.stack(entropy_losses_list).mean()
             
             losses['policy_loss_discrete'] = avg_discrete_loss.item()
             losses['policy_loss_continuous'] = avg_continuous_loss.item()

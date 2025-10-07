@@ -148,7 +148,29 @@ class GraphInputEncoder(nn.Module):
         """
 
         # Encode graph-level features as "virtual node"
-        graph_emb = self.graph_mlp(graph_features).unsqueeze(0)   # [1, hidden_dim]
+        # Handle both single graph [feature_dim] and batched graphs [batch_size, feature_dim]
+        if graph_features.dim() == 1:
+            # Single graph case
+            graph_emb = self.graph_mlp(graph_features).unsqueeze(0)   # [1, hidden_dim]
+        else:
+            # Batched graph case - process each graph separately and create graph tokens
+            batch_size = graph_features.shape[0]
+            if batch is None:
+                # If no batch tensor provided, assume all nodes belong to first graph
+                batch = torch.zeros(node_features.shape[0], dtype=torch.long, device=node_features.device)
+            
+            # Create one graph token per graph in the batch
+            graph_embs = self.graph_mlp(graph_features)  # [batch_size, hidden_dim]
+            
+            # Create graph tokens by replicating for each graph
+            graph_tokens = []
+            for i in range(batch_size):
+                graph_tokens.append(graph_embs[i].unsqueeze(0))  # [1, hidden_dim]
+            
+            # For now, use the mean of all graph embeddings as global context
+            # This is a simplification - a more sophisticated approach would handle
+            # multiple graphs properly in the transformer
+            graph_emb = torch.mean(graph_embs, dim=0).unsqueeze(0)  # [1, hidden_dim]
 
         # Encode node-level features
         node_emb = self.node_proj(node_features)  # [num_nodes, hidden_dim]

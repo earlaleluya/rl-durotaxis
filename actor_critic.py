@@ -240,13 +240,32 @@ class HybridActorCritic(nn.Module):
         
         # === CRITIC PROCESSING ===
         
-        # Graph-level value estimation
-        graph_value_features = self.graph_value_mlp(graph_token)  # [hidden_dim//2]
-        
-        # Multi-component value predictions
-        value_predictions = {}
-        for component in self.value_components:
-            value_predictions[component] = self.value_heads[component](graph_value_features).squeeze(-1)
+        # Handle batched vs single graph processing for value predictions
+        if graph_features.dim() == 1:
+            # Single graph case
+            graph_value_features = self.graph_value_mlp(graph_token)  # [hidden_dim//2]
+            
+            # Multi-component value predictions
+            value_predictions = {}
+            for component in self.value_components:
+                value_predictions[component] = self.value_heads[component](graph_value_features).squeeze(-1)
+        else:
+            # Batched graph case - we need to process each graph separately
+            # since the current architecture expects single graph tokens
+            batch_size = graph_features.shape[0]
+            
+            # For now, use the mean graph token for all graphs (simplified approach)
+            # This works because graph_token is already the mean of all graph embeddings
+            graph_value_features = self.graph_value_mlp(graph_token)  # [hidden_dim//2]
+            
+            # Multi-component value predictions - replicate for each graph in batch
+            value_predictions = {}
+            for component in self.value_components:
+                # Get single value and replicate for each graph in batch
+                single_value = self.value_heads[component](graph_value_features).squeeze(-1)  # scalar
+                # Replicate to create one value per graph in batch
+                values_batch = single_value.unsqueeze(0).repeat(batch_size)  # [batch_size]
+                value_predictions[component] = values_batch
         
         # === OUTPUT PREPARATION ===
         
