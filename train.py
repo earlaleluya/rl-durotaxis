@@ -23,10 +23,8 @@ import time
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
 
-# Add project to path
-sys.path.append('/home/arl_eifer/github/rl-durotaxis')
 
-from durotaxis_sim import Durotaxis
+from durotaxis_env import DurotaxisEnv
 from state import TopologyState  
 from encoder import GraphInputEncoder
 from actor_critic import HybridActorCritic
@@ -54,12 +52,12 @@ class DurotaxisTrainer:
                  log_every: int = 50,
                  progress_print_every: int = 5,
                  checkpoint_every: Optional[int] = None,
-                 substrate_type: str = 'linear',
+                 substrate_type: str = 'random',
                  max_episode_length: int = 200,
                  # Environment setup parameters (HIGH PRIORITY)
-                 substrate_size: tuple = (400, 300),
-                 init_num_nodes: int = 2,
-                 max_critical_nodes: int = 15,
+                 substrate_size: tuple = (200, 200),
+                 init_num_nodes: int = 1,
+                 max_critical_nodes: int = 50,
                  # Random substrate parameter ranges (HIGH PRIORITY)
                  linear_m_range: tuple = (0.01, 0.1),
                  linear_b_range: tuple = (0.5, 2.0),
@@ -93,7 +91,7 @@ class DurotaxisTrainer:
         print(f"📁 Created run directory: {self.run_dir} (Run #{self.run_number})")
         
         # Environment setup
-        self.env = Durotaxis(
+        self.env = DurotaxisEnv(
             substrate_size=self.substrate_size,
             init_num_nodes=self.init_num_nodes,
             max_critical_nodes=self.max_critical_nodes,
