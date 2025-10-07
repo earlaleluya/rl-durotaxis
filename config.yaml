@@ -7,7 +7,7 @@
 trainer:
   # Training parameters
   total_episodes: 1000
-  max_steps: 200
+  max_steps: 300
   learning_rate: 0.0003  # 3e-4
   save_dir: "./training_results"
   
@@ -15,6 +15,15 @@ trainer:
   entropy_bonus_coeff: 0.01
   weight_momentum: 0.9
   normalize_weights_every: 10
+  
+  # Batch training configuration
+  rollout_batch_size: 10      # Number of episodes to collect before updating
+  update_epochs: 4            # Number of update epochs per batch
+  minibatch_size: 64          # Size of minibatches during updates
+  
+  # Value clipping configuration
+  enable_value_clipping: true # Enable PPO-style value clipping for stable training
+  value_clip_epsilon: 0.2     # Clipping range for value predictions (0.1-0.3 typical)
   
   # Logging and checkpointing
   moving_avg_window: 20
@@ -24,6 +33,12 @@ trainer:
   
   # Environment setup parameters
   substrate_type: 'random'  # 'linear', 'exponential', or 'random'
+  
+  # Empty graph handling configuration
+  empty_graph_handling:
+    enable_graceful_recovery: true  # Enable graceful handling instead of breaking episodes
+    recovery_num_nodes: 1           # Number of nodes to spawn when recovering from empty graph
+    log_recoveries: true            # Log when empty graph recovery occurs
   
   # Encoder configuration
   encoder_hidden_dim: 128
@@ -46,16 +61,49 @@ trainer:
     edge_reward: 0.2
     total_node_reward: 0.3
   
-  # Hybrid policy loss weights
+  # Hybrid policy loss weights with gradient scaling
   policy_loss_weights:
     discrete_weight: 0.7     # Weight for discrete actions (spawn/delete)
     continuous_weight: 0.3   # Weight for continuous parameters
     entropy_weight: 0.01     # Exploration bonus weight
   
+  # Adaptive gradient scaling for hybrid action spaces
+  gradient_scaling:
+    enable_adaptive_scaling: true    # Enable intelligent gradient balancing
+    gradient_norm_target: 1.0        # Target gradient norm for balancing
+    scaling_momentum: 0.9            # EMA momentum for gradient norm tracking
+    min_scaling_factor: 0.1          # Minimum scaling to prevent collapse
+    max_scaling_factor: 10.0         # Maximum scaling to prevent explosion
+    warmup_steps: 100                # Steps to establish baseline gradient norms
+  
   # Adaptive reward scaling
   adaptive_scaling:
     enable_adaptive_scaling: true
     scaling_warmup_episodes: 50
+    
+  # Reward normalization system (two-tier approach)
+  reward_normalization:
+    enable_per_episode_norm: true     # Tier 1: Per-episode normalization
+    enable_cross_episode_scaling: true  # Tier 2: Cross-episode adaptive scaling
+    min_episode_length: 5             # Minimum episode length for normalization
+    normalization_method: 'adaptive'  # 'zscore', 'minmax', or 'adaptive'
+    
+  # Enhanced learnable advantage weighting system
+  advantage_weighting:
+    enable_learnable_weights: true    # Enable learnable component weights
+    enable_attention_weighting: true  # Enable attention-based dynamic weighting
+    weight_learning_rate: 0.01        # Learning rate for component weights
+    weight_regularization: 0.001      # L2 regularization for weight stability
+    
+  # Enhanced entropy regularization system
+  entropy_regularization:
+    enable_adaptive_entropy: true     # Enable adaptive entropy scheduling
+    entropy_coeff_start: 0.1          # Starting entropy coefficient (high exploration)
+    entropy_coeff_end: 0.001          # Ending entropy coefficient (low exploration)
+    entropy_decay_episodes: 500       # Episodes over which to decay entropy
+    discrete_entropy_weight: 1.0      # Weight for discrete action entropy
+    continuous_entropy_weight: 0.5    # Weight for continuous action entropy
+    min_entropy_threshold: 0.1        # Minimum entropy to prevent collapse
 
 # ============================================================================
 # DurotaxisEnv Configuration

@@ -328,6 +328,20 @@ class DurotaxisEnv(gym.Env):
         # Centroid tracking for fail termination
         self.centroid_history = []  # Store centroid x-coordinates
         self.consecutive_left_moves = 0  # Count consecutive leftward moves
+        
+        # KMeans caching for performance optimization
+        self._kmeans_cache = {}  # Cache for fitted KMeans models
+        self._last_features_hash = None  # Hash of last features for cache invalidation
+        self._cache_hit_count = 0  # Statistics for cache performance
+        self._cache_miss_count = 0  # Statistics for cache performance
+        
+        # Encoder observation optimization
+        self._max_obs_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
+        self._pre_allocated_obs = np.zeros(self._max_obs_size, dtype=np.float32)  # Reusable zero array
+        self._edge_index_cache = None  # Cache for edge_index tensor conversion
+        self._last_edge_structure_hash = None  # Hash of edge structure for cache invalidation
+        self._edge_cache_hit_count = 0  # Statistics for edge cache performance
+        self._edge_cache_miss_count = 0  # Statistics for edge cache performance
         self.fail_threshold = 2 * self.delta_time  # Threshold for fail termination
 
         # Topology tracking for substrate intensity comparison
@@ -405,6 +419,65 @@ class DurotaxisEnv(gym.Env):
         self.policy_agent = TopologyPolicyAgent(self.topology, self.state_extractor, policy)
         self._policy_initialized = True
 
+    def _get_edge_structure_hash(self, edge_index):
+        """
+        Generate a hash for edge structure to detect changes.
+        Uses edge count and structural characteristics for efficient comparison.
+        """
+        import hashlib
+        
+        if isinstance(edge_index, tuple):
+            src, dst = edge_index
+            # Convert to consistent format for hashing
+            edge_data = torch.stack([src, dst], dim=0)
+        else:
+            edge_data = edge_index
+            
+        # Create hash from edge structure characteristics
+        if edge_data.numel() == 0:
+            return "empty_graph"
+        
+        # Use shape and a sample of edge connections for hash
+        shape_str = str(edge_data.shape)
+        
+        # Sample edges for hash (avoid hashing entire large edge set)
+        if edge_data.shape[1] > 100:
+            # For large graphs, sample key edges
+            indices = torch.linspace(0, edge_data.shape[1]-1, 20, dtype=torch.long)
+            sample = edge_data[:, indices].flatten()
+        else:
+            # For small graphs, use all edges
+            sample = edge_data.flatten()
+        
+        hash_data = f"{shape_str}_{sample.cpu().numpy().tobytes().hex()}"
+        return hashlib.md5(hash_data.encode()).hexdigest()
+    
+    def _get_cached_edge_index(self, edge_index):
+        """
+        Get cached edge_index tensor or create new one.
+        Returns (edge_index_tensor, is_cache_hit)
+        """
+        structure_hash = self._get_edge_structure_hash(edge_index)
+        
+        if (self._last_edge_structure_hash == structure_hash and 
+            self._edge_index_cache is not None):
+            self._edge_cache_hit_count += 1
+            return self._edge_index_cache, True
+        else:
+            # Convert edge_index from DGL tuple format to PyG tensor format
+            if isinstance(edge_index, tuple):
+                src, dst = edge_index
+                edge_index_tensor = torch.stack([src, dst], dim=0)  # [2, num_edges]
+            else:
+                edge_index_tensor = edge_index
+            
+            # Cache the converted tensor
+            self._edge_index_cache = edge_index_tensor
+            self._last_edge_structure_hash = structure_hash
+            self._edge_cache_miss_count += 1
+            
+            return edge_index_tensor, False
+
     def _get_encoder_observation(self, state):
         """
         Get observation from GraphInputEncoder output with semantic pooling.
@@ -426,16 +499,14 @@ class DurotaxisEnv(gym.Env):
             edge_features = state['edge_attr']
             edge_index = state['edge_index']
             
-            # Convert edge_index from DGL tuple format to PyG tensor format if needed
-            if isinstance(edge_index, tuple):
-                src, dst = edge_index
-                edge_index_tensor = torch.stack([src, dst], dim=0)  # [2, num_edges]
-            else:
-                edge_index_tensor = edge_index
+            # Get cached edge_index tensor (avoids repeated conversions)
+            edge_index_tensor, edge_cache_hit = self._get_cached_edge_index(edge_index)
             
             # Handle empty graphs
             if node_features.shape[0] == 0:
-                return np.zeros((self.max_critical_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
+                # Reuse pre-allocated array (avoid new allocation)
+                self._pre_allocated_obs.fill(0.0)  # Reset to zeros
+                return self._pre_allocated_obs.copy()  # Return copy to avoid mutation
             
             # Get encoder output directly
             encoder_out = self.observation_encoder(
@@ -447,17 +518,16 @@ class DurotaxisEnv(gym.Env):
             
             # Check for potential information reduction
             actual_nodes = encoder_out.shape[0] - 1  # -1 for graph token
-            max_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
             
             if actual_nodes <= self.max_critical_nodes:
                 # Normal case: no pooling needed
                 # print(f"✅ No pooling needed: {actual_nodes} nodes ≤ {self.max_critical_nodes} max_critical_nodes")
                 encoder_flat = encoder_out.flatten().detach().cpu().numpy()
                 
-                # Pad with zeros if smaller than max size
-                padded = np.zeros(max_size, dtype=np.float32)
-                padded[:len(encoder_flat)] = encoder_flat
-                return padded
+                # Use pre-allocated array (avoid new allocation)
+                self._pre_allocated_obs.fill(0.0)  # Reset to zeros
+                self._pre_allocated_obs[:len(encoder_flat)] = encoder_flat
+                return self._pre_allocated_obs.copy()  # Return copy to avoid mutation
             
             else:
                 # 🧠 SEMANTIC POOLING: Intelligently select representative nodes
@@ -485,17 +555,75 @@ class DurotaxisEnv(gym.Env):
                 # print(f"    - Selected indices: {sorted(selected_indices.tolist())}")
                 # print(f"    - Information preserved: {len(selected_indices)/actual_nodes*100:.1f}%")
                 
-                # Flatten and pad to fixed size
+                # Flatten and pad to fixed size using pre-allocated array
                 pooled_flat = pooled_embeddings.flatten().detach().cpu().numpy()
-                padded = np.zeros(max_size, dtype=np.float32)
-                padded[:len(pooled_flat)] = pooled_flat
+                self._pre_allocated_obs.fill(0.0)  # Reset to zeros
+                self._pre_allocated_obs[:len(pooled_flat)] = pooled_flat
                 
-                return padded
+                return self._pre_allocated_obs.copy()  # Return copy to avoid mutation
                 
         except Exception as e:
             print(f"Error getting encoder observation: {e}")
-            # Fallback to zero observation
-            return np.zeros((self.max_critical_nodes + 1) * self.encoder_out_dim, dtype=np.float32)
+            # Fallback to zero observation using pre-allocated array
+            self._pre_allocated_obs.fill(0.0)
+            return self._pre_allocated_obs.copy()
+
+    def _get_features_cache_key(self, features_np, n_clusters):
+        """
+        Generate a cache key for KMeans based on feature characteristics.
+        Uses data shape, sample of values, and clustering parameters.
+        """
+        import hashlib
+        import numpy as np
+        
+        # Create a deterministic hash from feature characteristics
+        shape_str = str(features_np.shape)
+        
+        # Sample key points for hash (to avoid hashing entire array)
+        if features_np.size > 1000:
+            # For large arrays, sample strategically
+            indices = np.linspace(0, features_np.shape[0]-1, 20, dtype=int)
+            sample = features_np.flat[indices]
+        else:
+            # For small arrays, use statistical summary
+            sample = np.array([
+                features_np.mean(), features_np.std(), 
+                features_np.min(), features_np.max(),
+                np.median(features_np.flat)
+            ])
+        
+        # Combine shape, sample, and clustering params
+        key_data = f"{shape_str}_{n_clusters}_{sample.tobytes().hex()}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def _get_cached_kmeans(self, features_np, n_clusters, cache_prefix):
+        """
+        Get cached KMeans model or create new one.
+        Returns (kmeans_model, is_cache_hit)
+        """
+        from sklearn.cluster import MiniBatchKMeans
+        
+        cache_key = f"{cache_prefix}_{self._get_features_cache_key(features_np, n_clusters)}"
+        
+        if cache_key in self._kmeans_cache:
+            self._cache_hit_count += 1
+            return self._kmeans_cache[cache_key], True
+        else:
+            # Create new KMeans model
+            kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=256, n_init='auto', random_state=42)
+            kmeans.fit(features_np)
+            
+            # Cache the fitted model
+            self._kmeans_cache[cache_key] = kmeans
+            self._cache_miss_count += 1
+            
+            # Limit cache size to prevent memory issues
+            if len(self._kmeans_cache) > 50:  # Keep only 50 most recent models
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._kmeans_cache))
+                del self._kmeans_cache[oldest_key]
+            
+            return kmeans, False
 
     def _semantic_node_selection(self, node_embeddings, state, target_count):
         """
@@ -538,7 +666,7 @@ class DurotaxisEnv(gym.Env):
         """
         import torch
         import numpy as np
-        from sklearn.cluster import KMeans
+        from sklearn.cluster import MiniBatchKMeans
         
         num_nodes = node_embeddings.shape[0]
         
@@ -565,8 +693,11 @@ class DurotaxisEnv(gym.Env):
                 
                 if spatial_clusters > 1:
                     try:
-                        kmeans_spatial = KMeans(n_clusters=spatial_clusters, random_state=42, n_init=10)
-                        spatial_labels = kmeans_spatial.fit_predict(positions)
+                        kmeans_spatial, is_cache_hit = self._get_cached_kmeans(positions, spatial_clusters, "spatial")
+                        spatial_labels = kmeans_spatial.predict(positions)
+                        
+                        if is_cache_hit:
+                            print(f"    🗺️ Spatial clustering: Using cached model for {spatial_clusters} clusters")
                         
                         # Select one representative from each spatial cluster
                         for cluster_id in range(spatial_clusters):
@@ -595,8 +726,11 @@ class DurotaxisEnv(gym.Env):
                         feature_clusters = min(remaining_slots, len(available_indices))
                         
                         if feature_clusters > 1:
-                            kmeans_features = KMeans(n_clusters=feature_clusters, random_state=42, n_init=10)
-                            feature_labels = kmeans_features.fit_predict(available_features)
+                            kmeans_features, is_cache_hit = self._get_cached_kmeans(available_features, feature_clusters, "features")
+                            feature_labels = kmeans_features.predict(available_features)
+                            
+                            if is_cache_hit:
+                                print(f"    🎯 Feature clustering: Using cached model for {feature_clusters} clusters")
                             
                             # Select representative from each feature cluster
                             for cluster_id in range(feature_clusters):
@@ -806,30 +940,73 @@ class DurotaxisEnv(gym.Env):
         graph_reward += edge_reward
         
         
-        # === NODE-LEVEL REWARDS ===
+        # === NODE-LEVEL REWARDS (VECTORIZED) ===
         
         if num_nodes > 0:
+            import numpy as np
             node_features = new_state['node_features']
             
-            for i in range(num_nodes):
-                node_reward = 0.0
+            # Convert to numpy for efficient vectorized operations
+            node_features_np = node_features.detach().cpu().numpy()  # [num_nodes, feature_dim]
+            
+            # Initialize vectorized reward array
+            node_rewards_vec = np.zeros(num_nodes, dtype=np.float32)
+            
+            # 1. VECTORIZED Position-based rewards (durotaxis progression)
+            node_positions = node_features_np[:, :2]  # [num_nodes, 2] - x, y coordinates
+            
+            # Reward for moving rightward (positive durotaxis) - VECTORIZED
+            if hasattr(self, 'prev_node_positions') and len(self.prev_node_positions) > 0:
+                # Convert previous positions to numpy array
+                prev_positions = np.array(self.prev_node_positions[:num_nodes])  # Handle size mismatches
+                if prev_positions.shape[0] == num_nodes:
+                    # Vectorized movement calculation
+                    x_movement = node_positions[:, 0] - prev_positions[:, 0]  # [num_nodes]
+                    movement_rewards = x_movement * self.movement_reward  # [num_nodes]
+                    node_rewards_vec += movement_rewards
+            
+            # 2. VECTORIZED Substrate intensity rewards
+            if node_features_np.shape[1] > 2:
+                substrate_intensities = node_features_np[:, 2]  # [num_nodes] - intensity values
+                intensity_rewards = substrate_intensities * self.substrate_reward  # [num_nodes]
+                node_rewards_vec += intensity_rewards
+            
+            # 3. VECTORIZED Boundary position rewards  
+            if node_features_np.shape[1] > 7:
+                boundary_flags = node_features_np[:, 7]  # [num_nodes] - boundary indicators
+                boundary_rewards = np.where(boundary_flags > 0.5, self.boundary_bonus, 0.0)  # [num_nodes]
+                node_rewards_vec += boundary_rewards
+            
+            # 4. VECTORIZED Positional penalties (avoid substrate edges)
+            substrate_width = self.substrate.width
+            substrate_height = self.substrate.height
+            
+            # Left edge penalty - VECTORIZED
+            left_edge_mask = node_positions[:, 0] < substrate_width * 0.1  # [num_nodes]
+            left_edge_penalties = np.where(left_edge_mask, -self.left_edge_penalty, 0.0)  # [num_nodes]
+            node_rewards_vec += left_edge_penalties
+            
+            # Top/bottom edge penalty - VECTORIZED  
+            top_bottom_mask = ((node_positions[:, 1] < substrate_height * 0.1) | 
+                              (node_positions[:, 1] > substrate_height * 0.9))  # [num_nodes]
+            edge_penalties = np.where(top_bottom_mask, -self.edge_position_penalty, 0.0)  # [num_nodes]
+            node_rewards_vec += edge_penalties
+            
+            # 5. Per-node intensity comparison (requires loop for complexity)
+            if self.dequeued_topology is not None and node_features_np.shape[1] > 2:
+                # Compute average intensity once for all nodes - VECTORIZED
+                current_intensities = node_features_np[:, 2]  # [num_nodes]
+                avg_intensity = np.mean(current_intensities)
                 
-                # 1. Position-based rewards (durotaxis progression)
-                node_x = node_features[i][0].item()  # x-coordinate
-                node_y = node_features[i][1].item()  # y-coordinate
-                
-                # Reward for moving rightward (positive durotaxis)
-                if hasattr(self, 'prev_node_positions') and i < len(self.prev_node_positions):
-                    prev_x = self.prev_node_positions[i][0]
-                    x_movement = node_x - prev_x
-                    node_reward += x_movement * self.movement_reward  # Reward rightward movement
-                
-                # 2. Dequeued topology comparison reward
-                if self.dequeued_topology is not None:
+                # Process each node for intensity comparison (some complexity requires per-node handling)
+                for i in range(num_nodes):
+                    node_x = node_positions[i, 0]
+                    node_y = node_positions[i, 1]
+                    
                     # Get node's persistent ID for reliable tracking
                     node_persistent_id = self._get_node_persistent_id(i)
                     
-                    # Check if this node was present in the dequeued topology using persistent ID
+                    # Check if this node was present in the dequeued topology
                     if node_persistent_id is not None:
                         node_was_in_dequeued = self._check_persistent_id_in_topology(node_persistent_id, self.dequeued_topology)
                     else:
@@ -837,54 +1014,19 @@ class DurotaxisEnv(gym.Env):
                         node_was_in_dequeued = self._node_exists_in_topology(node_x, node_y, self.dequeued_topology)
                     
                     if node_was_in_dequeued:
-                        # Compute average substrate intensity of all nodes in current topology
-                        current_intensities = []
-                        for j in range(num_nodes):
-                            if len(node_features[j]) > 2:
-                                current_intensities.append(node_features[j][2].item())
+                        current_node_intensity = current_intensities[i]
                         
-                        if current_intensities:
-                            avg_intensity = sum(current_intensities) / len(current_intensities)
-                            current_node_intensity = node_features[i][2].item() if len(node_features[i]) > 2 else 0.0
-                            
-                            # Set to_delete flag based on intensity comparison
-                            if current_node_intensity < avg_intensity:
-                                node_reward -= self.intensity_penalty  # Penalty for being below average
-                                # Note: Automatic deletion based on intensity is disabled to prevent topology collapse
-                                # print(f"📉 Node {i} (PID: {node_persistent_id}) below average intensity: {current_node_intensity:.3f} < {avg_intensity:.3f} (penalty: -{self.intensity_penalty})")
-                            else:
-                                node_reward += self.intensity_bonus  # Basic survival reward
-                                # Note: Automatic deletion based on intensity is disabled to prevent topology collapse
-                                # print(f"📈 Node {i} (PID: {node_persistent_id}) above/at average intensity: {current_node_intensity:.3f} >= {avg_intensity:.3f} (bonus: +{self.intensity_bonus})")
-
-                # 3. Substrate intensity rewards
-                if len(node_features[i]) > 2: 
-                    substrate_intensity = node_features[i][2].item()
-                    node_reward += substrate_intensity * self.substrate_reward  # Reward higher stiffness areas                
-                
-                # 4. Boundary position rewards
-                if len(node_features[i]) > 7:  # Assuming boundary flag is at index 7
-                    is_boundary = node_features[i][7].item()
-                    if is_boundary > 0.5:  # Node is on boundary
-                        node_reward += self.boundary_bonus  # Small bonus for frontier nodes
-                
-                # 5. Positional penalties (avoid substrate edges)
-                substrate_width = self.substrate.width
-                substrate_height = self.substrate.height
-                
-                # Penalty for being too close to left edge (opposite of durotaxis)
-                if node_x < substrate_width * 0.1:
-                    node_reward -= self.left_edge_penalty
-                
-                # Penalty for being too close to top/bottom edges
-                if node_y < substrate_height * 0.1 or node_y > substrate_height * 0.9:
-                    node_reward -= self.edge_position_penalty
-                
-                node_rewards.append(node_reward)
+                        # Set penalties/bonuses based on intensity comparison
+                        if current_node_intensity < avg_intensity:
+                            node_rewards_vec[i] -= self.intensity_penalty  # Penalty for being below average
+                        else:
+                            node_rewards_vec[i] += self.intensity_bonus  # Basic survival reward
             
-            # Store current positions for next step
-            self.prev_node_positions = [(node_features[i][0].item(), node_features[i][1].item()) 
-                                       for i in range(num_nodes)]
+            # Convert back to list for compatibility with existing code
+            node_rewards = node_rewards_vec.tolist()
+            
+            # Store current positions for next step - VECTORIZED
+            self.prev_node_positions = node_positions.tolist()  # Convert back to list format
         
         # === COMBINE REWARDS ===
         
@@ -1630,9 +1772,54 @@ class DurotaxisEnv(gym.Env):
             'persistent_ids_marked': marked_pids,
             'persistent_ids_safe': safe_pids
         }
+    
+    def get_kmeans_cache_stats(self):
+        """Get KMeans cache performance statistics."""
+        total_requests = self._cache_hit_count + self._cache_miss_count
+        hit_rate = (self._cache_hit_count / total_requests * 100) if total_requests > 0 else 0.0
+        
+        return {
+            'cache_hits': self._cache_hit_count,
+            'cache_misses': self._cache_miss_count,
+            'total_requests': total_requests,
+            'hit_rate_percent': hit_rate,
+            'cached_models_count': len(self._kmeans_cache)
+        }
+    
+    def clear_kmeans_cache(self):
+        """Clear the KMeans cache and reset statistics."""
+        self._kmeans_cache.clear()
+        self._cache_hit_count = 0
+        self._cache_miss_count = 0
+
+    def get_encoder_cache_stats(self):
+        """Get encoder observation cache performance statistics."""
+        total_edge_requests = self._edge_cache_hit_count + self._edge_cache_miss_count
+        edge_hit_rate = (self._edge_cache_hit_count / total_edge_requests * 100) if total_edge_requests > 0 else 0.0
+        
+        return {
+            'edge_cache_hits': self._edge_cache_hit_count,
+            'edge_cache_misses': self._edge_cache_miss_count,
+            'total_edge_requests': total_edge_requests,
+            'edge_hit_rate_percent': edge_hit_rate,
+            'pre_allocated_array_size': self._max_obs_size,
+            'memory_saved_per_call': 'Reuses single array instead of allocating new'
+        }
+    
+    def clear_encoder_cache(self):
+        """Clear the encoder observation cache and reset statistics."""
+        self._edge_index_cache = None
+        self._last_edge_structure_hash = None
+        self._edge_cache_hit_count = 0
+        self._edge_cache_miss_count = 0
+        # Note: Pre-allocated array is kept for continued reuse
 
     def close(self):
         """Clean up resources."""
+        # Clear all caches
+        self._kmeans_cache.clear()
+        self._edge_index_cache = None
+        
         if hasattr(self.topology, 'close'):
             self.topology.close()
 

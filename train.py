@@ -19,6 +19,200 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+import random
+from collections import deque, defaultdict
+from typing import List, Dict, Tuple, Optional, Any
+import time
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+class TrajectoryBuffer:
+    """Buffer to store multiple episodes of trajectories for batch training"""
+    
+    def __init__(self):
+        self.episodes = []
+        self.current_episode = {
+            'states': [],
+            'actions': [],
+            'rewards': [],
+            'values': [],
+            'log_probs': [],
+            'final_values': None,
+            'terminated': False,
+            'success': False
+        }
+    
+    def start_episode(self):
+        """Start a new episode in the buffer"""
+        self.current_episode = {
+            'states': [],
+            'actions': [],
+            'rewards': [],
+            'values': [],
+            'old_values': [],  # Store old values for PPO value clipping
+            'log_probs': [],
+            'final_values': None,
+            'terminated': False,
+            'success': False
+        }
+    
+    def add_step(self, state, action, reward, value, log_prob, old_value=None):
+        """Add a step to the current episode"""
+        self.current_episode['states'].append(state)
+        self.current_episode['actions'].append(action)
+        self.current_episode['rewards'].append(reward)
+        self.current_episode['values'].append(value)
+        self.current_episode['old_values'].append(old_value if old_value is not None else value)
+        self.current_episode['log_probs'].append(log_prob)
+    
+    def finish_episode(self, final_values, terminated, success):
+        """Finish the current episode and add it to the buffer"""
+        self.current_episode['final_values'] = final_values
+        self.current_episode['terminated'] = terminated
+        self.current_episode['success'] = success
+        self.episodes.append(self.current_episode)
+    
+    def get_batch_data(self):
+        """Get all trajectories as batch data"""
+        if not self.episodes:
+            return None
+            
+        # Concatenate all episodes into single lists
+        all_states = []
+        all_actions = []
+        all_rewards = []
+        all_values = []
+        all_old_values = []
+        all_log_probs = []
+        all_returns = []
+        all_advantages = []
+        
+        for episode in self.episodes:
+            all_states.extend(episode['states'])
+            all_actions.extend(episode['actions'])
+            all_rewards.extend(episode['rewards'])
+            all_values.extend(episode['values'])
+            all_old_values.extend(episode['old_values'])
+            all_log_probs.extend(episode['log_probs'])
+            all_returns.extend(episode['returns'])
+            all_advantages.extend(episode['advantages'])
+        
+        return {
+            'states': all_states,
+            'actions': all_actions,
+            'rewards': all_rewards,
+            'values': all_values,
+            'old_values': all_old_values,
+            'log_probs': all_log_probs,
+            'returns': all_returns,
+            'advantages': all_advantages
+        }
+    
+    def create_minibatches(self, minibatch_size: int):
+        """Create random minibatches from the buffer data"""
+        batch_data = self.get_batch_data()
+        if not batch_data:
+            return []
+            
+        total_steps = len(batch_data['states'])
+        indices = list(range(total_steps))
+        random.shuffle(indices)
+        
+        minibatches = []
+        for i in range(0, total_steps, minibatch_size):
+            end_idx = min(i + minibatch_size, total_steps)
+            batch_indices = indices[i:end_idx]
+            
+            minibatch = {}
+            for key, data in batch_data.items():
+                minibatch[key] = [data[idx] for idx in batch_indices]
+            
+            minibatches.append(minibatch)
+        
+        return minibatches
+    
+    def compute_returns_and_advantages_for_all_episodes(self, gamma: float, gae_lambda: float):
+        """Compute returns and advantages for all episodes in the buffer"""
+        for episode in self.episodes:
+            rewards = episode['rewards']
+            values = episode['values'] 
+            final_values = episode['final_values']
+            terminated = episode['terminated']
+            
+            # Compute GAE advantages and returns
+            returns = []
+            advantages = []
+            gae = 0
+            
+            # Convert values to tensors for easier computation
+            values_tensor = torch.stack(values) if values else torch.tensor([])
+            final_value = final_values if final_values is not None else torch.tensor(0.0)
+            
+            # Work backwards through the episode
+            for t in reversed(range(len(rewards))):
+                if t == len(rewards) - 1:
+                    next_value = final_value if not terminated else torch.tensor(0.0)
+                else:
+                    next_value = values_tensor[t + 1]
+                
+                # Get reward components
+                reward_dict = rewards[t]
+                reward = reward_dict.get('total_reward', 0.0)
+                
+                # TD error
+                delta = reward + gamma * next_value - values_tensor[t]
+                
+                # GAE calculation
+                gae = delta + gamma * gae_lambda * gae
+                advantages.insert(0, gae)
+                returns.insert(0, gae + values_tensor[t])
+            
+            # Store computed values
+            episode['returns'] = returns
+            episode['advantages'] = advantages
+    
+    def clear(self):
+        """Clear all episodes from the buffer"""
+        self.episodes = []
+        self.current_episode = {
+            'states': [],
+            'actions': [],
+            'rewards': [],
+            'values': [],
+            'old_values': [],
+            'log_probs': [],
+            'final_values': None,
+            'terminated': False,
+            'success': False
+        }
+    
+    def __len__(self):
+        """Return the number of episodes in the buffer"""
+        return len(self.episodes)
+    
+    def get_episode_stats(self):
+        """Get statistics about episodes in the buffer"""
+        if not self.episodes:
+            return {}
+            
+        episode_rewards = []
+        episode_lengths = []
+        success_count = 0
+        
+        for episode in self.episodes:
+            total_reward = sum(r.get('total_reward', 0.0) for r in episode['rewards'])
+            episode_rewards.append(total_reward)
+            episode_lengths.append(len(episode['rewards']))
+            if episode['success']:
+                success_count += 1
+        
+        return {
+            'num_episodes': len(self.episodes),
+            'avg_reward': np.mean(episode_rewards) if episode_rewards else 0.0,
+            'avg_length': np.mean(episode_lengths) if episode_lengths else 0.0,
+            'success_rate': success_count / len(self.episodes) if self.episodes else 0.0,
+            'total_steps': sum(episode_lengths)
+        }
 import time
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
@@ -122,6 +316,68 @@ class DurotaxisTrainer:
         self.enable_adaptive_scaling = config.get('enable_adaptive_scaling', True)
         self.scaling_warmup_episodes = config.get('scaling_warmup_episodes', 50)
         
+        # Reward normalization configuration
+        reward_norm_config = config.get('reward_normalization', {})
+        self.enable_per_episode_norm = reward_norm_config.get('enable_per_episode_norm', True)
+        self.enable_cross_episode_scaling = reward_norm_config.get('enable_cross_episode_scaling', True)
+        self.min_episode_length = reward_norm_config.get('min_episode_length', 5)
+        self.normalization_method = reward_norm_config.get('normalization_method', 'adaptive')
+        
+        # Enhanced learnable component weighting configuration
+        advantage_config = config.get('advantage_weighting', {})
+        self.enable_learnable_weights = advantage_config.get('enable_learnable_weights', True)
+        self.enable_attention_weighting = advantage_config.get('enable_attention_weighting', True)
+        self.weight_learning_rate = advantage_config.get('weight_learning_rate', 0.01)
+        self.weight_regularization = advantage_config.get('weight_regularization', 0.001)
+        
+        # Enhanced entropy regularization configuration
+        entropy_config = config.get('entropy_regularization', {})
+        self.enable_adaptive_entropy = entropy_config.get('enable_adaptive_entropy', True)
+        self.entropy_coeff_start = entropy_config.get('entropy_coeff_start', 0.1)
+        self.entropy_coeff_end = entropy_config.get('entropy_coeff_end', 0.001)
+        self.entropy_decay_episodes = entropy_config.get('entropy_decay_episodes', 500)
+        self.discrete_entropy_weight = entropy_config.get('discrete_entropy_weight', 1.0)
+        self.continuous_entropy_weight = entropy_config.get('continuous_entropy_weight', 0.5)
+        self.min_entropy_threshold = entropy_config.get('min_entropy_threshold', 0.1)
+        
+        # Batch training configuration
+        self.rollout_batch_size = config.get('rollout_batch_size', 10)
+        self.update_epochs = config.get('update_epochs', 4)
+        self.minibatch_size = config.get('minibatch_size', 64)
+        
+        # Value clipping configuration
+        self.enable_value_clipping = config.get('enable_value_clipping', True)
+        self.value_clip_epsilon = config.get('value_clip_epsilon', 0.2)
+        
+        # Adaptive gradient scaling configuration
+        gradient_config = config.get('gradient_scaling', {})
+        self.enable_gradient_scaling = gradient_config.get('enable_adaptive_scaling', True)
+        self.gradient_norm_target = gradient_config.get('gradient_norm_target', 1.0)
+        self.scaling_momentum = gradient_config.get('scaling_momentum', 0.9)
+        self.min_scaling_factor = gradient_config.get('min_scaling_factor', 0.1)
+        self.max_scaling_factor = gradient_config.get('max_scaling_factor', 10.0)
+        self.gradient_warmup_steps = gradient_config.get('warmup_steps', 100)
+        
+        # Initialize gradient scaling state
+        self.gradient_step_count = 0
+        self.discrete_grad_norm_ema = None
+        self.continuous_grad_norm_ema = None
+        self.adaptive_discrete_weight = self.policy_loss_weights['discrete_weight']
+        self.adaptive_continuous_weight = self.policy_loss_weights['continuous_weight']
+        
+        # Empty graph handling configuration
+        empty_graph_config = config.get('empty_graph_handling', {})
+        self.enable_graceful_recovery = empty_graph_config.get('enable_graceful_recovery', True)
+        self.recovery_num_nodes = empty_graph_config.get('recovery_num_nodes', 1)
+        self.log_recoveries = empty_graph_config.get('log_recoveries', True)
+        self.empty_graph_recovery_count = 0  # Track recovery statistics
+        
+        # Initialize trajectory buffer for batch training
+        self.trajectory_buffer = TrajectoryBuffer()
+        
+        # Current entropy coefficient (will be adapted during training)
+        self.current_entropy_coeff = self.entropy_coeff_start
+        
         # Create run directory with automatic numbering
         self.run_dir = self.create_run_directory(self.save_dir)
         print(f"📁 Created run directory: {self.run_dir} (Run #{self.run_number})")
@@ -175,9 +431,16 @@ class DurotaxisTrainer:
             dropout_rate=actor_critic_config.get('dropout_rate', 0.1)
         ).to(self.device)
         
-        # Optimizer
+        # Enhanced Learnable Component Weighting System
+        self._initialize_learnable_weights()
+        
+        # Optimizer (includes learnable weights)
         self.learning_rate = config.get('learning_rate', 3e-4)
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
+        self.weight_optimizer = optim.Adam(self.learnable_component_weights.parameters(), lr=self.weight_learning_rate)
+        
+        # Learning rate scheduler for long runs
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=500)
         
         # Training tracking
         self.episode_rewards = defaultdict(list)
@@ -221,6 +484,7 @@ class DurotaxisTrainer:
         print(f"🚀 DurotaxisTrainer initialized")
         print(f"   Device: {self.device}")
         print(f"   Network parameters: {sum(p.numel() for p in self.network.parameters()):,}")
+        print(f"   Learnable weight parameters: {sum(p.numel() for p in self.learnable_component_weights.parameters()):,}")
         print(f"   Component names: {self.component_names}")
         print(f"   Substrate type: {self.substrate_type}")
         if self.substrate_type == 'random':
@@ -233,10 +497,47 @@ class DurotaxisTrainer:
             print(f"   Checkpoint frequency: disabled (only best + final models saved)")
         print(f"   Progress print frequency: every {self.progress_print_every} episodes")
     
+    def _initialize_learnable_weights(self):
+        """Initialize the enhanced learnable component weighting system"""
+        import torch.nn as nn
+        
+        num_components = len(self.component_names)
+        
+        # Tier 1: Learnable component weights (your original idea)
+        if self.enable_learnable_weights:
+            # Create a simple module to hold parameters
+            class LearnableWeights(nn.Module):
+                def __init__(self, num_components, enable_attention):
+                    super().__init__()
+                    self.base_weights = nn.Parameter(torch.ones(num_components))
+                    if enable_attention:
+                        self.attention_weights = nn.Linear(num_components, num_components)
+                    else:
+                        self.attention_weights = None
+                        
+            self.learnable_component_weights = LearnableWeights(num_components, self.enable_attention_weighting)
+        else:
+            # Fallback to fixed weights
+            class FixedWeights(nn.Module):
+                def __init__(self, initial_weights):
+                    super().__init__()
+                    self.base_weights = nn.Parameter(torch.tensor(initial_weights), requires_grad=False)
+                    self.attention_weights = None
+                    
+            initial_weights = [self.component_weights[comp] for comp in self.component_names]
+            self.learnable_component_weights = FixedWeights(initial_weights)
+        
+        # Component name to index mapping for efficient lookups
+        self.component_to_idx = {comp: idx for idx, comp in enumerate(self.component_names)}
+        
+        # Move to device
+        self.learnable_component_weights = self.learnable_component_weights.to(self.device)
+    
     def create_action_mask(self, state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         """Create action mask to prevent invalid topology operations"""
         num_nodes = state_dict.get('num_nodes', 0)
         if num_nodes == 0:
+            # Return None for empty graphs - graceful recovery will handle this
             return None
         
         # Basic action masking rules
@@ -290,10 +591,16 @@ class DurotaxisTrainer:
                 stats['std'] = 1.0
     
     def get_component_scaling_factors(self) -> Dict[str, float]:
-        """Get adaptive scaling factors for reward components"""
+        """
+        Tier 2 Scaling: Cross-episode adaptive scaling factors
+        
+        Computes scaling factors based on historical component statistics
+        to maintain balance across different episodes and training phases.
+        """
         scaling_factors = {}
         
-        if not self.enable_adaptive_scaling:
+        # Check if cross-episode scaling is enabled
+        if not self.enable_cross_episode_scaling or not self.enable_adaptive_scaling:
             return {component: 1.0 for component in self.component_names}
         
         # Collect recent standard deviations
@@ -322,6 +629,78 @@ class DurotaxisTrainer:
             scaling_factors = {component: 1.0 for component in self.component_names}
         
         return scaling_factors
+    
+    def normalize_episode_rewards(self, rewards: List[Dict]) -> Dict[str, List[float]]:
+        """
+        Tier 1 Normalization: Per-episode reward component normalization
+        
+        Normalizes each reward component within the current episode to prevent
+        high-magnitude components from dominating the learning signal.
+        
+        Args:
+            rewards: List of reward dictionaries for the episode
+            
+        Returns:
+            Dictionary mapping component names to normalized reward lists
+        """
+        normalized_rewards = {}
+        
+        # Skip normalization if disabled or episode too short
+        if not self.enable_per_episode_norm or len(rewards) < self.min_episode_length:
+            for component in self.component_names:
+                normalized_rewards[component] = [r.get(component, 0.0) for r in rewards]
+            return normalized_rewards
+        
+        for component in self.component_names:
+            # Extract rewards for this component
+            rewards_np = np.array([r.get(component, 0.0) for r in rewards])
+            
+            # Skip normalization if all rewards are zero or very small variance
+            if len(rewards_np) == 0 or np.abs(rewards_np).max() < 1e-8:
+                normalized_rewards[component] = rewards_np.tolist()
+                continue
+            
+            # Apply selected normalization method
+            if self.normalization_method == 'zscore':
+                normalized_rewards[component] = self._zscore_normalize(rewards_np)
+            elif self.normalization_method == 'minmax':
+                normalized_rewards[component] = self._minmax_normalize(rewards_np)
+            else:  # 'adaptive' method
+                normalized_rewards[component] = self._adaptive_normalize(rewards_np)
+        
+        return normalized_rewards
+    
+    def _zscore_normalize(self, rewards_np: np.ndarray) -> List[float]:
+        """Standard z-score normalization"""
+        mean = rewards_np.mean()
+        std = rewards_np.std()
+        if std < 1e-8:
+            return np.zeros_like(rewards_np).tolist()
+        return ((rewards_np - mean) / std).tolist()
+    
+    def _minmax_normalize(self, rewards_np: np.ndarray) -> List[float]:
+        """Min-max normalization to [0, 1] range"""
+        reward_min, reward_max = rewards_np.min(), rewards_np.max()
+        reward_range = reward_max - reward_min
+        if reward_range < 1e-8:
+            return np.zeros_like(rewards_np).tolist()
+        return ((rewards_np - reward_min) / reward_range).tolist()
+    
+    def _adaptive_normalize(self, rewards_np: np.ndarray) -> List[float]:
+        """Adaptive normalization that chooses best method based on data characteristics"""
+        mean = rewards_np.mean()
+        std = rewards_np.std()
+        
+        if std < 1e-8:  # Near-constant rewards
+            # Use min-max normalization for constant/near-constant rewards
+            reward_range = rewards_np.max() - rewards_np.min()
+            if reward_range > 1e-8:
+                return ((rewards_np - rewards_np.min()) / reward_range - 0.5).tolist()
+            else:
+                return np.zeros_like(rewards_np).tolist()
+        else:
+            # Use z-score normalization for variable rewards
+            return ((rewards_np - mean) / std).tolist()
     
     def collate_graph_batch(self, states: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Collate multiple graph states into a single batch for efficient processing"""
@@ -497,6 +876,272 @@ class DurotaxisTrainer:
         # Periodic normalization to prevent weight drift
         if self.weight_updates_count % self.normalize_weights_every == 0:
             self.normalize_component_weights()
+    
+    def compute_enhanced_advantage_weights(self, advantages: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Enhanced learnable advantage weighting system
+        
+        Combines three approaches:
+        1. Learnable base weights (trainable parameters)
+        2. Attention-based dynamic weighting (context-dependent)  
+        3. Adaptive scaling for stability
+        
+        Args:
+            advantages: Dictionary of advantages per component
+            
+        Returns:
+            Final combined weighted advantages
+        """
+        if not self.enable_learnable_weights:
+            # Fallback to traditional weighting
+            return self._compute_traditional_weighted_advantages(advantages)
+        
+        device = next(iter(advantages.values())).device
+        batch_size = next(iter(advantages.values())).shape[0]
+        
+        # Step 1: Extract advantages in component order
+        advantage_tensor = torch.stack([
+            advantages[comp] for comp in self.component_names
+        ], dim=1)  # Shape: [batch_size, num_components]
+        
+        # Step 2: Learnable base weights (Tier 1)
+        base_weights = torch.softmax(self.learnable_component_weights.base_weights, dim=0)
+        
+        # Step 3: Attention-based dynamic weighting (Tier 2)
+        if self.enable_attention_weighting and self.learnable_component_weights.attention_weights is not None:
+            # Compute attention weights based on advantage magnitudes
+            advantage_magnitudes = torch.abs(advantage_tensor).mean(dim=0)  # [num_components]
+            attention_logits = self.learnable_component_weights.attention_weights(advantage_magnitudes)
+            attention_weights = torch.softmax(attention_logits, dim=0)
+            
+            # Combine base weights with attention
+            final_weights = base_weights * attention_weights
+            final_weights = final_weights / final_weights.sum()  # Renormalize
+        else:
+            final_weights = base_weights
+        
+        # Step 4: Apply weights to advantages
+        weighted_advantages = (advantage_tensor * final_weights.unsqueeze(0)).sum(dim=1)
+        
+        # Step 5: Normalize final advantages
+        if len(weighted_advantages) > 1:
+            weighted_advantages = (weighted_advantages - weighted_advantages.mean()) / (weighted_advantages.std() + 1e-8)
+        
+        return weighted_advantages
+    
+    def _compute_traditional_weighted_advantages(self, advantages: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Fallback to traditional component weighting method"""
+        total_advantages = torch.zeros(len(next(iter(advantages.values()))), device=self.device)
+        for component, adv in advantages.items():
+            weight = self.component_weights.get(component, 1.0)
+            total_advantages += weight * adv
+        
+        # Normalize advantages
+        if len(total_advantages) > 1:
+            total_advantages = (total_advantages - total_advantages.mean()) / (total_advantages.std() + 1e-8)
+        
+        return total_advantages
+    
+    def update_learnable_weights(self, advantages: Dict[str, torch.Tensor], policy_loss: torch.Tensor):
+        """Update learnable component weights based on policy performance"""
+        if not self.enable_learnable_weights:
+            return
+        
+        # Compute weight regularization loss
+        weight_reg_loss = self.weight_regularization * torch.norm(self.learnable_component_weights.base_weights)
+        
+        # Total loss for weight optimization
+        total_weight_loss = policy_loss + weight_reg_loss
+        
+        # Update learnable weights
+        self.weight_optimizer.zero_grad()
+        total_weight_loss.backward(retain_graph=True)
+        torch.nn.utils.clip_grad_norm_(self.learnable_component_weights.parameters(), 0.5)
+        self.weight_optimizer.step()
+    
+    def compute_adaptive_entropy_coefficient(self, episode: int) -> float:
+        """
+        Adaptive entropy coefficient scheduling
+        
+        Starts high for exploration, gradually decays to allow exploitation.
+        Critical for preventing premature policy collapse in hybrid action spaces.
+        """
+        if not self.enable_adaptive_entropy:
+            return self.entropy_coeff_start
+        
+        # Linear decay from start to end coefficient
+        if episode < self.entropy_decay_episodes:
+            progress = episode / self.entropy_decay_episodes
+            current_coeff = self.entropy_coeff_start * (1 - progress) + self.entropy_coeff_end * progress
+        else:
+            current_coeff = self.entropy_coeff_end
+        
+        # Update current coefficient for monitoring
+        self.current_entropy_coeff = current_coeff
+        return current_coeff
+
+    def compute_adaptive_gradient_scaling(self, discrete_loss: torch.Tensor, continuous_loss: torch.Tensor) -> Tuple[float, float]:
+        """
+        Compute adaptive gradient scaling weights to balance discrete and continuous learning
+        
+        Args:
+            discrete_loss: Policy loss for discrete actions
+            continuous_loss: Policy loss for continuous actions
+            
+        Returns:
+            Tuple of (adaptive_discrete_weight, adaptive_continuous_weight)
+        """
+        if not self.enable_gradient_scaling:
+            return self.policy_loss_weights['discrete_weight'], self.policy_loss_weights['continuous_weight']
+        
+        # Compute gradients for each component separately (without applying them)
+        discrete_gradients = []
+        continuous_gradients = []
+        
+        # Get gradients for discrete loss
+        if discrete_loss.requires_grad:
+            discrete_grads = torch.autograd.grad(
+                discrete_loss, 
+                [p for p in self.network.parameters() if p.requires_grad], 
+                retain_graph=True, 
+                create_graph=False,
+                allow_unused=True
+            )
+            discrete_gradients = [g for g in discrete_grads if g is not None]
+        
+        # Get gradients for continuous loss  
+        if continuous_loss.requires_grad:
+            continuous_grads = torch.autograd.grad(
+                continuous_loss,
+                [p for p in self.network.parameters() if p.requires_grad], 
+                retain_graph=True, 
+                create_graph=False,
+                allow_unused=True
+            )
+            continuous_gradients = [g for g in continuous_grads if g is not None]
+        
+        # Compute gradient norms
+        discrete_grad_norm = 0.0
+        if discrete_gradients:
+            discrete_grad_norm = torch.sqrt(sum(torch.sum(g**2) for g in discrete_gradients)).item()
+        
+        continuous_grad_norm = 0.0
+        if continuous_gradients:
+            continuous_grad_norm = torch.sqrt(sum(torch.sum(g**2) for g in continuous_gradients)).item()
+        
+        # Update EMA of gradient norms
+        if self.discrete_grad_norm_ema is None:
+            self.discrete_grad_norm_ema = discrete_grad_norm
+            self.continuous_grad_norm_ema = continuous_grad_norm
+        else:
+            self.discrete_grad_norm_ema = (self.scaling_momentum * self.discrete_grad_norm_ema + 
+                                         (1 - self.scaling_momentum) * discrete_grad_norm)
+            self.continuous_grad_norm_ema = (self.scaling_momentum * self.continuous_grad_norm_ema + 
+                                           (1 - self.scaling_momentum) * continuous_grad_norm)
+        
+        self.gradient_step_count += 1
+        
+        # During warmup, use original weights
+        if self.gradient_step_count < self.gradient_warmup_steps:
+            return self.policy_loss_weights['discrete_weight'], self.policy_loss_weights['continuous_weight']
+        
+        # Compute adaptive scaling factors
+        if self.discrete_grad_norm_ema > 0 and self.continuous_grad_norm_ema > 0:
+            # Target: both components should have similar gradient norms
+            discrete_scale = self.gradient_norm_target / self.discrete_grad_norm_ema
+            continuous_scale = self.gradient_norm_target / self.continuous_grad_norm_ema
+            
+            # Clamp scaling factors to prevent extreme values
+            discrete_scale = max(self.min_scaling_factor, min(self.max_scaling_factor, discrete_scale))
+            continuous_scale = max(self.min_scaling_factor, min(self.max_scaling_factor, continuous_scale))
+            
+            # Apply scaling to original weights
+            base_discrete = self.policy_loss_weights['discrete_weight']
+            base_continuous = self.policy_loss_weights['continuous_weight']
+            
+            scaled_discrete = base_discrete * discrete_scale
+            scaled_continuous = base_continuous * continuous_scale
+            
+            # Normalize to maintain relative importance while balancing gradients
+            total_weight = scaled_discrete + scaled_continuous
+            if total_weight > 0:
+                self.adaptive_discrete_weight = scaled_discrete / total_weight
+                self.adaptive_continuous_weight = scaled_continuous / total_weight
+        
+        return self.adaptive_discrete_weight, self.adaptive_continuous_weight
+    
+    def compute_enhanced_entropy_loss(self, eval_output: Dict[str, torch.Tensor], episode: int) -> Dict[str, torch.Tensor]:
+        """
+        Enhanced entropy regularization for hybrid action spaces
+        
+        Implements your core idea with improvements:
+        1. Adaptive entropy scheduling (high→low over training)
+        2. Separate handling for discrete vs continuous actions  
+        3. Minimum entropy protection against policy collapse
+        4. Action space specific weighting
+        
+        Args:
+            eval_output: Network evaluation output containing entropy information
+            episode: Current episode number for adaptive scheduling
+            
+        Returns:
+            Dictionary of entropy losses for monitoring and optimization
+        """
+        entropy_losses = {}
+        
+        # Get adaptive entropy coefficient
+        entropy_coeff = self.compute_adaptive_entropy_coefficient(episode)
+        
+        if 'entropy' in eval_output:
+            # Combined entropy (your original idea enhanced)
+            total_entropy = eval_output['entropy'].mean()
+            
+            # Minimum entropy protection (prevent complete collapse)
+            if total_entropy < self.min_entropy_threshold:
+                # Boost entropy if too low
+                entropy_penalty = (self.min_entropy_threshold - total_entropy) * 2.0
+                entropy_losses['entropy_penalty'] = entropy_penalty
+            
+            # Main entropy regularization (encourage exploration)
+            entropy_losses['total'] = -entropy_coeff * total_entropy
+            
+        else:
+            # Separate discrete and continuous entropy handling
+            total_entropy_loss = torch.tensor(0.0, device=self.device)
+            
+            if 'discrete_entropy' in eval_output:
+                discrete_entropy = eval_output['discrete_entropy'].mean()
+                
+                # Discrete actions need strong entropy (topology decisions are critical)
+                discrete_loss = -entropy_coeff * self.discrete_entropy_weight * discrete_entropy
+                entropy_losses['discrete'] = discrete_loss
+                total_entropy_loss += discrete_loss
+                
+                # Monitor discrete entropy collapse
+                if discrete_entropy < self.min_entropy_threshold:
+                    discrete_penalty = (self.min_entropy_threshold - discrete_entropy) * 3.0
+                    entropy_losses['discrete_penalty'] = discrete_penalty
+                    total_entropy_loss += discrete_penalty
+            
+            if 'continuous_entropy' in eval_output:
+                continuous_entropy = eval_output['continuous_entropy'].mean()
+                
+                # Continuous actions can be more focused (parameter fine-tuning)
+                continuous_loss = -entropy_coeff * self.continuous_entropy_weight * continuous_entropy
+                entropy_losses['continuous'] = continuous_loss
+                total_entropy_loss += continuous_loss
+                
+                # Monitor continuous entropy collapse
+                if continuous_entropy < self.min_entropy_threshold * 0.5:  # Lower threshold for continuous
+                    continuous_penalty = (self.min_entropy_threshold * 0.5 - continuous_entropy) * 1.5
+                    entropy_losses['continuous_penalty'] = continuous_penalty
+                    total_entropy_loss += continuous_penalty
+            
+            # Combined loss for backward compatibility
+            if total_entropy_loss.item() != 0:
+                entropy_losses['total'] = total_entropy_loss
+        
+        return entropy_losses
     
     def normalize_component_weights(self) -> None:
         """Normalize component weights to sum to 1 for balanced contribution"""
@@ -683,8 +1328,23 @@ class DurotaxisTrainer:
                          for k, v in state_dict.items()}
             
             if state_dict['num_nodes'] == 0:
-                # Handle empty graph case
-                break
+                if self.enable_graceful_recovery:
+                    # Graceful empty graph handling: add minimal dummy node to preserve training continuity
+                    if self.log_recoveries:
+                        print(f"⚠️  Empty graph detected at episode step {episode_length}, adding {self.recovery_num_nodes} node(s) to continue training...")
+                    self.env.topology.reset(init_num_nodes=self.recovery_num_nodes)
+                    self.empty_graph_recovery_count += 1
+                    # Get updated state after reset
+                    state_dict = self.state_extractor.get_state_features(include_substrate=True)
+                    state_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                 for k, v in state_dict.items()}
+                    # Update state extractor with reset topology
+                    self.state_extractor.set_topology(self.env.topology)
+                else:
+                    # Fallback to original behavior: break episode
+                    if self.log_recoveries:
+                        print(f"⚠️  Empty graph detected at episode step {episode_length}, ending episode...")
+                    break
                 
             # Create action mask
             action_mask = self.create_action_mask(state_dict)
@@ -770,24 +1430,27 @@ class DurotaxisTrainer:
     def compute_returns_and_advantages(self, rewards: List[Dict], values: List[Dict], 
                                      final_values: Optional[Dict] = None, terminated: bool = False,
                                      gamma: float = 0.99, gae_lambda: float = 0.95) -> Dict[str, torch.Tensor]:
-        """Compute returns and advantages for each reward component with proper GAE bootstrapping"""
+        """Compute returns and advantages for each reward component with improved normalization"""
         if not rewards or not values:
             return {}, {}
         
-        # Get adaptive scaling factors
+        # Tier 1: Per-episode reward normalization (prevents component domination within episode)
+        normalized_rewards = self.normalize_episode_rewards(rewards)
+        
+        # Tier 2: Get adaptive scaling factors (for cross-episode balance)  
         scaling_factors = self.get_component_scaling_factors()
         
         returns = {}
         advantages = {}
         
         for component in self.component_names:
-            # Extract component rewards and values
-            raw_component_rewards = torch.tensor([r.get(component, 0.0) for r in rewards], 
-                                               dtype=torch.float32, device=self.device)
+            # Extract normalized component rewards
+            component_rewards = torch.tensor(normalized_rewards[component], 
+                                           dtype=torch.float32, device=self.device)
             
-            # Apply adaptive scaling
+            # Apply adaptive scaling for cross-episode consistency
             scaling_factor = scaling_factors.get(component, 1.0)
-            component_rewards = raw_component_rewards * scaling_factor
+            component_rewards = component_rewards * scaling_factor
             
             component_values = torch.stack([v[component] for v in values])
             
@@ -835,17 +1498,15 @@ class DurotaxisTrainer:
     
     def compute_hybrid_policy_loss(self, old_log_probs_dict: Dict[str, torch.Tensor], 
                                   eval_output: Dict[str, torch.Tensor], 
-                                  advantage: float) -> Dict[str, torch.Tensor]:
-        """Compute balanced policy loss for hybrid discrete+continuous actions"""
+                                  advantage: float, episode: int = 0) -> Dict[str, torch.Tensor]:
+        """Compute balanced policy loss for hybrid discrete+continuous actions with adaptive gradient scaling"""
         policy_losses = {}
-        entropy_losses = {}
         
-        # Extract weights
-        discrete_weight = self.policy_loss_weights['discrete_weight']
-        continuous_weight = self.policy_loss_weights['continuous_weight']
+        # Extract base weights and clipping
         clip_eps = self.policy_loss_weights['clip_epsilon']
         
         # === DISCRETE POLICY LOSS ===
+        discrete_loss_raw = torch.tensor(0.0, device=self.device)
         if ('discrete' in old_log_probs_dict and 
             'discrete_log_probs' in eval_output and 
             len(old_log_probs_dict['discrete']) > 0 and 
@@ -858,17 +1519,14 @@ class DurotaxisTrainer:
             ratio_discrete = torch.exp(new_discrete_log_prob - old_discrete_log_prob)
             clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO discrete policy loss
-            discrete_loss = -torch.min(
+            # PPO discrete policy loss (before scaling)
+            discrete_loss_raw = -torch.min(
                 ratio_discrete * advantage,
                 clipped_ratio_discrete * advantage
             )
-            
-            policy_losses['discrete'] = discrete_weight * discrete_loss
-        else:
-            policy_losses['discrete'] = torch.tensor(0.0, device=self.device)
         
         # === CONTINUOUS POLICY LOSS ===
+        continuous_loss_raw = torch.tensor(0.0, device=self.device)
         if ('continuous' in old_log_probs_dict and 
             'continuous_log_probs' in eval_output and 
             len(old_log_probs_dict['continuous']) > 0 and 
@@ -881,28 +1539,25 @@ class DurotaxisTrainer:
             ratio_continuous = torch.exp(new_continuous_log_prob - old_continuous_log_prob)
             clipped_ratio_continuous = torch.clamp(ratio_continuous, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO continuous policy loss
-            continuous_loss = -torch.min(
+            # PPO continuous policy loss (before scaling)
+            continuous_loss_raw = -torch.min(
                 ratio_continuous * advantage,
                 clipped_ratio_continuous * advantage
             )
-            
-            policy_losses['continuous'] = continuous_weight * continuous_loss
-        else:
-            policy_losses['continuous'] = torch.tensor(0.0, device=self.device)
         
-        # === ENTROPY LOSSES (Separate for discrete and continuous) ===
-        entropy_weight = self.policy_loss_weights['entropy_weight']
+        # === ADAPTIVE GRADIENT SCALING ===
+        # Compute adaptive weights based on gradient magnitudes
+        adaptive_discrete_weight, adaptive_continuous_weight = self.compute_adaptive_gradient_scaling(
+            discrete_loss_raw, continuous_loss_raw
+        )
         
-        if 'entropy' in eval_output:
-            # Use provided entropy (combined)
-            entropy_losses['total'] = -entropy_weight * eval_output['entropy']
-        else:
-            # Compute separate entropies if available
-            if 'discrete_entropy' in eval_output:
-                entropy_losses['discrete'] = -entropy_weight * eval_output['discrete_entropy']
-            if 'continuous_entropy' in eval_output:
-                entropy_losses['continuous'] = -entropy_weight * eval_output['continuous_entropy']
+        # Apply adaptive weights
+        policy_losses['discrete'] = adaptive_discrete_weight * discrete_loss_raw
+        policy_losses['continuous'] = adaptive_continuous_weight * continuous_loss_raw
+        
+        # === ENHANCED ENTROPY REGULARIZATION ===
+        # Use enhanced entropy system instead of basic entropy handling
+        entropy_losses = self.compute_enhanced_entropy_loss(eval_output, episode)
         
         # Total policy loss
         total_policy_loss = sum(policy_losses.values())
@@ -913,32 +1568,25 @@ class DurotaxisTrainer:
             'policy_loss_continuous': policy_losses['continuous'],
             'total_policy_loss': total_policy_loss,
             'entropy_loss': total_entropy_loss,
-            'discrete_weight_used': discrete_weight,
-            'continuous_weight_used': continuous_weight
+            'discrete_weight_used': adaptive_discrete_weight,
+            'continuous_weight_used': adaptive_continuous_weight,
+            'discrete_grad_norm': getattr(self, 'discrete_grad_norm_ema', 0.0),
+            'continuous_grad_norm': getattr(self, 'continuous_grad_norm_ema', 0.0),
+            'gradient_scaling_active': self.enable_gradient_scaling and self.gradient_step_count >= self.gradient_warmup_steps
         }
     
     def update_policy(self, states: List[Dict], actions: List[Dict], 
                      returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
-                     old_log_probs: List[Dict]) -> Dict[str, float]:
-        """Update policy using PPO with efficient batched re-evaluation"""
+                     old_log_probs: List[Dict], episode: int = 0) -> Dict[str, float]:
+        """Update policy using PPO with efficient batched re-evaluation and enhanced entropy"""
         if not states or not actions:
             return {}
         
         losses = {}
         
-        # === ADAPTIVE COMPONENT WEIGHTING ===
-        # Update component weights based on advantage magnitude
-        self.update_adaptive_component_weights(advantages)
-        
-        # Combine advantages with adaptive component weighting
-        total_advantages = torch.zeros(len(states), device=self.device)
-        for component, adv in advantages.items():
-            weight = self.component_weights.get(component, 1.0)
-            total_advantages += weight * adv
-        
-        # Normalize advantages
-        if len(total_advantages) > 1:
-            total_advantages = (total_advantages - total_advantages.mean()) / (total_advantages.std() + 1e-8)
+        # === ENHANCED LEARNABLE ADVANTAGE WEIGHTING ===
+        # Use enhanced learnable weighting system instead of traditional approach
+        total_advantages = self.compute_enhanced_advantage_weights(advantages)
         
         # === EFFICIENT BATCHED RE-EVALUATION ===
         
@@ -1021,7 +1669,7 @@ class DurotaxisTrainer:
             
             # Compute hybrid policy loss with separate discrete/continuous handling
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
-                old_log_probs_dict, eval_output, advantage
+                old_log_probs_dict, eval_output, advantage, episode
             )
             
             hybrid_policy_losses.append(hybrid_loss_dict)
@@ -1080,6 +1728,230 @@ class DurotaxisTrainer:
         total_loss = avg_total_policy_loss + 0.5 * total_value_loss + avg_entropy_loss + entropy_bonus
         losses['total_loss'] = total_loss.item()
         
+        # Update learnable component weights based on policy performance
+        self.update_learnable_weights(advantages, avg_total_policy_loss)
+        
+        # Backward pass
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
+        self.optimizer.step()
+        
+        return losses
+
+    def update_policy_minibatch(self, states: List[Dict], actions: List[Dict], 
+                               returns: List[torch.Tensor], advantages: List[torch.Tensor],
+                               old_log_probs: List[Dict], old_values: List[Dict], episode: int = 0) -> Dict[str, float]:
+        """Update policy using a minibatch of data from the trajectory buffer"""
+        if not states or not actions:
+            return {}
+        
+        # Convert list data back to the format expected by original update_policy
+        # Group returns and advantages by component
+        returns_dict = {component: [] for component in self.component_names}
+        advantages_dict = {component: [] for component in self.component_names}
+        old_values_dict = {component: [] for component in self.component_names}
+        
+        # For minibatch training, we need to reconstruct the component-wise format
+        # Since returns and advantages are already computed as scalars in the buffer,
+        # we'll use them directly as total values
+        for i, (ret_val, adv_val, old_val) in enumerate(zip(returns, advantages, old_values)):
+            # Use the total values for all components (they're already weighted)
+            for component in self.component_names:
+                returns_dict[component].append(ret_val)
+                advantages_dict[component].append(adv_val)
+                # Handle old values - if it's a dict, extract component, otherwise use as total
+                if isinstance(old_val, dict):
+                    old_values_dict[component].append(old_val.get(component, old_val.get('total_reward', ret_val)))
+                else:
+                    old_values_dict[component].append(old_val)
+        
+        # Convert to tensors
+        for component in self.component_names:
+            returns_dict[component] = torch.stack(returns_dict[component])
+            advantages_dict[component] = torch.stack(advantages_dict[component])
+            old_values_dict[component] = torch.stack(old_values_dict[component])
+        
+        # Call the original update_policy method with old values
+        return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, episode)
+
+    def update_policy_with_value_clipping(self, states: List[Dict], actions: List[Dict], 
+                                        returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
+                                        old_log_probs: List[Dict], old_values: Dict[str, torch.Tensor], episode: int = 0) -> Dict[str, float]:
+        """Update policy using PPO with value clipping for stable critic updates"""
+        if not states or not actions:
+            return {}
+        
+        losses = {}
+        
+        # === ENHANCED LEARNABLE ADVANTAGE WEIGHTING ===
+        # Use enhanced learnable weighting system instead of traditional approach
+        total_advantages = self.compute_enhanced_advantage_weights(advantages)
+        
+        # === EFFICIENT BATCHED RE-EVALUATION ===
+        
+        # Step 1: Collate all states into a single batch
+        batched_states = self.collate_graph_batch(states)
+        
+        # Step 2: Collate action masks
+        action_masks = []
+        for i, action_dict in enumerate(actions):
+            if 'mask' in action_dict and action_dict['mask'] is not None:
+                action_masks.append(action_dict['mask'])
+            elif states[i].get('num_nodes', 0) > 0:
+                # Create default mask if not provided
+                num_nodes = states[i]['num_nodes']
+                default_mask = torch.ones(num_nodes, 2, dtype=torch.bool, device=self.device)
+                action_masks.append(default_mask)
+            else:
+                action_masks.append(None)
+        
+        # Batch action masks
+        if any(mask is not None for mask in action_masks):
+            valid_masks = [mask for mask in action_masks if mask is not None]
+            if valid_masks:
+                batched_action_mask = torch.cat(valid_masks, dim=0)
+            else:
+                batched_action_mask = None
+        else:
+            batched_action_mask = None
+        
+        # Step 3: Collate discrete and continuous actions
+        all_discrete_actions = []
+        all_continuous_actions = []
+        
+        for action_dict in actions:
+            if 'discrete' in action_dict and action_dict['discrete'].shape[0] > 0:
+                all_discrete_actions.append(action_dict['discrete'])
+                all_continuous_actions.append(action_dict['continuous'])
+        
+        if all_discrete_actions:
+            batched_discrete_actions = torch.cat(all_discrete_actions, dim=0)
+            batched_continuous_actions = torch.cat(all_continuous_actions, dim=0)
+        else:
+            # Handle empty actions case
+            batched_discrete_actions = torch.empty(0, dtype=torch.long, device=self.device)
+            batched_continuous_actions = torch.empty(0, 4, device=self.device)
+        
+        # Step 4: Single batched re-evaluation (🚀 MUCH FASTER!)
+        if batched_states['num_nodes'] > 0:
+            batched_eval_output = self.network.evaluate_actions(
+                batched_states,
+                batched_discrete_actions,
+                batched_continuous_actions,
+                action_mask=batched_action_mask
+            )
+        else:
+            # Handle empty batch
+            batched_eval_output = {
+                'discrete_log_probs': torch.empty(0, device=self.device),
+                'continuous_log_probs': torch.empty(0, device=self.device),
+                'total_log_probs': torch.empty(0, device=self.device),
+                'value_predictions': {k: torch.empty(0, device=self.device) for k in self.component_names},
+                'entropy': torch.tensor(0.0, device=self.device)
+            }
+        
+        # Step 5: Unbatch the evaluation results
+        node_counts = batched_states['node_counts']
+        individual_eval_outputs = self.unbatch_network_output(batched_eval_output, node_counts)
+        
+        # === COMPUTE LOSSES USING BATCHED RESULTS ===
+        
+        hybrid_policy_losses = []
+        value_losses = {component: [] for component in self.component_names}
+        
+        for i, (eval_output, old_log_probs_dict) in enumerate(zip(individual_eval_outputs, old_log_probs)):
+            if i >= len(actions) or 'discrete' not in actions[i]:
+                continue
+            
+            # === HYBRID POLICY LOSS ===
+            advantage = total_advantages[i]
+            
+            # Compute hybrid policy loss with separate discrete/continuous handling
+            hybrid_loss_dict = self.compute_hybrid_policy_loss(
+                old_log_probs_dict, eval_output, advantage, episode
+            )
+            
+            hybrid_policy_losses.append(hybrid_loss_dict)
+            
+            # === PPO VALUE LOSSES WITH CLIPPING (Component-specific) ===
+            for component in self.component_names:
+                if component in eval_output['value_predictions'] and component in returns:
+                    predicted_value = eval_output['value_predictions'][component]
+                    target_return = returns[component][i]
+                    old_value = old_values[component][i]
+                    
+                    if self.enable_value_clipping:
+                        # PPO-style value clipping to prevent large critic updates
+                        value_pred_clipped = old_value + torch.clamp(
+                            predicted_value - old_value, 
+                            -self.value_clip_epsilon, 
+                            self.value_clip_epsilon
+                        )
+                        
+                        # Compute both clipped and unclipped value losses
+                        v_loss1 = (predicted_value - target_return) ** 2
+                        v_loss2 = (value_pred_clipped - target_return) ** 2
+                        
+                        # Take the maximum to ensure we don't make updates that are too large
+                        value_loss = torch.max(v_loss1, v_loss2)
+                    else:
+                        # Standard MSE loss (fallback)
+                        value_loss = F.mse_loss(predicted_value, target_return)
+                    
+                    value_losses[component].append(value_loss)
+        
+        # === AGGREGATE LOSSES ===
+        
+        # Policy losses
+        if hybrid_policy_losses:
+            # Average across batch
+            avg_discrete_loss = torch.stack([h['policy_loss_discrete'] for h in hybrid_policy_losses]).mean()
+            avg_continuous_loss = torch.stack([h['policy_loss_continuous'] for h in hybrid_policy_losses]).mean()
+            avg_total_policy_loss = torch.stack([h['total_policy_loss'] for h in hybrid_policy_losses]).mean()
+            avg_entropy_loss = torch.stack([h['entropy_loss'] for h in hybrid_policy_losses]).mean()
+            
+            losses['policy_loss_discrete'] = avg_discrete_loss.item()
+            losses['policy_loss_continuous'] = avg_continuous_loss.item()
+            losses['total_policy_loss'] = avg_total_policy_loss.item()
+            losses['entropy_loss'] = avg_entropy_loss.item()
+            
+            # Show weight usage
+            losses['discrete_weight'] = hybrid_policy_losses[0]['discrete_weight_used']
+            losses['continuous_weight'] = hybrid_policy_losses[0]['continuous_weight_used']
+        else:
+            avg_total_policy_loss = torch.tensor(0.0, device=self.device)
+            avg_entropy_loss = torch.tensor(0.0, device=self.device)
+        
+        # Component-weighted value loss with clipping information
+        total_value_loss = torch.tensor(0.0, device=self.device)
+        for component, component_losses in value_losses.items():
+            if component_losses:
+                component_loss = torch.stack(component_losses).mean()
+                weight = self.component_weights.get(component, 1.0)
+                total_value_loss += weight * component_loss
+                losses[f'value_loss_{component}'] = component_loss.item()
+        
+        losses['total_value_loss'] = total_value_loss.item()
+        losses['value_clipping_enabled'] = self.enable_value_clipping
+        losses['value_clip_epsilon'] = self.value_clip_epsilon
+        
+        # === ENTROPY BONUS FOR EXPLORATION ===
+        # Encourage exploration to prevent premature convergence
+        entropy_bonus = torch.tensor(0.0, device=self.device)
+        if 'entropy' in batched_eval_output:
+            entropy_bonus = -self.entropy_bonus_coeff * batched_eval_output['entropy']
+            losses['entropy_bonus'] = entropy_bonus.item()
+        else:
+            losses['entropy_bonus'] = 0.0
+        
+        # === TOTAL LOSS AND OPTIMIZATION ===
+        total_loss = avg_total_policy_loss + 0.5 * total_value_loss + avg_entropy_loss + entropy_bonus
+        losses['total_loss'] = total_loss.item()
+        
+        # Update learnable component weights based on policy performance
+        self.update_learnable_weights(advantages, avg_total_policy_loss)
+        
         # Backward pass
         self.optimizer.zero_grad()
         total_loss.backward()
@@ -1089,97 +1961,178 @@ class DurotaxisTrainer:
         return losses
     
     def train(self):
-        """Main training loop"""
+        """Main training loop with batch updates"""
         # Create run directory for this training session
         self.run_dir = self.create_run_directory(self.save_dir)
         print(f"🏋️ Starting training for {self.total_episodes} episodes (Run #{self.run_number:04d})")
         print(f"📁 Saving to: {self.run_dir}")
-        print(f"📊 Progress format: Ep | R: Current (MA: MovingAvg, Best: Best) Trend | Loss | Entropy | Steps | Success | Focus: Component(Weight)")
+        print(f"📊 Batch Training: {self.rollout_batch_size} episodes per batch, {self.update_epochs} update epochs, {self.minibatch_size} minibatch size")
+        print(f"📊 Progress format: Batch | R: Current (MA: MovingAvg, Best: Best) | Loss | Entropy | LR: Learning Rate | Episodes | Success Rate | Focus: Component(Weight)")
         
-        for episode in range(self.total_episodes):
-            # Collect episode
-            states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode()
+        episode_count = 0
+        batch_count = 0
+        
+        while episode_count < self.total_episodes:
+            # ==========================================
+            # PHASE 1: COLLECT ROLLOUT BATCH
+            # ==========================================
+            self.trajectory_buffer.clear()
+            batch_episode_rewards = []
+            batch_successes = []
             
-            if not rewards:
-                continue
-            
-            # Update component statistics for adaptive scaling
-            self.update_component_stats(rewards)
+            # Collect rollout_batch_size episodes
+            for batch_episode in range(self.rollout_batch_size):
+                if episode_count >= self.total_episodes:
+                    break
+                    
+                # Start new episode in buffer
+                self.trajectory_buffer.start_episode()
                 
-            # Compute returns and advantages (with proper GAE bootstrapping)
-            returns, advantages = self.compute_returns_and_advantages(
-                rewards, values, final_values, terminated
-            )
-            
-            # Update policy
-            losses = self.update_policy(states, actions, returns, advantages, log_probs)
-            
-            # Track episode rewards
-            episode_total_reward = sum(r.get('total_reward', 0.0) for r in rewards)
-            self.episode_rewards['total_reward'].append(episode_total_reward)
-            
-            for component in self.component_names:
-                component_reward = sum(r.get(component, 0.0) for r in rewards)
-                self.episode_rewards[component].append(component_reward)
-            
-            # Track losses
-            for loss_name, loss_value in losses.items():
-                self.losses[loss_name].append(loss_value)
-            
-            # Compute and save spawn parameter statistics
-            self.save_spawn_statistics(episode)
-            
-            # Compute and save reward component statistics
-            self.save_reward_statistics(episode)
-            
-            # One-line comprehensive progress print (includes spawn & reward stats)
-            if episode % self.progress_print_every == 0 or episode < 10:
-                recent_reward = moving_average(self.episode_rewards['total_reward'], min(10, len(self.episode_rewards['total_reward'])))
-                best_so_far = max(self.episode_rewards['total_reward']) if self.episode_rewards['total_reward'] else 0.0
-                total_loss = losses.get('total_loss', 0.0)
-                entropy_bonus = losses.get('entropy_bonus', 0.0)
-                dominant_comp = max(self.component_weights.items(), key=lambda x: x[1])[0]
-                dominant_weight = self.component_weights[dominant_comp]
+                # Collect episode using existing method
+                states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode()
                 
-                # Show progress with trend indicator
-                trend = "↗" if len(self.episode_rewards['total_reward']) > 1 and recent_reward > self.episode_rewards['total_reward'][-2] else "→"
+                if not rewards:
+                    continue
                 
-                # Build spawn info
-                spawn_info = ""
-                if hasattr(self, 'current_spawn_summary') and self.current_spawn_summary['count'] > 0:
-                    spawn_info = f" | Spawns: {self.current_spawn_summary['count']}(γ:{self.current_spawn_summary['gamma']} α:{self.current_spawn_summary['alpha']})"
+                # Add episode data to buffer
+                for i in range(len(states)):
+                    self.trajectory_buffer.add_step(
+                        states[i], actions[i], rewards[i], values[i], log_probs[i], values[i]  # old_values = values for first collection
+                    )
                 
-                # Build reward breakdown info  
-                reward_info = ""
-                if hasattr(self, 'current_reward_summary') and self.current_reward_summary:
-                    total_r = next((r for r in self.current_reward_summary if r['name'] == 'total_reward'), None)
-                    graph_r = next((r for r in self.current_reward_summary if r['name'] == 'graph_reward'), None)
-                    if total_r and graph_r:
-                        reward_info = f" | Rewards: T:{total_r['sum']:.1f} G:{graph_r['sum']:.1f}"
+                # Finish episode in buffer
+                self.trajectory_buffer.finish_episode(final_values, terminated, success)
                 
-                # Build substrate info
-                substrate_info = ""
-                if self.substrate_type == 'random':
-                    params = self.current_substrate_params
-                    substrate_info = f" | Sub: {params['kind'][:3]}(m:{params['m']:.3f} b:{params['b']:.2f})"
-                elif self.substrate_type in ['linear', 'exponential']:
-                    substrate_info = f" | Sub: {self.substrate_type[:3]}"
+                # Update component statistics for adaptive scaling
+                self.update_component_stats(rewards)
                 
-                print(f"Ep {episode:4d} | R: {episode_total_reward:6.3f} (MA: {recent_reward:6.3f}, Best: {best_so_far:6.3f}) {trend} | "
-                      f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | Steps: {len(rewards):3d} | "
-                      f"Success: {'✓' if success else '✗'} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){spawn_info}{reward_info}{substrate_info}")
+                # Track episode rewards and success
+                episode_total_reward = sum(r.get('total_reward', 0.0) for r in rewards)
+                batch_episode_rewards.append(episode_total_reward)
+                batch_successes.append(success)
+                
+                # Update episode tracking
+                self.episode_rewards['total_reward'].append(episode_total_reward)
+                for component in self.component_names:
+                    component_reward = sum(r.get(component, 0.0) for r in rewards)
+                    self.episode_rewards[component].append(component_reward)
+                
+                # Update learning rate schedule
+                self.scheduler.step()
+                
+                # Compute and save spawn parameter statistics
+                self.save_spawn_statistics(episode_count)
+                
+                # Compute and save reward component statistics
+                self.save_reward_statistics(episode_count)
+                
+                episode_count += 1
             
-            # Save best model
-            if episode_total_reward > self.best_total_reward:
-                self.best_total_reward = episode_total_reward
-                self.save_model(f"best_model_ep{episode}.pt")
-            
-            # Periodic saves (only if checkpoint_every is configured)
-            if self.checkpoint_every is not None and episode % self.checkpoint_every == 0 and episode > 0:
-                self.save_model(f"checkpoint_ep{episode}.pt")
-                print(f"💾 Checkpoint saved at episode {episode}")
+            # ==========================================
+            # PHASE 2: COMPUTE RETURNS AND ADVANTAGES
+            # ==========================================
+            if len(self.trajectory_buffer) > 0:
+                # Compute returns and advantages for all episodes in buffer
+                algorithm_config = self.config_loader.get_algorithm_config()
+                gamma = algorithm_config.get('gamma', 0.99)
+                gae_lambda = algorithm_config.get('gae_lambda', 0.95)
+                
+                self.trajectory_buffer.compute_returns_and_advantages_for_all_episodes(gamma, gae_lambda)
+                
+                # ==========================================
+                # PHASE 3: BATCH POLICY UPDATES
+                # ==========================================
+                
+                # Perform multiple update epochs on the collected batch
+                total_losses = {}
+                
+                for epoch in range(self.update_epochs):
+                    # Create random minibatches from buffer
+                    minibatches = self.trajectory_buffer.create_minibatches(self.minibatch_size)
+                    
+                    epoch_losses = {}
+                    for minibatch in minibatches:
+                        # Update policy on this minibatch
+                        losses = self.update_policy_minibatch(
+                            minibatch['states'], 
+                            minibatch['actions'],
+                            minibatch['returns'], 
+                            minibatch['advantages'], 
+                            minibatch['log_probs'],
+                            minibatch['old_values'], 
+                            episode_count
+                        )
+                        
+                        # Accumulate losses
+                        for loss_name, loss_value in losses.items():
+                            if loss_name not in epoch_losses:
+                                epoch_losses[loss_name] = []
+                            epoch_losses[loss_name].append(loss_value)
+                    
+                    # Average losses across minibatches for this epoch
+                    for loss_name, loss_values in epoch_losses.items():
+                        if loss_name not in total_losses:
+                            total_losses[loss_name] = []
+                        total_losses[loss_name].append(np.mean(loss_values))
+                
+                # Average losses across all epochs
+                final_losses = {}
+                for loss_name, loss_values in total_losses.items():
+                    final_losses[loss_name] = np.mean(loss_values)
+                
+                # Track losses
+                for loss_name, loss_value in final_losses.items():
+                    self.losses[loss_name].append(loss_value)
+                
+                # ==========================================
+                # PHASE 4: BATCH PROGRESS REPORTING
+                # ==========================================
+                
+                # Get batch statistics
+                batch_stats = self.trajectory_buffer.get_episode_stats()
+                
+                # Progress reporting (every few batches or early batches)
+                if batch_count % max(1, self.progress_print_every // self.rollout_batch_size) == 0 or batch_count < 3:
+                    recent_reward = moving_average(self.episode_rewards['total_reward'], min(20, len(self.episode_rewards['total_reward'])))
+                    best_so_far = max(self.episode_rewards['total_reward']) if self.episode_rewards['total_reward'] else 0.0
+                    total_loss = final_losses.get('total_loss', 0.0)
+                    entropy_bonus = final_losses.get('entropy_bonus', 0.0)
+                    dominant_comp = max(self.component_weights.items(), key=lambda x: x[1])[0]
+                    dominant_weight = self.component_weights[dominant_comp]
+                    
+                    # Build substrate info
+                    substrate_info = ""
+                    if self.substrate_type == 'random':
+                        params = self.current_substrate_params
+                        substrate_info = f" | Sub: {params['kind'][:3]}(m:{params['m']:.3f} b:{params['b']:.2f})"
+                    elif self.substrate_type in ['linear', 'exponential']:
+                        substrate_info = f" | Sub: {self.substrate_type[:3]}"
+                    
+                    # Build empty graph recovery info
+                    recovery_info = ""
+                    if self.empty_graph_recovery_count > 0:
+                        recovery_info = f" | Recoveries: {self.empty_graph_recovery_count}"
+                    
+                    print(f"Batch {batch_count:3d} | R: {batch_stats['avg_reward']:6.3f} (MA: {recent_reward:6.3f}, Best: {best_so_far:6.3f}) | "
+                          f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
+                          f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
+                
+                # Save best model (check against best episode in this batch)
+                best_batch_reward = max(batch_episode_rewards) if batch_episode_rewards else 0.0
+                if best_batch_reward > self.best_total_reward:
+                    self.best_total_reward = best_batch_reward
+                    self.save_model(f"best_model_batch{batch_count}.pt")
+                
+                # Periodic saves (only if checkpoint_every is configured)
+                if self.checkpoint_every is not None and batch_count % (self.checkpoint_every // self.rollout_batch_size) == 0 and batch_count > 0:
+                    self.save_model(f"checkpoint_batch{batch_count}.pt")
+                    print(f"💾 Checkpoint saved at batch {batch_count} (episode {episode_count})")
+                
+                batch_count += 1
         
         print(f"🎉 Training completed!")
+        print(f"   Episodes trained: {episode_count}")
+        print(f"   Batches completed: {batch_count}")
         print(f"   Best total reward: {self.best_total_reward:.3f}")
         self.save_model("final_model.pt")
         self.save_metrics()
@@ -1408,6 +2361,7 @@ class DurotaxisTrainer:
         checkpoint = {
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
             'episode_rewards': dict(self.episode_rewards),
             'losses': dict(self.losses),
             'best_reward': self.best_total_reward,
@@ -1418,6 +2372,38 @@ class DurotaxisTrainer:
         filepath = os.path.join(self.run_dir, filename)
         torch.save(checkpoint, filepath)
         print(f"💾 Saved: {filename} (Run #{self.run_number})")
+    
+    def load_model(self, filename: str):
+        """Load model checkpoint from file"""
+        filepath = os.path.join(self.run_dir, filename)
+        if not os.path.exists(filepath):
+            print(f"❌ Checkpoint file not found: {filename}")
+            return False
+            
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        # Load network and optimizer states
+        self.network.load_state_dict(checkpoint['network_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load scheduler state if available (for backward compatibility)
+        if 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        else:
+            print("⚠️ No scheduler state found in checkpoint (older checkpoint format)")
+        
+        # Load training progress
+        if 'episode_rewards' in checkpoint:
+            self.episode_rewards = defaultdict(list, checkpoint['episode_rewards'])
+        if 'losses' in checkpoint:
+            self.losses = defaultdict(list, checkpoint['losses'])
+        if 'best_reward' in checkpoint:
+            self.best_total_reward = checkpoint['best_reward']
+        if 'component_weights' in checkpoint:
+            self.component_weights = checkpoint['component_weights']
+            
+        print(f"📂 Loaded: {filename} (Run #{checkpoint.get('run_number', 'unknown')})")
+        return True
     
     def save_metrics(self):
         """Save training metrics"""
