@@ -127,7 +127,7 @@ environment:
   
   # Visualization
   flush_delay: 0.0001
-  enable_visualization: true
+  enable_visualization: false
   
   # Reward structure - Graph rewards
   graph_rewards:
