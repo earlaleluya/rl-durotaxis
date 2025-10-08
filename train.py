@@ -486,6 +486,8 @@ class DurotaxisTrainer:
         # Training tracking
         self.episode_rewards = defaultdict(list)
         self.losses = defaultdict(list)
+        # Per-episode loss tracking (one value per episode: average total loss applied to episodes in a batch)
+        self.episode_losses = []
         self.best_total_reward = float('-inf')
         
         # Spawn parameter tracking for each episode
@@ -505,6 +507,9 @@ class DurotaxisTrainer:
             'total_node_reward': [],
             'total_reward': []
         }
+
+        # Per-step node counts for current episode (used to compute min/mean/max/std per episode)
+        self.current_episode_node_counts = []
         
         # Summary attributes for consolidated one-line logging
         self.current_spawn_summary = {'count': 0}
@@ -1413,6 +1418,9 @@ class DurotaxisTrainer:
         # Update substrate if using random type
         if self.substrate_type == 'random':
             self._update_random_substrate()
+
+        # Reset per-step node counts for this episode
+        self.current_episode_node_counts = []
         
         states = []
         actions_taken = []
@@ -1433,6 +1441,13 @@ class DurotaxisTrainer:
             state_dict = self.state_extractor.get_state_features(include_substrate=True)
             state_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                          for k, v in state_dict.items()}
+
+            # Track node count for this step
+            try:
+                self.current_episode_node_counts.append(int(state_dict.get('num_nodes', 0)))
+            except Exception:
+                # Ignore if node count is not available
+                pass
             
             if state_dict['num_nodes'] == 0:
                 if self.enable_graceful_recovery:
@@ -2217,6 +2232,50 @@ class DurotaxisTrainer:
                 # Track losses
                 for loss_name, loss_value in final_losses.items():
                     self.losses[loss_name].append(loss_value)
+
+                # ---- Update per-episode JSON entries with computed episode loss ----
+                try:
+                    episode_loss_value = float(final_losses.get('total_loss', None)) if final_losses else None
+                    num_episodes_in_batch = len(batch_episode_rewards)
+
+                    if episode_loss_value is not None and num_episodes_in_batch > 0:
+                        # Helper to update the last N entries in a JSON history file
+                        def update_last_n_entries(filepath, key_name='episode_loss'):
+                            if not os.path.exists(filepath):
+                                return
+                            try:
+                                with open(filepath, 'r') as f:
+                                    data = json.load(f)
+                            except Exception:
+                                return
+
+                            if isinstance(data, dict):
+                                # Old format: single dict, just set the key
+                                data[key_name] = episode_loss_value
+                                new_data = data
+                            elif isinstance(data, list):
+                                # Update the last num_episodes_in_batch entries
+                                for i in range(1, num_episodes_in_batch + 1):
+                                    if len(data) - i >= 0:
+                                        if isinstance(data[-i], dict):
+                                            data[-i][key_name] = episode_loss_value
+                                new_data = data
+                            else:
+                                return
+
+                            # Write back
+                            try:
+                                with open(filepath, 'w') as f:
+                                    json.dump(new_data, f, indent=2)
+                            except Exception:
+                                pass
+
+                        # Update both spawn & reward stat files
+                        update_last_n_entries(os.path.join(self.run_dir, 'spawn_parameters_stats.json'))
+                        update_last_n_entries(os.path.join(self.run_dir, 'reward_components_stats.json'))
+                except Exception:
+                    # Non-critical: do not fail training if we can't update files
+                    pass
                 
                 # ==========================================
                 # PHASE 4: BATCH PROGRESS REPORTING
@@ -2368,6 +2427,63 @@ class DurotaxisTrainer:
         # Save to run directory
         stats_filepath = os.path.join(self.run_dir, 'spawn_parameters_stats.json')
         
+        # Enrich stats with additional episode diagnostics
+        # Loss summary (total_loss may be tracked in self.losses)
+        try:
+            recent_total_loss = self.losses.get('total_loss', [])[-1] if self.losses.get('total_loss') else None
+        except Exception:
+            recent_total_loss = None
+
+        # Node statistics for this episode (we track current_spawn_summary['count'] and can sample node counts if available)
+        node_stats = {
+            'current_nodes': getattr(self.env.topology.graph, 'num_nodes', lambda: None)() if hasattr(self.env, 'topology') else None,
+            'init_num_nodes': getattr(self, 'init_num_nodes', None)
+        }
+
+        # If we tracked per-step node counts for this episode, compute summary stats
+        try:
+            counts = list(self.current_episode_node_counts) if hasattr(self, 'current_episode_node_counts') else []
+            if counts:
+                node_stats['min'] = int(min(counts))
+                node_stats['max'] = int(max(counts))
+                node_stats['mean'] = float(np.mean(counts))
+                node_stats['std'] = float(np.std(counts))
+                node_stats['samples'] = len(counts)
+            else:
+                node_stats['min'] = None
+                node_stats['max'] = None
+                node_stats['mean'] = None
+                node_stats['std'] = None
+                node_stats['samples'] = 0
+        except Exception:
+            # Non-critical: leave node_stats as minimal
+            pass
+
+        # Entropy & LR & component weights snapshot
+        # Short-term moving averages for monitoring convergence
+        try:
+            ma_window = int(getattr(self, 'moving_avg_window', 20))
+        except Exception:
+            ma_window = 20
+
+        def moving_avg(seq, window):
+            if not seq:
+                return None
+            seq = list(seq)
+            return float(np.mean(seq[-window:])) if len(seq) >= 1 else None
+
+        extra_metadata = {
+            'recent_total_loss': recent_total_loss,
+            'ma_total_loss': moving_avg(self.losses.get('total_loss', []), ma_window),
+            'ma_total_reward': moving_avg(self.episode_rewards.get('total_reward', []), ma_window),
+            'node_stats': node_stats,
+            'entropy_coeff': getattr(self, 'current_entropy_coeff', None),
+            'learning_rate': float(self.optimizer.param_groups[0]['lr']) if hasattr(self, 'optimizer') else None,
+            'component_weights_snapshot': dict(self.component_weights) if hasattr(self, 'component_weights') else None,
+            'spawn_summary': dict(self.current_spawn_summary) if hasattr(self, 'current_spawn_summary') else None,
+            'success': None  # will be set by training loop when known
+        }
+
         # Load existing data if file exists, otherwise start with empty list
         if os.path.exists(stats_filepath):
             try:
@@ -2383,7 +2499,9 @@ class DurotaxisTrainer:
         else:
             episode_history = []
         
-        # Append current episode data
+        # Merge extra metadata and append current episode data
+        if isinstance(stats, dict):
+            stats.update(extra_metadata)
         episode_history.append(stats)
         
         # Save updated history
@@ -2461,6 +2579,27 @@ class DurotaxisTrainer:
         # Save to run directory
         stats_filepath = os.path.join(self.run_dir, 'reward_components_stats.json')
         
+        # Enrich stats with additional episode diagnostics
+        try:
+            recent_total_loss = self.losses.get('total_loss', [])[-1] if self.losses.get('total_loss') else None
+        except Exception:
+            recent_total_loss = None
+
+        node_stats = {
+            'current_nodes': getattr(self.env.topology.graph, 'num_nodes', lambda: None)() if hasattr(self, 'env') and hasattr(self.env, 'topology') else None,
+            'init_num_nodes': getattr(self, 'init_num_nodes', None)
+        }
+
+        extra_metadata = {
+            'recent_total_loss': recent_total_loss,
+            'node_stats': node_stats,
+            'entropy_coeff': getattr(self, 'current_entropy_coeff', None),
+            'learning_rate': float(self.optimizer.param_groups[0]['lr']) if hasattr(self, 'optimizer') else None,
+            'component_weights_snapshot': dict(self.component_weights) if hasattr(self, 'component_weights') else None,
+            'spawn_summary': dict(self.current_spawn_summary) if hasattr(self, 'current_spawn_summary') else None,
+            'success': None
+        }
+
         # Load existing data if file exists, otherwise start with empty list
         if os.path.exists(stats_filepath):
             try:
@@ -2476,7 +2615,9 @@ class DurotaxisTrainer:
         else:
             episode_history = []
         
-        # Append current episode data
+        # Merge extra metadata and append current episode data
+        if isinstance(stats, dict):
+            stats.update(extra_metadata)
         episode_history.append(stats)
         
         # Save updated history
