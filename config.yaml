@@ -7,8 +7,8 @@
 trainer:
   # Training parameters
   total_episodes: 1000
-  max_steps: 300
-  learning_rate: 0.0003  # 3e-4
+  max_steps: 1000
+  learning_rate: 0.0001  # Reduced from 0.0003 for more stable value learning
   save_dir: "./training_results"
   
   # Loss weighting and optimization
@@ -98,12 +98,12 @@ trainer:
   # Enhanced entropy regularization system
   entropy_regularization:
     enable_adaptive_entropy: true     # Enable adaptive entropy scheduling
-    entropy_coeff_start: 0.1          # Starting entropy coefficient (high exploration)
-    entropy_coeff_end: 0.001          # Ending entropy coefficient (low exploration)
-    entropy_decay_episodes: 500       # Episodes over which to decay entropy
-    discrete_entropy_weight: 1.0      # Weight for discrete action entropy
-    continuous_entropy_weight: 0.5    # Weight for continuous action entropy
-    min_entropy_threshold: 0.1        # Minimum entropy to prevent collapse
+    entropy_coeff_start: 0.3          # Increased from 0.1 for more exploration
+    entropy_coeff_end: 0.01           # Increased from 0.001 to maintain exploration
+    entropy_decay_episodes: 800       # Increased from 500 for slower decay
+    discrete_entropy_weight: 1.5      # Increased from 1.0 for more discrete exploration
+    continuous_entropy_weight: 1.0    # Increased from 0.5 for more continuous exploration
+    min_entropy_threshold: 0.05       # Reduced from 0.1 to allow more focused policies
 
 # ============================================================================
 # DurotaxisEnv Configuration
@@ -131,10 +131,10 @@ environment:
   
   # Reward structure - Graph rewards
   graph_rewards:
-    connectivity_penalty: 10.0    # Penalty for losing connectivity (N < 2)
-    growth_penalty: 10.0          # Penalty for excessive growth (N > max_critical_nodes)
-    survival_reward: 0.01         # Basic survival reward for valid topology
-    action_reward: 0.005          # Reward multiplier per action taken
+    connectivity_penalty: 5.0     # Reduced from 10.0 for gentler learning
+    growth_penalty: 5.0           # Reduced from 10.0 for gentler learning
+    survival_reward: 0.1          # Increased from 0.01 for better maintenance incentive
+    action_reward: 0.01           # Increased from 0.005 for better action incentive
   
   # Reward structure - Node rewards
   node_rewards:
@@ -167,11 +167,18 @@ environment:
   # Reward structure - Termination rewards
   termination_rewards:
     success_reward: 100.0         # Large reward for reaching rightmost location
-    out_of_bounds_penalty: -30.0  # Large penalty for nodes going out of bounds
-    no_nodes_penalty: -30.0       # Penalty for losing all nodes
-    leftward_drift_penalty: -30.0 # Penalty for consistent leftward movement
-    timeout_penalty: -10.0        # Small penalty for reaching max time steps
-    critical_nodes_penalty: -25.0 # Penalty for exceeding critical node threshold
+    out_of_bounds_penalty: -15.0  # Reduced from -30.0 for gentler learning
+    no_nodes_penalty: -15.0       # Reduced from -30.0 for gentler learning
+    leftward_drift_penalty: -15.0 # Reduced from -30.0 for gentler learning
+    timeout_penalty: -5.0         # Reduced from -10.0 for gentler learning
+    critical_nodes_penalty: -12.5 # Reduced from -25.0 for gentler learning
+    
+  # NEW: Node survival rewards to encourage maintenance
+  survival_rewards:
+    node_maintenance_bonus: 0.1   # Bonus per step for maintaining nodes
+    episode_length_bonus: 0.05    # Bonus multiplier for longer episodes
+    connectivity_bonus: 0.2       # Bonus for maintaining connectivity
+    multi_node_bonus: 0.15        # Extra bonus for maintaining multiple nodes
 
 # ============================================================================
 # GraphInputEncoder Configuration
@@ -209,10 +216,10 @@ algorithm:
   # PPO (Proximal Policy Optimization) parameters
   ppo_epochs: 1                 # Number of PPO epochs per update
   clip_epsilon: 0.2             # PPO clipping parameter
-  value_loss_coeff: 0.5         # Value function loss coefficient
+  value_loss_coeff: 1.0         # Increased from 0.5 for better value estimation
   
   # Optimization parameters
-  max_grad_norm: 0.5            # Maximum gradient norm for clipping
+  max_grad_norm: 1.0            # Increased from 0.5 for less aggressive clipping
 
 # ============================================================================
 # Device and Performance Configuration
@@ -244,3 +251,34 @@ experimental:
   
   # Substrate variation
   substrate_variation: true     # Enable substrate parameter variation during training
+  
+  # NEW: Curriculum learning system
+  curriculum_learning:
+    enable_curriculum: true           # Enable curriculum learning
+    phase_1_episodes: 300            # Easy phase: focus on node maintenance
+    phase_2_episodes: 600            # Medium phase: balanced learning
+    # Phase 3: remaining episodes with full complexity
+    
+    # Phase-specific configurations
+    phase_1_config:
+      max_critical_nodes: 30          # Reduced complexity
+      init_num_nodes: 3               # Start with more nodes
+      no_nodes_penalty_multiplier: 0.5  # Reduced harsh penalties
+      
+    phase_2_config:
+      max_critical_nodes: 40          # Gradual increase
+      init_num_nodes: 2               # Moderate start
+      no_nodes_penalty_multiplier: 0.75 # Gradual penalty increase
+      
+    phase_3_config:
+      max_critical_nodes: 50          # Full complexity
+      init_num_nodes: 1               # Standard start
+      no_nodes_penalty_multiplier: 1.0  # Full penalties
+  
+  # NEW: Enhanced success criteria
+  success_criteria:
+    enable_multiple_criteria: true    # Use multiple success definitions
+    survival_success_steps: 10        # Maintain nodes for 10+ steps
+    reward_success_threshold: -20     # Achieve reasonable reward
+    growth_success_nodes: 2           # Maintain connectivity (2+ nodes)
+    exploration_success_steps: 15     # Long episode regardless of outcome

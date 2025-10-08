@@ -295,3 +295,16 @@ while True:
     if done:
         break
 ```
+
+
+### Curriculum Learning & Enhanced Success Criteria 🎓
+3-Phase Training System:
+* Phase 1 (0-300 episodes): Easy mode with reduced complexity (30 max nodes, 3 starting nodes, 50% penalty reduction)
+* Phase 2 (300-600 episodes): Medium mode with gradual increase (40 max nodes, 2 starting nodes, 75% penalty reduction)
+* Phase 3 (600+ episodes): Full complexity with standard parameters
+
+Multiple Success Criteria:
+* Survival success: Maintain nodes for 10+ steps
+* Reward success: Achieve reasonable reward (-20+ threshold)
+* Growth success: Maintain connectivity (2+ nodes)
+* Exploration success: Complete long episodes (15+ steps)

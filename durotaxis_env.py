@@ -352,6 +352,13 @@ class DurotaxisEnv(gym.Env):
         self.prev_node_positions = []  # Store previous node positions for movement rewards
         self.last_reward_breakdown = None  # Store detailed reward information
         
+        # Curriculum learning parameters (initialized to defaults)
+        self._curriculum_penalty_multiplier = 1.0
+        self._survival_config = {}
+        self.min_nodes_for_spawn = config.get('min_nodes_for_spawn', 2)
+        self.max_nodes_for_spawn = config.get('max_nodes_for_spawn', self.max_critical_nodes)
+        self.consecutive_left_moves_limit = config.get('consecutive_left_moves_limit', self.fail_threshold)
+        
         # 1. Action Space
         # Since the agent uses graph_transformer_policy_dgl.act_with_policy(),
         # we define a dummy action space for compatibility with RL frameworks.
@@ -1027,7 +1034,7 @@ class DurotaxisEnv(gym.Env):
             
             # Store current positions for next step - VECTORIZED
             self.prev_node_positions = node_positions.tolist()  # Convert back to list format
-        
+          
         # === COMBINE REWARDS ===
         
         # Aggregate node rewards (you can use different strategies)
@@ -1043,8 +1050,20 @@ class DurotaxisEnv(gym.Env):
         else:
             total_node_reward = 0.0
         
+        # Apply curriculum penalty multiplier to negative rewards
+        penalty_multiplier = getattr(self, '_curriculum_penalty_multiplier', 1.0)
+        if penalty_multiplier != 1.0:
+            # Apply penalty multiplier to negative components
+            if graph_reward < 0:
+                graph_reward *= penalty_multiplier
+            if total_node_reward < 0:
+                total_node_reward *= penalty_multiplier
+        
+        # Add survival reward if configured
+        survival_reward = self.get_survival_reward(self.current_step)
+        
         # Final combined reward
-        total_reward = graph_reward + total_node_reward
+        total_reward = graph_reward + total_node_reward + survival_reward
         
         # Create detailed reward information dictionary
         reward_breakdown = {
@@ -1055,6 +1074,7 @@ class DurotaxisEnv(gym.Env):
             'edge_reward': edge_reward,
             'node_rewards': node_rewards,
             'total_node_reward': total_node_reward,
+            'survival_reward': survival_reward,
             'num_nodes': num_nodes
         }
         
@@ -1490,8 +1510,8 @@ class DurotaxisEnv(gym.Env):
                     self.consecutive_left_moves = 0
                 
                 # Check fail termination condition
-                if self.consecutive_left_moves >= self.fail_threshold:
-                    print(f"❌ Episode terminated: Centroid moved left {self.consecutive_left_moves} consecutive times (threshold: {self.fail_threshold})")
+                if self.consecutive_left_moves >= self.consecutive_left_moves_limit:
+                    print(f"❌ Episode terminated: Centroid moved left {self.consecutive_left_moves} consecutive times (threshold: {self.consecutive_left_moves_limit})")
                     print(f"   Current centroid: {current_centroid:.2f}, Previous: {previous_centroid:.2f}")
                     return True, self.leftward_drift_penalty
 
@@ -1604,6 +1624,48 @@ class DurotaxisEnv(gym.Env):
         if self.last_reward_breakdown:
             return self.last_reward_breakdown.get('edge_reward', 0.0)
         return 0.0
+
+    def apply_curriculum_config(self, curriculum_config: dict):
+        """Apply curriculum learning configuration to the environment."""
+        if not curriculum_config:
+            return
+            
+        # Apply penalty multiplier if specified
+        if 'penalty_multiplier' in curriculum_config:
+            self._curriculum_penalty_multiplier = curriculum_config['penalty_multiplier']
+        else:
+            self._curriculum_penalty_multiplier = 1.0
+            
+        # Apply reduced spawn requirements if specified
+        spawn_config = curriculum_config.get('spawn_requirements', {})
+        if 'min_nodes' in spawn_config:
+            self.min_nodes_for_spawn = spawn_config['min_nodes']
+        if 'max_nodes' in spawn_config:
+            self.max_nodes_for_spawn = spawn_config['max_nodes']
+            
+        # Apply relaxed termination if specified
+        termination_config = curriculum_config.get('termination', {})
+        if 'consecutive_left_moves' in termination_config:
+            self.consecutive_left_moves_limit = termination_config['consecutive_left_moves']
+            
+    def get_survival_reward(self, step_count: int) -> float:
+        """Calculate survival reward based on step count and configuration."""
+        survival_config = getattr(self, '_survival_config', {})
+        if not survival_config.get('enabled', False):
+            return 0.0
+            
+        base_reward = survival_config.get('base_reward', 0.1)
+        bonus_threshold = survival_config.get('bonus_threshold', 10)
+        bonus_reward = survival_config.get('bonus_reward', 0.2)
+        
+        # Base survival reward for each step
+        reward = base_reward
+        
+        # Bonus for reaching threshold
+        if step_count >= bonus_threshold:
+            reward += bonus_reward
+            
+        return reward
 
     def reset(self, seed=None, options=None):
         """Reset the environment to initial state."""

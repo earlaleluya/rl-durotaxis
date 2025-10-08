@@ -395,6 +395,24 @@ class DurotaxisTrainer:
         self.log_recoveries = empty_graph_config.get('log_recoveries', True)
         self.empty_graph_recovery_count = 0  # Track recovery statistics
         
+        # NEW: Curriculum learning configuration
+        experimental_config = self.config_loader.config.get('experimental', {})
+        curriculum_config = experimental_config.get('curriculum_learning', {})
+        self.enable_curriculum = curriculum_config.get('enable_curriculum', False)
+        self.phase_1_episodes = curriculum_config.get('phase_1_episodes', 300)
+        self.phase_2_episodes = curriculum_config.get('phase_2_episodes', 600)
+        self.phase_1_config = curriculum_config.get('phase_1_config', {})
+        self.phase_2_config = curriculum_config.get('phase_2_config', {})
+        self.phase_3_config = curriculum_config.get('phase_3_config', {})
+        
+        # NEW: Success criteria configuration
+        success_config = experimental_config.get('success_criteria', {})
+        self.enable_multiple_criteria = success_config.get('enable_multiple_criteria', False)
+        self.survival_success_steps = success_config.get('survival_success_steps', 10)
+        self.reward_success_threshold = success_config.get('reward_success_threshold', -20)
+        self.growth_success_nodes = success_config.get('growth_success_nodes', 2)
+        self.exploration_success_steps = success_config.get('exploration_success_steps', 15)
+        
         # Initialize trajectory buffer for batch training
         self.trajectory_buffer = TrajectoryBuffer()
         
@@ -1306,8 +1324,74 @@ class DurotaxisTrainer:
             'save_directory': self.save_dir
         }
     
-    def collect_episode(self) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], bool, bool]:
-        """Collect one episode of experience"""
+    def _get_curriculum_config(self, episode_num: int) -> Dict[str, any]:
+        """Get curriculum-adjusted configuration based on training progress."""
+        if not self.enable_curriculum:
+            return {}
+            
+        curriculum_config = {}
+        
+        if episode_num < self.phase_1_episodes:
+            # Phase 1: Easy phase - focus on node maintenance
+            curriculum_config.update(self.phase_1_config)
+        elif episode_num < self.phase_2_episodes:
+            # Phase 2: Medium phase - balanced learning
+            curriculum_config.update(self.phase_2_config)
+        else:
+            # Phase 3: Full complexity
+            curriculum_config.update(self.phase_3_config)
+        
+        return curriculum_config
+    
+    def _apply_curriculum_to_env(self, curriculum_config: Dict[str, any]):
+        """Apply curriculum configuration to environment."""
+        if not curriculum_config:
+            return
+            
+        # Apply curriculum settings to environment
+        self.env.apply_curriculum_config(curriculum_config)
+        
+        # Also store survival config for reward calculation
+        survival_config = curriculum_config.get('survival_rewards', {})
+        self.env._survival_config = survival_config
+            
+        # Update critical node thresholds
+        if 'max_critical_nodes' in curriculum_config:
+            self.env.max_critical_nodes = curriculum_config['max_critical_nodes']
+            
+        # Update initial node count
+        if 'init_num_nodes' in curriculum_config:
+            self.init_num_nodes = curriculum_config['init_num_nodes']
+    
+    def _evaluate_episode_success(self, episode_rewards: List[Dict], episode_length: int, 
+                                 final_state: Dict) -> Tuple[bool, Dict[str, bool]]:
+        """Evaluate if an episode was successful using multiple criteria."""
+        if not self.enable_multiple_criteria:
+            # Use traditional success evaluation (if any)
+            return False, {}
+            
+        total_reward = sum(r.get('total_reward', 0) for r in episode_rewards)
+        num_nodes = final_state.get('num_nodes', 0)
+        
+        # Multiple success criteria (easier to achieve)
+        success_criteria = {
+            'survival_success': episode_length >= self.survival_success_steps and num_nodes > 0,
+            'reward_success': total_reward > self.reward_success_threshold,
+            'growth_success': episode_length >= 5 and num_nodes >= self.growth_success_nodes,
+            'exploration_success': episode_length >= self.exploration_success_steps,
+        }
+        
+        # Episode is successful if it meets any criterion
+        is_successful = any(success_criteria.values())
+        
+        return is_successful, success_criteria
+    
+    def collect_episode(self, episode_num: int = 0) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], bool, bool]:
+        """Collect one episode of experience with curriculum learning support"""
+        # Apply curriculum learning configuration
+        curriculum_config = self._get_curriculum_config(episode_num)
+        self._apply_curriculum_to_env(curriculum_config)
+        
         # Reset spawn parameter tracking for this episode
         self.current_episode_spawn_params = {
             'gamma': [],
@@ -2035,7 +2119,7 @@ class DurotaxisTrainer:
                 self.trajectory_buffer.start_episode()
                 
                 # Collect episode using existing method
-                states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode()
+                states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode(episode_count)
                 
                 if not rewards:
                     continue
@@ -2071,6 +2155,10 @@ class DurotaxisTrainer:
                 
                 # Compute and save reward component statistics
                 self.save_reward_statistics(episode_count)
+                
+                # Simple one-line episode progress print
+                latest_loss = self.losses['total_loss'][-1] if self.losses['total_loss'] else 0.0
+                print(f"Episode {episode_count:4d}: R={episode_total_reward:7.3f} | Steps={len(states):3d} | Success={success} | Loss={latest_loss:7.4f}")
                 
                 episode_count += 1
             
