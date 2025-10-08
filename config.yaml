@@ -6,9 +6,9 @@
 # ============================================================================
 trainer:
   # Training parameters
-  total_episodes: 1000
+  total_episodes: 200     # Reduced for quick experiment
   max_steps: 1000
-  learning_rate: 0.0001  # Reduced from 0.0003 for more stable value learning
+  learning_rate: 0.00005  # Further reduced for more stable learning
   save_dir: "./training_results"
   
   # Loss weighting and optimization
@@ -81,12 +81,12 @@ trainer:
     enable_adaptive_scaling: true
     scaling_warmup_episodes: 50
     
-  # Reward normalization system (two-tier approach)
+  # Reward normalization system (two-tier approach) - STRENGTHENED
   reward_normalization:
     enable_per_episode_norm: true     # Tier 1: Per-episode normalization
     enable_cross_episode_scaling: true  # Tier 2: Cross-episode adaptive scaling
-    min_episode_length: 5             # Minimum episode length for normalization
-    normalization_method: 'adaptive'  # 'zscore', 'minmax', or 'adaptive'
+    min_episode_length: 3             # Reduced for more frequent normalization
+    normalization_method: 'zscore'    # Changed to zscore for stronger normalization
     
   # Enhanced learnable advantage weighting system
   advantage_weighting:
@@ -95,15 +95,15 @@ trainer:
     weight_learning_rate: 0.01        # Learning rate for component weights
     weight_regularization: 0.001      # L2 regularization for weight stability
     
-  # Enhanced entropy regularization system
+  # Enhanced entropy regularization system - INCREASED FOR MORE EXPLORATION
   entropy_regularization:
     enable_adaptive_entropy: true     # Enable adaptive entropy scheduling
-    entropy_coeff_start: 0.3          # Increased from 0.1 for more exploration
-    entropy_coeff_end: 0.01           # Increased from 0.001 to maintain exploration
-    entropy_decay_episodes: 800       # Increased from 500 for slower decay
-    discrete_entropy_weight: 1.5      # Increased from 1.0 for more discrete exploration
-    continuous_entropy_weight: 1.0    # Increased from 0.5 for more continuous exploration
-    min_entropy_threshold: 0.05       # Reduced from 0.1 to allow more focused policies
+    entropy_coeff_start: 0.5          # INCREASED from 0.3 for even more exploration
+    entropy_coeff_end: 0.02           # INCREASED from 0.01 to maintain exploration longer
+    entropy_decay_episodes: 150       # Reduced for shorter experiment
+    discrete_entropy_weight: 2.0      # INCREASED from 1.5 for more discrete exploration
+    continuous_entropy_weight: 1.5    # INCREASED from 1.0 for more continuous exploration
+    min_entropy_threshold: 0.1        # INCREASED from 0.05 to prevent early collapse
 
 # ============================================================================
 # DurotaxisEnv Configuration
@@ -252,11 +252,11 @@ experimental:
   # Substrate variation
   substrate_variation: true     # Enable substrate parameter variation during training
   
-  # NEW: Curriculum learning system
+  # NEW: Curriculum learning system - ENABLED FOR BETTER LEARNING
   curriculum_learning:
     enable_curriculum: true           # Enable curriculum learning
-    phase_1_episodes: 300            # Easy phase: focus on node maintenance
-    phase_2_episodes: 600            # Medium phase: balanced learning
+    phase_1_episodes: 60             # Easy phase: focus on node maintenance (reduced for experiment)
+    phase_2_episodes: 120            # Medium phase: balanced learning (reduced for experiment)
     # Phase 3: remaining episodes with full complexity
     
     # Phase-specific configurations
