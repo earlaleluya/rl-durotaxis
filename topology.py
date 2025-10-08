@@ -1,5 +1,33 @@
 '''
-    The agent herewith is a "topology of nodes". This program intends to represent topology as a "graph".
+    The agent herewith is a "topology of nodes". This program intends to represent topology as    def get_all_nodes(self):
+        """
+        Return a list of all node IDs in the graph.
+        
+        Returns
+        -------
+        list of int
+            Lis    def compute_    def get_node_positions(self):
+        """
+        Get all node positions as a dictionary.
+        
+        Returns
+        -------
+        dict
+            Dictionary mapping node index to position array [x, y]
+        """
+        return {i: self.graph.ndata['pos'][i].numpy() for i in range(self.graph.num_nodes())}troid(self):
+        """
+        Compute the centroid (center of mass) of all nodes.
+        
+        Returns
+        -------
+        np.ndarray
+            2D coordinates [x, y] of the topology centroid
+        """
+        centroid = torch.mean(self.graph.ndata['pos'], dim=0)
+        return centroid.numpy()ntaining all node indices in the current graph
+        """
+        return self.graph.nodes().tolist()"graph".
 
     Resources:
     - Deep Graph Library: Deep Graph learning at scale (https://www.youtube.com/watch?v=VmQkLro6UWo)
@@ -17,9 +45,40 @@ import numpy as np
 
 
 class Topology:
+    """
+    Dynamic graph topology representing cellular network with spawn/delete operations.
     
-    def __init__(self, dgl_graph=None, substrate=None):
+    This class manages a dynamic graph where nodes represent cells and edges represent
+    cell-cell connections. It provides methods for topology evolution through node
+    spawning (cell division/migration) and deletion (cell death/removal), along with
+    visualization capabilities.
+    
+    The topology integrates with a substrate to determine spawning behaviors based on
+    substrate intensity gradients (durotaxis simulation).
+    
+    Attributes
+    ----------
+    substrate : Substrate
+        The substrate environment providing intensity signals
+    graph : dgl.DGLGraph
+        The dynamic graph structure
+    fig : matplotlib.figure.Figure
+        Figure handle for visualization
+    ax : matplotlib.axes.Axes
+        Axes handle for visualization
+        
+    Examples
+    --------
+    >>> topology = Topology(substrate=substrate)
+    >>> topology.reset(init_num_nodes=5)
+    >>> topology.show()
+    >>> actions = topology.act()
+    """
+    
+    def __init__(self, dgl_graph=None, substrate=None, flush_delay=0.01):
         self.substrate = substrate
+        self._next_persistent_id = 0  # Global counter for unique persistent IDs
+        self.flush_delay = flush_delay  # Default flush delay for visualization
         self.graph = dgl_graph if dgl_graph is not None else self.reset()
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
@@ -27,7 +86,24 @@ class Topology:
 
 
     def act(self):
-        """This method still simulates the sample actions to be taken, which based on random choice of either spawn or delete."""
+        """
+        Perform random spawn and delete actions on all nodes.
+        
+        This method simulates stochastic cellular behavior by randomly choosing
+        spawn or delete actions for each node in the graph. It processes spawns
+        first to avoid index shifting issues, then processes deletions in reverse
+        order for the same reason.
+        
+        Returns
+        -------
+        dict
+            Dictionary mapping node_id to action taken ('spawn' or 'delete')
+            
+        Notes
+        -----
+        This is a fallback method for random behavior. In the RL environment,
+        actions are typically determined by the policy network.
+        """
         all_nodes = self.get_all_nodes()
         sample_actions = {node_id: random.choice(['spawn', 'delete']) for node_id in all_nodes}
         
@@ -75,14 +151,6 @@ class Topology:
         
         for i in range(num_nodes):
             pos = positions[i].numpy()
-            
-            # Debug: Check if position is out of bounds
-            x, y = int(pos[0]), int(pos[1])
-            if (x < 0 or y < 0 or 
-                (substrate_shape[1] > 0 and x >= substrate_shape[1]) or 
-                (substrate_shape[0] > 0 and y >= substrate_shape[0])):
-                print(f"⚠️ Node {i} position out of bounds: ({x}, {y}) vs substrate shape {substrate_shape}")
-            
             intensity = self.substrate.get_intensity(pos)
             intensities.append(intensity)
         
@@ -102,13 +170,29 @@ class Topology:
         # Compute new node position
         x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
         new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
-        # Store current positions before adding node
+        # Store current data before adding new node
         current_positions = self.graph.ndata['pos']
+        current_new_node_flags = self.graph.ndata['new_node']
+        current_persistent_ids = self.graph.ndata.get('persistent_id', torch.arange(self.graph.num_nodes(), dtype=torch.long))
+        
         # Add new node to graph
         self.graph.add_nodes(1)
+        
         # Update position data by concatenating the new coordinate
         updated_positions = torch.cat([current_positions, new_node_coord.unsqueeze(0)], dim=0)
         self.graph.ndata['pos'] = updated_positions
+        
+        # Update new_node flags: existing nodes remain 0, new node gets 1
+        new_node_flag = torch.tensor([1.0], dtype=torch.float32)  # New node is flagged as 1
+        updated_new_node_flags = torch.cat([current_new_node_flags, new_node_flag], dim=0)
+        self.graph.ndata['new_node'] = updated_new_node_flags
+        
+        # Update persistent IDs: preserve existing IDs, assign new unique ID to new node
+        new_persistent_id = torch.tensor([self._next_persistent_id], dtype=torch.long)
+        updated_persistent_ids = torch.cat([current_persistent_ids, new_persistent_id], dim=0)
+        self.graph.ndata['persistent_id'] = updated_persistent_ids
+        self._next_persistent_id += 1  # Increment for next new node
+        
         # Get the NEW node ID (after adding the node)
         new_node_id = self.graph.num_nodes() - 1  
         # Add edge from curr_node_id to new_node_id
@@ -152,6 +236,7 @@ class Topology:
             - Removes the node from the graph.
             - Adjusts the indices of remaining nodes to account for the removal.
             - Connects each predecessor to each successor to maintain graph connectivity.
+            - Preserves new_node flags for remaining nodes.
 
         Note:
             After node removal, indices of nodes greater than curr_node_id are decremented by 1.
@@ -159,8 +244,34 @@ class Topology:
         # Find predecessors and successors of the current node
         predecessors = self.graph.predecessors(curr_node_id).tolist()
         successors = self.graph.successors(curr_node_id).tolist()
+        
+        # Store new_node flags before removal (if they exist)
+        if 'new_node' in self.graph.ndata:
+            new_node_flags = self.graph.ndata['new_node'].clone()
+        
+        # Store persistent IDs before removal (if they exist)
+        if 'persistent_id' in self.graph.ndata:
+            persistent_ids = self.graph.ndata['persistent_id'].clone()
+        
         # Remove the current node
         self.graph = dgl.remove_nodes(self.graph, curr_node_id)
+        
+        # Restore new_node flags for remaining nodes (excluding deleted node)
+        if 'new_node' in self.graph.ndata:
+            remaining_flags = torch.cat([
+                new_node_flags[:curr_node_id],
+                new_node_flags[curr_node_id+1:]
+            ])
+            self.graph.ndata['new_node'] = remaining_flags
+        
+        # Restore persistent IDs for remaining nodes (excluding deleted node)
+        if 'persistent_id' in self.graph.ndata:
+            remaining_persistent_ids = torch.cat([
+                persistent_ids[:curr_node_id],
+                persistent_ids[curr_node_id+1:]
+            ])
+            self.graph.ndata['persistent_id'] = remaining_persistent_ids
+        
         # After removal, node indices shift down for nodes after curr_node_id
         # Adjust indices for successors and predecessors
         def adjust_idx(idx):
@@ -171,15 +282,6 @@ class Topology:
         for p in adjusted_predecessors:
             for s in adjusted_successors:
                 self.graph.add_edges(p, s)
-
-
-
-
-    def try_show(self, g):
-        G = g.to_networkx()
-        nx.draw(G, pos=g.ndata['pos'], with_labels=True, node_color='lightgreen', node_size=500, font_size=16)
-        plt.show()
-
 
 
     def compute_centroid(self):
@@ -235,40 +337,126 @@ class Topology:
 
 
 
-    def reset(self, init_num_nodes=1, init_bin=0.05):
+    def reset(self, init_num_nodes=5, init_bin=0.1):
         """
-        Reset the topology by generating random node coordinates.
-        The x-coordinate is in [0, init_bin * substrate.width].
-        The y-coordinate is in [0, substrate.height].
+        Reset topology with initial nodes positioned in a specific substrate region.
+        
+        Creates a new graph with the specified number of initial nodes, positioned
+        randomly within the leftmost fraction of the substrate (defined by init_bin).
+        Nodes are connected in a left-to-right chain to establish initial connectivity.
+        
+        Parameters
+        ----------
+        init_num_nodes : int, optional
+            Number of initial nodes to create. Default is 5.
+        init_bin : float, optional
+            Fraction of substrate width from left edge where nodes will be placed.
+            For example, init_bin=0.1 places nodes in leftmost 10% of substrate.
+            Default is 0.1.
+            
+        Returns
+        -------
+        dgl.DGLGraph
+            The reset graph with initial topology
+            
+        Notes
+        -----
+        Each node gets:
+        - 'pos': 2D position coordinates
+        - 'persistent_id': Unique identifier that persists across operations
+        - 'new_node': Flag indicating if node was recently spawned (starts as 0)
+        - 'to_delete': Flag for deletion marking (starts as 0)
         """
-        x_max = init_bin * self.substrate.width
-        y_max = self.substrate.height
-        # Randomize coordinates
-        coordinates = torch.stack([
-            torch.rand(init_num_nodes, dtype=torch.float32) * x_max,  # x-coordinates
-            torch.rand(init_num_nodes, dtype=torch.float32) * y_max   # y-coordinates
-        ], dim=1)
-        # Sort nodes by x-coordinate
-        x_coords = coordinates[:, 0]
-        sorted_indices = torch.argsort(x_coords)
-        # Create edges: node i -> node i+1 in sorted order
-        src = sorted_indices[:-1]
-        dst = sorted_indices[1:]
-        # Create a directed graph with these edges
-        g = dgl.graph((src, dst), num_nodes=init_num_nodes)
-        g.ndata['pos'] = coordinates
-        self.graph = g
-        return g
+        """
+        Reset topology with initial nodes.
+        
+        Args:
+            init_num_nodes (int): Number of initial nodes to create
+            init_bin (float): Fraction of substrate width from leftmost side where nodes will be placed.
+                            For example, init_bin=0.1 places nodes in the leftmost 10% of the substrate.
+        """
+        # Reset the next persistent ID counter
+        self._next_persistent_id = 0
+        
+        # Create new graph - handle zero nodes case
+        if init_num_nodes <= 0:
+            # Create empty graph with minimal node features for consistency
+            self.graph = dgl.graph(([], []))
+            # No nodes to add, but ensure node data tensors exist for compatibility
+            return
+        
+        # Create new graph with initial nodes
+        self.graph = dgl.graph(([], []))
+        
+        # Add initial nodes
+        self.graph.add_nodes(init_num_nodes)
+        
+        # Calculate the x-range for initial placement based on init_bin
+        max_x = self.substrate.width * init_bin
+        
+        # Initialize node positions within the specified bin
+        positions = []
+        persistent_ids = []
+        for i in range(init_num_nodes):
+            # Random position within the leftmost init_bin fraction of substrate
+            x = np.random.uniform(0, max_x)
+            y = np.random.uniform(0, self.substrate.height)
+            positions.append([x, y])
+            persistent_ids.append(self._next_persistent_id)
+            self._next_persistent_id += 1
+        
+        # Set node features
+        self.graph.ndata['pos'] = torch.tensor(positions, dtype=torch.float32)
+        self.graph.ndata['persistent_id'] = torch.tensor(persistent_ids, dtype=torch.long)
+        self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
+        self.graph.ndata['to_delete'] = torch.zeros(init_num_nodes, dtype=torch.float32)  # Initialize to_delete flags
+        
+        # Initial graph may start with no edges
+        # Add some random initial connections
+        if init_num_nodes > 1:
+            self._add_initial_edges(init_num_nodes)
+
+        return self.graph
+
+    def _add_initial_edges(self, init_num_nodes):
+        """Add initial edges to the graph based on x-coordinates, connecting from left to right."""
+        positions = self.graph.ndata['pos'].numpy()
+        
+        # Create node index pairs with their x-coordinates
+        node_x_pairs = [(i, positions[i][0]) for i in range(init_num_nodes)]
+        
+        # Sort nodes by x-coordinate (left to right)
+        node_x_pairs.sort(key=lambda pair: pair[1])
+        
+        # Extract sorted node indices
+        sorted_node_indices = [pair[0] for pair in node_x_pairs]
+        
+        # Create edges connecting each node to the next rightmost node
+        edges_src = []
+        edges_dst = []
+        
+        for i in range(len(sorted_node_indices) - 1):
+            current_node = sorted_node_indices[i]
+            next_node = sorted_node_indices[i + 1]
+            
+            # Add directed edge from current node to next rightmost node
+            edges_src.append(current_node)
+            edges_dst.append(next_node)
+        
+        # Add edges to the graph if any were created
+        if edges_src:
+            self.graph.add_edges(edges_src, edges_dst)
 
 
-
-    def show(self, size=(10, 8), highlight_outmost=False, update_only=True):        
+    def show(self, size=(10, 8), flush_delay=None, highlight_outmost=False, update_only=True, episode_num=None):        
         """
         Visualizes the agent's topology and substrate signal matrix.
         Parameters
         ----------
         size : tuple of int, optional
             Figure size for the plot (width, height). Default is (10, 8).
+        flush_delay : float, optional
+            Time in seconds to pause after updating the plot. If None, uses the class default flush_delay.
         highlight_outmost : bool, optional
             If True, highlights the outmost nodes in the topology, draws the convex hull boundary,
             and marks the centroid. If False, only plots all nodes and the centroid.
@@ -277,7 +465,8 @@ class Topology:
         Description
         -----------
         - Plots the substrate signal matrix as a background image.
-        - Plots all node positions in the graph.
+        - If nodes exist, plots all node positions in the graph.
+        - If no nodes exist, shows substrate-only visualization.
         - If `highlight_outmost` is True:
             - Highlights outmost nodes in red.
             - Draws the convex hull boundary around the nodes.
@@ -288,60 +477,119 @@ class Topology:
         - Displays a legend and sets the plot title to 'Topology'.
         """
         canvas = self.substrate.signal_matrix.copy()
-        positions = self.graph.ndata['pos'].numpy()
+        
+        # Check if we have any nodes
+        num_nodes = self.graph.num_nodes()
+        if num_nodes > 0:
+            positions = self.graph.ndata['pos'].numpy()
+        else:
+            positions = None
+        
+        # Use class flush_delay if none provided
+        if flush_delay is None:
+            flush_delay = self.flush_delay
         
         # Enable interactive mode
         plt.ion()
         
-        # Create figure only if it doesn't exist or update_only is False
-        if self.fig is None or not update_only:
+        # Validate and recover figure state if needed
+        figure_needs_recreation = False
+        if self.fig is not None:
+            try:
+                # Check if figure is still valid
+                if not plt.fignum_exists(self.fig.number):
+                    figure_needs_recreation = True
+                    self.fig = None
+                    self.ax = None
+            except:
+                figure_needs_recreation = True
+                self.fig = None
+                self.ax = None
+        
+        # Create figure only if it doesn't exist, update_only is False, or needs recreation
+        # Always try to reuse existing figure for episode continuity
+        if self.fig is None or not update_only or figure_needs_recreation:
             self.fig, self.ax = plt.subplots(figsize=size)
             plt.show(block=False)  # Non-blocking show
         else:
-            # Clear the existing axes for update
+            # Clear the existing axes for update but keep the window
             self.ax.clear()
         
-        # Compute and plot centroid
-        centroid = self.compute_centroid()
+        # Set up the plot area with proper limits
+        substrate_width, substrate_height = self.substrate.width, self.substrate.height
+        self.ax.set_xlim(0, substrate_width)
+        self.ax.set_ylim(0, substrate_height)
+        self.ax.set_aspect('equal', adjustable='box')
         
-        if highlight_outmost:
-            # Get outmost nodes
-            outmost_indices = self.get_outmost_nodes()
-            # Plot all nodes in blue
-            self.ax.scatter(positions[:, 0], positions[:, 1], c='blue', s=10, alpha=0.6, label='All nodes')
-            # Highlight outmost nodes in red
-            outmost_positions = positions[outmost_indices]
-            self.ax.scatter(outmost_positions[:, 0], outmost_positions[:, 1], 
-                           c='red', s=50, marker='o', edgecolor='black', linewidth=1,
-                           label=f'Outmost nodes ({len(outmost_indices)})')
-            # Draw convex hull boundary
-            if len(outmost_indices) >= 3:
-                try:
-                    hull = ConvexHull(positions)
-                    for simplex in hull.simplices:
-                        self.ax.plot(positions[simplex, 0], positions[simplex, 1], 'r--', alpha=0.7)
-                except:
-                    pass
-            # Add green marker for centroid
-            self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
-                           edgecolor='black', linewidth=1, label='Centroid')
-            self.ax.legend()
-            self.ax.set_title('Topology')
+        # Display substrate as background first
+        self.ax.imshow(canvas, cmap='viridis', origin='lower', 
+                      extent=[0, substrate_width, 0, substrate_height], alpha=0.7)
+        
+        # Handle visualization based on whether nodes exist
+        if positions is None or num_nodes == 0:
+            # Substrate-only visualization (no nodes)
+            episode_str = f"Ep{episode_num:2d}" if episode_num is not None else "Ep??"
+            step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"
+            self.ax.set_title(f'{episode_str} {step_str}: Substrate Only - 0 nodes')
+            # No legend needed for substrate-only view
         else:
-            self.ax.scatter(positions[:, 0], positions[:, 1], c='red', s=10)
-            # Add green marker for centroid
-            self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
-                           edgecolor='black', linewidth=1, label='Centroid')
-            self.ax.legend()
-            self.ax.set_title('Topology')        
+            # Normal visualization with nodes
+            # Compute and plot centroid
+            centroid = self.compute_centroid()
+            
+            if highlight_outmost:
+                # Get outmost nodes
+                outmost_indices = self.get_outmost_nodes()
+                # Plot all nodes in blue
+                self.ax.scatter(positions[:, 0], positions[:, 1], c='blue', s=10, alpha=0.6, label='All nodes')
+                # Highlight outmost nodes in red
+                outmost_positions = positions[outmost_indices]
+                self.ax.scatter(outmost_positions[:, 0], outmost_positions[:, 1], 
+                               c='red', s=10, marker='o', edgecolor='black', linewidth=1,
+                               label=f'Outmost nodes ({len(outmost_indices)})')
+                # Draw convex hull boundary
+                if len(outmost_indices) >= 3:
+                    try:
+                        hull = ConvexHull(positions)
+                        for simplex in hull.simplices:
+                            self.ax.plot(positions[simplex, 0], positions[simplex, 1], 'r--', alpha=0.7)
+                    except:
+                        pass
+                # Add green marker for centroid
+                self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
+                               edgecolor='black', linewidth=1, label='Centroid')
+                self.ax.legend()
+                # Uniform title format
+                episode_str = f"Ep{episode_num:2d}" if episode_num is not None else "Ep??"
+                step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"
+                self.ax.set_title(f'{episode_str} {step_str}: Topology - {len(positions)} nodes')
+            else:
+                self.ax.scatter(positions[:, 0], positions[:, 1], c='red', s=20, alpha=0.8, label='Nodes')
+                # Add green marker for centroid
+                self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
+                               edgecolor='black', linewidth=1, label='Centroid')
+                self.ax.legend()
+                # Uniform title format
+                episode_str = f"Ep{episode_num:2d}" if episode_num is not None else "Ep??"
+                step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"
+                self.ax.set_title(f'{episode_str} {step_str}: Topology - {len(positions)} nodes')        # Remove the duplicate imshow call since we already added it above
         
-        self.ax.imshow(canvas, cmap='viridis', origin='lower')
-        
-        # Refresh the display
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.01)  # Small pause to ensure update
-    
+        # Refresh the display with proper flushing and error handling
+        try:
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+            
+            # Force window update
+            if hasattr(self.fig.canvas, 'manager'):
+                self.fig.canvas.manager.show()
+            
+            plt.pause(flush_delay)
+        except Exception as e:
+            print(f"Warning: Figure refresh failed: {e}")
+            # Try to recreate figure for next call
+            self.fig = None
+            self.ax = None  
+
     
     def close_figure(self):
         """Close the figure window and reset figure references"""
@@ -349,6 +597,21 @@ class Topology:
             plt.close(self.fig)
             self.fig = None
             self.ax = None
+    
+    def force_figure_update(self):
+        """Force the matplotlib figure to update and refresh"""
+        if self.fig is not None:
+            try:
+                self.fig.canvas.draw_idle()
+                self.fig.canvas.flush_events()
+                if hasattr(self.fig.canvas, 'manager'):
+                    self.fig.canvas.manager.show()
+                plt.pause(0.01)  # Small pause to ensure update
+            except Exception as e:
+                print(f"Warning: Force figure update failed: {e}")
+                # Reset figure state for recovery
+                self.fig = None
+                self.ax = None
       
 
 
@@ -359,15 +622,13 @@ if __name__ == '__main__':
     substrate_linear = Substrate((600, 400))
     substrate_linear.create('linear', m=0.05, b=1)
    
-    agent = Topology(substrate=substrate_linear)      
-
-
+    # Create topology with custom flush_delay (0.1 seconds)
+    agent = Topology(substrate=substrate_linear, flush_delay=0.1)      
 
     agent.reset(init_num_nodes=100, init_bin=0.1)
     for i in range(1,20):
         agent.show(highlight_outmost=True)
         agent.act()
-
 
     # Keep the last figure window open
     plt.ioff()  # Turn off interactive mode
