@@ -2304,7 +2304,7 @@ class DurotaxisTrainer:
         return run_dir
     
     def compute_spawn_statistics(self, episode: int) -> dict:
-        """Compute statistics for spawn parameters from current episode"""
+        """Compute statistics for spawn parameters from current episode (compact format)"""
         import statistics
         
         stats = {
@@ -2316,42 +2316,38 @@ class DurotaxisTrainer:
         for param_name, values in self.current_episode_spawn_params.items():
             if values:  # Only compute stats if we have values
                 try:
+                    # Compact format - only essential statistics
                     param_stats = {
                         'count': len(values),
                         'mean': statistics.mean(values),
                         'std': statistics.stdev(values) if len(values) > 1 else 0.0,
                         'min': min(values),
                         'max': max(values),
-                        'median': statistics.median(values),
-                        'mode': statistics.mode(values) if len(values) > 0 else values[0],
-                        'range': max(values) - min(values),
-                        'variance': statistics.variance(values) if len(values) > 1 else 0.0
+                        'sum': sum(values)
                     }
-                    
-                    # Add quartiles if we have enough data
-                    if len(values) >= 4:
-                        sorted_vals = sorted(values)
-                        n = len(sorted_vals)
-                        param_stats['q25'] = sorted_vals[n//4]
-                        param_stats['q75'] = sorted_vals[3*n//4]
-                        param_stats['iqr'] = param_stats['q75'] - param_stats['q25']
                     
                     stats['parameters'][param_name] = param_stats
                     
                 except statistics.StatisticsError:
-                    # Handle edge cases (e.g., mode with no clear mode)
+                    # Handle edge cases
                     stats['parameters'][param_name] = {
                         'count': len(values),
                         'mean': statistics.mean(values),
                         'std': statistics.stdev(values) if len(values) > 1 else 0.0,
                         'min': min(values),
                         'max': max(values),
-                        'median': statistics.median(values),
-                        'range': max(values) - min(values),
-                        'variance': statistics.variance(values) if len(values) > 1 else 0.0
+                        'sum': sum(values)
                     }
             else:
                 # No spawn actions in this episode
+                stats['parameters'][param_name] = {
+                    'count': 0,
+                    'mean': 0.0,
+                    'std': 0.0,
+                    'min': 0.0,
+                    'max': 0.0,
+                    'sum': 0.0
+                }
                 stats['parameters'][param_name] = {
                     'count': 0,
                     'mean': None,
@@ -2366,14 +2362,33 @@ class DurotaxisTrainer:
         return stats
     
     def save_spawn_statistics(self, episode: int) -> None:
-        """Compute and save spawn parameter statistics to JSON file (overwrites each episode)"""
+        """Compute and save spawn parameter statistics to JSON file (appends episode history)"""
         stats = self.compute_spawn_statistics(episode)
         
         # Save to run directory
         stats_filepath = os.path.join(self.run_dir, 'spawn_parameters_stats.json')
         
+        # Load existing data if file exists, otherwise start with empty list
+        if os.path.exists(stats_filepath):
+            try:
+                with open(stats_filepath, 'r') as f:
+                    existing_data = json.load(f)
+                # Handle both old format (dict) and new format (list)
+                if isinstance(existing_data, dict):
+                    episode_history = [existing_data]  # Convert old format
+                else:
+                    episode_history = existing_data
+            except (json.JSONDecodeError, FileNotFoundError):
+                episode_history = []
+        else:
+            episode_history = []
+        
+        # Append current episode data
+        episode_history.append(stats)
+        
+        # Save updated history
         with open(stats_filepath, 'w') as f:
-            json.dump(stats, f, indent=2)
+            json.dump(episode_history, f, indent=2)
         
         # Optional: Print summary if there were spawn actions (silent for one-line logging)
         total_spawns = sum(stats['parameters'][param]['count'] for param in stats['parameters'] 
@@ -2392,87 +2407,81 @@ class DurotaxisTrainer:
             self.current_spawn_summary = {'count': 0}
     
     def compute_reward_statistics(self, episode: int) -> dict:
-        """Compute statistics for reward components from current episode"""
+        """Compute statistics for reward components from current episode (compact format)"""
         import statistics
         
         stats = {
             'episode': episode,
             'timestamp': time.time(),
-            'substrate_params': self.current_substrate_params,
             'reward_components': {}
         }
         
         for component_name, values in self.current_episode_rewards.items():
             if values:  # Only compute stats if we have values
                 try:
+                    # Compact format - only essential statistics
                     component_stats = {
                         'count': len(values),
                         'mean': statistics.mean(values),
                         'std': statistics.stdev(values) if len(values) > 1 else 0.0,
                         'min': min(values),
                         'max': max(values),
-                        'median': statistics.median(values),
-                        'mode': statistics.mode(values) if len(values) > 0 else values[0],
-                        'range': max(values) - min(values),
-                        'variance': statistics.variance(values) if len(values) > 1 else 0.0,
                         'sum': sum(values)  # Total reward for this component
                     }
-                    
-                    # Add quartiles if we have enough data
-                    if len(values) >= 4:
-                        sorted_vals = sorted(values)
-                        n = len(sorted_vals)
-                        component_stats['q25'] = sorted_vals[n//4]
-                        component_stats['q75'] = sorted_vals[3*n//4]
-                        component_stats['iqr'] = component_stats['q75'] - component_stats['q25']
-                    
-                    # Add percentiles for detailed analysis
-                    if len(values) >= 10:
-                        sorted_vals = sorted(values)
-                        n = len(sorted_vals)
-                        component_stats['p10'] = sorted_vals[n//10]
-                        component_stats['p90'] = sorted_vals[9*n//10]
                         
                     stats['reward_components'][component_name] = component_stats
                     
                 except statistics.StatisticsError:
-                    # Handle edge cases (e.g., mode with no clear mode)
+                    # Handle edge cases
                     stats['reward_components'][component_name] = {
                         'count': len(values),
                         'mean': statistics.mean(values),
                         'std': statistics.stdev(values) if len(values) > 1 else 0.0,
                         'min': min(values),
                         'max': max(values),
-                        'median': statistics.median(values),
-                        'range': max(values) - min(values),
-                        'variance': statistics.variance(values) if len(values) > 1 else 0.0,
                         'sum': sum(values)
                     }
             else:
                 # No rewards recorded for this component
                 stats['reward_components'][component_name] = {
                     'count': 0,
-                    'mean': None,
-                    'std': None,
-                    'min': None,
-                    'max': None,
-                    'median': None,
-                    'range': None,
-                    'variance': None,
+                    'mean': 0.0,
+                    'std': 0.0,
+                    'min': 0.0,
+                    'max': 0.0,
                     'sum': 0.0
                 }
         
         return stats
     
     def save_reward_statistics(self, episode: int) -> None:
-        """Compute and save reward component statistics to JSON file (overwrites each episode)"""
+        """Compute and save reward component statistics to JSON file (appends episode history)"""
         stats = self.compute_reward_statistics(episode)
         
         # Save to run directory
         stats_filepath = os.path.join(self.run_dir, 'reward_components_stats.json')
         
+        # Load existing data if file exists, otherwise start with empty list
+        if os.path.exists(stats_filepath):
+            try:
+                with open(stats_filepath, 'r') as f:
+                    existing_data = json.load(f)
+                # Handle both old format (dict) and new format (list)
+                if isinstance(existing_data, dict):
+                    episode_history = [existing_data]  # Convert old format
+                else:
+                    episode_history = existing_data
+            except (json.JSONDecodeError, FileNotFoundError):
+                episode_history = []
+        else:
+            episode_history = []
+        
+        # Append current episode data
+        episode_history.append(stats)
+        
+        # Save updated history
         with open(stats_filepath, 'w') as f:
-            json.dump(stats, f, indent=2)
+            json.dump(episode_history, f, indent=2)
         
         # Store reward summary for consolidated logging (silent for one-line logging)
         key_components = ['total_reward', 'graph_reward', 'spawn_reward', 'edge_reward']
