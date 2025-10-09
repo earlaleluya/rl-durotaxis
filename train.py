@@ -434,12 +434,36 @@ class DurotaxisTrainer:
         # NEW: Curriculum learning configuration
         experimental_config = self.config_loader.config.get('experimental', {})
         curriculum_config = experimental_config.get('curriculum_learning', {})
+        # Also allow curriculum definition under top-level trainer section (common in config.yaml)
+        trainer_curriculum = self.config_loader.config.get('trainer', {}).get('curriculum_learning', {})
+        # Prefer trainer section if present, otherwise fall back to experimental
+        if trainer_curriculum:
+            curriculum_config = trainer_curriculum
+
         self.enable_curriculum = curriculum_config.get('enable_curriculum', False)
+
+        # Keep some legacy fields (not required when using explicit stage definitions)
         self.phase_1_episodes = curriculum_config.get('phase_1_episodes', 300)
         self.phase_2_episodes = curriculum_config.get('phase_2_episodes', 600)
         self.phase_1_config = curriculum_config.get('phase_1_config', {})
         self.phase_2_config = curriculum_config.get('phase_2_config', {})
         self.phase_3_config = curriculum_config.get('phase_3_config', {})
+
+        # Build scaled curriculum stages that map to trainer.total_episodes if enabled
+        self.curriculum_stages = []  # list of dicts: {'name','start','end','config'}
+        if self.enable_curriculum:
+            try:
+                # Ask ConfigLoader for normalized curriculum config if available
+                normalized_curr = self.config_loader.get_curriculum_config()
+                # Merge normalized settings into curriculum_config (normalized takes precedence)
+                if normalized_curr:
+                    # copy normalized stages/overlap into curriculum_config variable used below
+                    curriculum_config = {**curriculum_config, **normalized_curr}
+
+                self._build_scaled_curriculum(curriculum_config)
+            except Exception:
+                # Non-fatal: leave curriculum_stages empty and fallback to legacy behavior
+                self.curriculum_stages = []
         
         # NEW: Success criteria configuration
         success_config = experimental_config.get('success_criteria', {})
@@ -834,7 +858,19 @@ class DurotaxisTrainer:
                     # Convert edge_index from tuple to tensor if needed
                     if isinstance(edge_index, tuple):
                         src, dst = edge_index
-                        edge_index = torch.stack([src, dst], dim=0)
+                        # Ensure src/dst tensors are on the trainer device
+                        if isinstance(src, torch.Tensor):
+                            src = src.to(self.device)
+                        if isinstance(dst, torch.Tensor):
+                            dst = dst.to(self.device)
+                        edge_index = torch.stack([src, dst], dim=0).to(self.device)
+                    else:
+                        # If already a tensor, move to device
+                        edge_index = edge_index.to(self.device)
+
+                    # Ensure edge_attr is on the correct device
+                    if isinstance(edge_attr, torch.Tensor):
+                        edge_attr = edge_attr.to(self.device)
                     
                     if edge_index.shape[1] > 0:  # Has edges
                         # Adjust edge indices for batching
@@ -1371,20 +1407,159 @@ class DurotaxisTrainer:
         """Get curriculum-adjusted configuration based on training progress."""
         if not self.enable_curriculum:
             return {}
-            
+
+        # If we built scaled curriculum stages, use them to select the config
+        if self.curriculum_stages:
+            for stage in self.curriculum_stages:
+                if episode_num >= stage['start'] and episode_num <= stage['end']:
+                    # Return a shallow copy of the stage config to avoid accidental mutation
+                    out = stage.get('config', {}).copy() if isinstance(stage.get('config', {}), dict) else {}
+                    # include stage metadata
+                    out['_stage_name'] = stage.get('name')
+                    out['_stage_start'] = stage.get('start')
+                    out['_stage_end'] = stage.get('end')
+                    out['_stage_focus'] = stage.get('focus')
+                    return out
+
+        # Fallback: legacy phase_1/2/3 durations
         curriculum_config = {}
-        
         if episode_num < self.phase_1_episodes:
-            # Phase 1: Easy phase - focus on node maintenance
             curriculum_config.update(self.phase_1_config)
         elif episode_num < self.phase_2_episodes:
-            # Phase 2: Medium phase - balanced learning
             curriculum_config.update(self.phase_2_config)
         else:
-            # Phase 3: Full complexity
             curriculum_config.update(self.phase_3_config)
-        
+
         return curriculum_config
+
+    def _build_scaled_curriculum(self, curriculum_config: Dict[str, any]) -> None:
+        """Build curriculum stages scaled to the trainer's total_episodes.
+
+        The method looks for explicit stage definitions under the provided
+        curriculum_config (keys like 'stage_1_navigation', 'stage_2_management', ...)
+        or a 'stages' mapping. If explicit episode ranges are present, their
+        relative sizes are used to compute proportions and scale them to
+        self.total_episodes. The resulting stages are stored in
+        self.curriculum_stages as a list of dicts.
+        """
+        total_eps = max(1, int(self.total_episodes))
+
+        # Prefer an explicit 'stages' list if present
+        stages = []
+        if 'stages' in curriculum_config and isinstance(curriculum_config['stages'], list):
+            stages = curriculum_config['stages']
+        else:
+            # Otherwise, gather keys that look like stage definitions
+            for key, value in curriculum_config.items():
+                if isinstance(value, dict) and key.lower().startswith('stage'):
+                    # Keep the stage name and the dict
+                    stages.append({'name': key, 'config': value})
+
+        if not stages:
+            # Nothing to build
+            self.curriculum_stages = []
+            return
+
+        # Extract absolute lengths if episode_start/episode_end provided; otherwise use equal weights
+        abs_lengths = []
+        stage_meta = []
+        for entry in stages:
+            name = entry.get('name') if isinstance(entry, dict) and 'name' in entry else entry
+            cfg = entry.get('config') if isinstance(entry, dict) and 'config' in entry else entry
+
+            start = cfg.get('episode_start') if isinstance(cfg, dict) else None
+            end = cfg.get('episode_end') if isinstance(cfg, dict) else None
+            focus = cfg.get('focus') if isinstance(cfg, dict) else None
+
+            if start is not None and end is not None:
+                length = max(0, int(end) - int(start) + 1)
+            else:
+                length = None
+
+            abs_lengths.append(length)
+            stage_meta.append({'name': name, 'config': cfg if isinstance(cfg, dict) else {}, 'focus': focus, 'start': start, 'end': end})
+
+        # If any absolute lengths are present, use relative proportions of those lengths
+        if any(l is not None for l in abs_lengths):
+            # Replace None with average of present lengths
+            present = [l for l in abs_lengths if l is not None]
+            avg = int(sum(present) / len(present)) if present else 1
+            rel_lengths = [l if l is not None else avg for l in abs_lengths]
+        else:
+            # Equal weights
+            rel_lengths = [1] * len(stage_meta)
+
+        total_rel = sum(rel_lengths)
+        # Compute scaled lengths (floor), then distribute remainder
+        scaled = [int((rl * total_eps) / total_rel) for rl in rel_lengths]
+        remainder = total_eps - sum(scaled)
+        # Distribute remainder to first stages
+        for i in range(remainder):
+            scaled[i % len(scaled)] += 1
+
+        # Build start/end indices
+        stages_out = []
+        cur = 0
+        for meta, length in zip(stage_meta, scaled):
+            start = cur
+            end = max(cur, cur + length - 1)
+            stages_out.append({
+                'name': meta['name'],
+                'start': start,
+                'end': end,
+                'config': meta.get('config', {}),
+                'focus': meta.get('focus')
+            })
+            cur = end + 1
+
+        # Store built curriculum
+        # Apply overlap: prefer curriculum_overlap_pct (fraction), otherwise use stage_overlap (absolute)
+        overlap_pct = curriculum_config.get('curriculum_overlap_pct', None)
+        stage_overlap_abs = curriculum_config.get('stage_overlap', None)
+
+        if overlap_pct is not None:
+            # Interpret as fraction of each stage length to overlap with next stage
+            adjusted = []
+            for s in stages_out:
+                length = s['end'] - s['start'] + 1
+                ov = int(round(length * float(overlap_pct)))
+                adjusted.append((s, ov))
+
+            # Apply overlaps by shrinking next stage start accordingly
+            final = []
+            for i, (s, ov) in enumerate(adjusted):
+                start = s['start']
+                end = s['end']
+                # shrink end by ov for current stage, but ensure non-negative length
+                new_end = max(start, end - ov)
+                final.append({**s, 'start': start, 'end': new_end})
+
+            # Ensure contiguous coverage (next stage start is previous end+1)
+            for i in range(1, len(final)):
+                final[i]['start'] = final[i-1]['end'] + 1
+                if final[i]['start'] > final[i]['end']:
+                    final[i]['end'] = final[i]['start']
+
+            self.curriculum_stages = final
+        elif stage_overlap_abs is not None:
+            # Absolute overlap in episodes; shrink current stage end by overlap, leave next stage start
+            adjusted = []
+            for s in stages_out:
+                start = s['start']
+                end = s['end']
+                new_end = max(start, end - int(stage_overlap_abs))
+                adjusted.append({**s, 'start': start, 'end': new_end})
+
+            # Contiguous coverage
+            for i in range(1, len(adjusted)):
+                adjusted[i]['start'] = adjusted[i-1]['end'] + 1
+                if adjusted[i]['start'] > adjusted[i]['end']:
+                    adjusted[i]['end'] = adjusted[i]['start']
+
+            self.curriculum_stages = adjusted
+        else:
+            # No overlap adjustment
+            self.curriculum_stages = stages_out
     
     def _apply_curriculum_to_env(self, curriculum_config: Dict[str, any]):
         """Apply curriculum configuration to environment."""
@@ -1477,8 +1652,20 @@ class DurotaxisTrainer:
         while not done and episode_length < self.max_steps:
             # Get current state
             state_dict = self.state_extractor.get_state_features(include_substrate=True)
-            state_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                         for k, v in state_dict.items()}
+
+            # Move tensors in state_dict to the trainer device. Handle tuple edge_index specially.
+            moved_state = {}
+            for k, v in state_dict.items():
+                if isinstance(v, torch.Tensor):
+                    moved_state[k] = v.to(self.device)
+                elif isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, torch.Tensor) for x in v):
+                    # edge_index as tuple (src, dst)
+                    src, dst = v
+                    moved_state[k] = (src.to(self.device), dst.to(self.device))
+                else:
+                    moved_state[k] = v
+
+            state_dict = moved_state
 
             # Track node count for this step
             try:
