@@ -255,6 +255,42 @@ def moving_average(data, window=20):
     return np.mean(data[-window:])
 
 
+def exponential_moving_average(data, alpha=0.1):
+    """Calculate exponential moving average for responsive smoothing"""
+    if not data:
+        return 0.0
+    if len(data) == 1:
+        return data[0]
+    
+    ema = data[0]
+    for value in data[1:]:
+        ema = alpha * value + (1 - alpha) * ema
+    return ema
+
+
+def robust_moving_average(data, window=20, outlier_threshold=2.0):
+    """Calculate moving average with outlier removal for robust smoothing"""
+    if len(data) < window:
+        recent_data = data
+    else:
+        recent_data = data[-window:]
+    
+    if not recent_data:
+        return 0.0
+    
+    # Remove outliers using z-score
+    if len(recent_data) > 3:
+        mean = np.mean(recent_data)
+        std = np.std(recent_data)
+        if std > 0:
+            z_scores = np.abs((np.array(recent_data) - mean) / std)
+            filtered_data = [recent_data[i] for i in range(len(recent_data)) if z_scores[i] < outlier_threshold]
+            if filtered_data:
+                return np.mean(filtered_data)
+    
+    return np.mean(recent_data)
+
+
 class DurotaxisTrainer:
     """Streamlined trainer for hybrid actor-critic with component rewards"""
     
@@ -286,7 +322,7 @@ class DurotaxisTrainer:
         self.max_steps = config.get('max_steps', 200)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.save_dir = config.get('save_dir', "./training_results")
-        self.entropy_bonus_coeff = config.get('entropy_bonus_coeff', 0.01)
+        self.entropy_bonus_coeff = config.get('entropy_bonus_coeff', 0.05)  # Increased for stronger regularization
         self.moving_avg_window = config.get('moving_avg_window', 20)
         self.log_every = config.get('log_every', 50)
         self.progress_print_every = config.get('progress_print_every', 5)
@@ -356,12 +392,12 @@ class DurotaxisTrainer:
         # Enhanced entropy regularization configuration
         entropy_config = config.get('entropy_regularization', {})
         self.enable_adaptive_entropy = entropy_config.get('enable_adaptive_entropy', True)
-        self.entropy_coeff_start = entropy_config.get('entropy_coeff_start', 0.1)
-        self.entropy_coeff_end = entropy_config.get('entropy_coeff_end', 0.001)
-        self.entropy_decay_episodes = entropy_config.get('entropy_decay_episodes', 500)
-        self.discrete_entropy_weight = entropy_config.get('discrete_entropy_weight', 1.0)
-        self.continuous_entropy_weight = entropy_config.get('continuous_entropy_weight', 0.5)
-        self.min_entropy_threshold = entropy_config.get('min_entropy_threshold', 0.1)
+        self.entropy_coeff_start = entropy_config.get('entropy_coeff_start', 0.2)  # Start higher
+        self.entropy_coeff_end = entropy_config.get('entropy_coeff_end', 0.01)    # End higher
+        self.entropy_decay_episodes = entropy_config.get('entropy_decay_episodes', 800)  # Decay slower
+        self.discrete_entropy_weight = entropy_config.get('discrete_entropy_weight', 1.2) # Stronger for discrete
+        self.continuous_entropy_weight = entropy_config.get('continuous_entropy_weight', 0.7) # Stronger for continuous
+        self.min_entropy_threshold = entropy_config.get('min_entropy_threshold', 0.15) # Higher threshold
         
         # Batch training configuration
         self.rollout_batch_size = config.get('rollout_batch_size', 10)
@@ -488,6 +524,8 @@ class DurotaxisTrainer:
         self.losses = defaultdict(list)
         # Per-episode loss tracking (one value per episode: average total loss applied to episodes in a batch)
         self.episode_losses = []
+        self.smoothed_rewards = []  # Track moving average of total rewards
+        self.smoothed_losses = []   # Track moving average of losses
         self.best_total_reward = float('-inf')
         
         # Spawn parameter tracking for each episode
@@ -1522,12 +1560,53 @@ class DurotaxisTrainer:
             # Environment step
             next_obs, reward_components, terminated, truncated, info = self.env.step(0)
             done = terminated or truncated
+
+            # Enhanced milestone-based reward shaping
+            if 'milestone_bonus' not in reward_components:
+                reward_components['milestone_bonus'] = 0.0
             
+            # Progressive milestone rewards based on episode length and achievements
+            episode_progress = episode_length / self.max_steps
+            num_nodes = state_dict.get('num_nodes', 0)
+            
+            # Stage 1: Survival and basic navigation rewards
+            if episode_length >= 10 and episode_progress < 0.3:
+                reward_components['milestone_bonus'] += 2.0  # Early survival bonus
+            
+            # Stage 2: Spatial exploration rewards
+            substrate_x = state_dict.get('substrate_x', 0.0)
+            if substrate_x > 0.7 and num_nodes >= 2:
+                reward_components['milestone_bonus'] += 5.0  # Right-side exploration
+            elif substrate_x > 0.9 and num_nodes >= 3:
+                reward_components['milestone_bonus'] += 10.0  # Deep exploration with nodes
+            
+            # Stage 3: Node management skill rewards
+            spawn_count = len(self.current_episode_rewards['spawn_reward'])
+            delete_count = len(self.current_episode_rewards['delete_reward'])
+            
+            if spawn_count >= 1 and delete_count >= 1:
+                reward_components['milestone_bonus'] += 3.0  # Basic node management
+            if spawn_count >= 3 and delete_count >= 2:
+                reward_components['milestone_bonus'] += 7.0  # Advanced node management
+            
+            # Stage 4: Efficiency and optimization rewards
+            if episode_length >= 30 and num_nodes <= 10:  # Efficient long episodes
+                reward_components['milestone_bonus'] += 4.0
+            
+            # Stage 5: Consistency rewards (avoid large negative spikes)
+            recent_rewards = self.current_episode_rewards['total_reward'][-5:] if len(self.current_episode_rewards['total_reward']) >= 5 else []
+            if recent_rewards and all(r >= -5.0 for r in recent_rewards):
+                reward_components['milestone_bonus'] += 1.0  # Consistency bonus
+            
+            # Add milestone bonus to total_reward
+            if reward_components['milestone_bonus'] > 0:
+                reward_components['total_reward'] += reward_components['milestone_bonus']
+
             # Track reward components for statistics
             for component, value in reward_components.items():
                 if component in self.current_episode_rewards:
                     self.current_episode_rewards[component].append(value)
-            
+
             # Store reward components
             rewards.append(reward_components)
             episode_length += 1
@@ -2162,6 +2241,23 @@ class DurotaxisTrainer:
                     component_reward = sum(r.get(component, 0.0) for r in rewards)
                     self.episode_rewards[component].append(component_reward)
                 
+                # Enhanced reward smoothing with multiple methods
+                window = self.moving_avg_window if hasattr(self, 'moving_avg_window') else 20
+                simple_ma = moving_average(self.episode_rewards['total_reward'], window)
+                robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
+                ema = exponential_moving_average(self.episode_rewards['total_reward'])
+                
+                # Use robust moving average as primary smoothed metric
+                self.smoothed_rewards.append(robust_ma)
+                
+                # Track smoothed rewards for milestone_bonus component too
+                if 'milestone_bonus' in self.episode_rewards:
+                    milestone_smoothed = robust_moving_average(self.episode_rewards['milestone_bonus'], window//2)
+                else:
+                    milestone_rewards = [sum(r.get('milestone_bonus', 0.0) for r in rewards)]
+                    self.episode_rewards['milestone_bonus'] = self.episode_rewards.get('milestone_bonus', []) + milestone_rewards
+                    milestone_smoothed = milestone_rewards[0]
+                
                 # Update learning rate schedule
                 self.scheduler.step()
                 
@@ -2171,9 +2267,11 @@ class DurotaxisTrainer:
                 # Compute and save reward component statistics
                 self.save_reward_statistics(episode_count)
                 
-                # Simple one-line episode progress print
+                # Enhanced episode progress print with smoothed metrics
                 latest_loss = self.losses['total_loss'][-1] if self.losses['total_loss'] else 0.0
-                print(f"Episode {episode_count:4d}: R={episode_total_reward:7.3f} | Steps={len(states):3d} | Success={success} | Loss={latest_loss:7.4f}")
+                smoothed_reward = self.smoothed_rewards[-1] if self.smoothed_rewards else episode_total_reward
+                milestone_bonus = sum(r.get('milestone_bonus', 0.0) for r in rewards)
+                print(f"Episode {episode_count:4d}: R={episode_total_reward:7.3f} (Smooth={smoothed_reward:6.2f}) | MB={milestone_bonus:4.1f} | Steps={len(states):3d} | Success={success} | Loss={latest_loss:7.4f}")
                 
                 episode_count += 1
             
@@ -2232,8 +2330,14 @@ class DurotaxisTrainer:
                 # Track losses
                 for loss_name, loss_value in final_losses.items():
                     self.losses[loss_name].append(loss_value)
+                # Update smoothed losses
+                window = self.moving_avg_window if hasattr(self, 'moving_avg_window') else 20
+                if 'total_loss' in final_losses:
+                    smoothed_loss = moving_average(self.losses['total_loss'], window)
+                    self.smoothed_losses.append(smoothed_loss)
 
                 # ---- Update per-episode JSON entries with computed episode loss ----
+                self.save_loss_statistics(episode_count)
                 try:
                     episode_loss_value = float(final_losses.get('total_policy_loss', None)) if final_losses else None
                     num_episodes_in_batch = len(batch_episode_rewards)
@@ -2571,6 +2675,27 @@ class DurotaxisTrainer:
                 }
         
         return stats
+    
+    def save_loss_statistics(self, episode: int) -> None:
+        """Save per-episode and smoothed losses to JSON file for analysis"""
+        metrics_path = os.path.join(self.run_dir, 'loss_metrics.json')
+        metrics = {
+            'episode': episode,
+            'loss': self.losses['total_loss'][-1] if self.losses['total_loss'] else None,
+            'smoothed_loss': self.smoothed_losses[-1] if self.smoothed_losses else None
+        }
+        # Append to file
+        if os.path.exists(metrics_path):
+            try:
+                with open(metrics_path, 'r') as f:
+                    data = json.load(f)
+            except Exception:
+                data = []
+        else:
+            data = []
+        data.append(metrics)
+        with open(metrics_path, 'w') as f:
+            json.dump(data, f, indent=2)
     
     def save_reward_statistics(self, episode: int) -> None:
         """Compute and save reward component statistics to JSON file (appends episode history)"""
