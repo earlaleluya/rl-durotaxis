@@ -2235,7 +2235,7 @@ class DurotaxisTrainer:
 
                 # ---- Update per-episode JSON entries with computed episode loss ----
                 try:
-                    episode_loss_value = float(final_losses.get('total_loss', None)) if final_losses else None
+                    episode_loss_value = float(final_losses.get('total_policy_loss', None)) if final_losses else None
                     num_episodes_in_batch = len(batch_episode_rewards)
 
                     if episode_loss_value is not None and num_episodes_in_batch > 0:
