@@ -541,11 +541,11 @@ class Topology:
                 # Get outmost nodes
                 outmost_indices = self.get_outmost_nodes()
                 # Plot all nodes in blue
-                self.ax.scatter(positions[:, 0], positions[:, 1], c='blue', s=10, alpha=0.6, label='All nodes')
+                self.ax.scatter(positions[:, 0], positions[:, 1], c='blue', s=2, alpha=0.6, label='All nodes')
                 # Highlight outmost nodes in red
                 outmost_positions = positions[outmost_indices]
                 self.ax.scatter(outmost_positions[:, 0], outmost_positions[:, 1], 
-                               c='red', s=10, marker='o', edgecolor='black', linewidth=1,
+                               c='red', s=2, marker='o', edgecolor='black', linewidth=1,
                                label=f'Outmost nodes ({len(outmost_indices)})')
                 # Draw convex hull boundary
                 if len(outmost_indices) >= 3:
@@ -564,7 +564,7 @@ class Topology:
                 step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"
                 self.ax.set_title(f'{episode_str} {step_str}: Topology - {len(positions)} nodes')
             else:
-                self.ax.scatter(positions[:, 0], positions[:, 1], c='red', s=20, alpha=0.8, label='Nodes')
+                self.ax.scatter(positions[:, 0], positions[:, 1], c='blue', s=2, alpha=0.8, label='Nodes')
                 # Add green marker for centroid
                 self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
                                edgecolor='black', linewidth=1, label='Centroid')

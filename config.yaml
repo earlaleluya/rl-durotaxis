@@ -6,7 +6,7 @@
 # ============================================================================
 trainer:
   # Training parameters
-  total_episodes: 150       # Reduced for curriculum testing
+  total_episodes: 3000
   max_steps: 1000
   learning_rate: 0.00008   # Slightly increased for faster learning with better exploration
   save_dir: "./training_results"
