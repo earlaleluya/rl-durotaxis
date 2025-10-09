@@ -7,8 +7,7 @@ Due to compatability issues, it is best to prepare the environment in Ubuntu OS.
 ```bash
 conda create -n durotaxis python=3.12.11
 conda activate durotaxis
-pip install dgl==2.4.0 -f https://data.dgl.ai/wheels/torch-2.4/repo.html
-
+pip install torch==2.4.0 stable-baselines3 dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
 ```
 
 Clone the files to your preferred directory. Then in terminal,
