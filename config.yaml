@@ -6,7 +6,12 @@
 # ============================================================================
 trainer:
   # Training parameters
-  total_episodes: 3000
+  # Total number of episodes for the whole training run.
+  # Note: When `curriculum_learning.enable_curriculum` is true the trainer will
+  # automatically scale curriculum stage durations to this value. If you change
+  # this number (for example to 10000), the curriculum stages will be resized
+  # proportionally so the curriculum covers the full training run.
+  total_episodes: 10000
   max_steps: 1000
   learning_rate: 0.00008   # Slightly increased for faster learning with better exploration
   save_dir: "./training_results"
@@ -99,7 +104,15 @@ trainer:
     advancement_criteria: "success_rate"  # Advance based on success rate
     min_success_rate: 0.6            # 60% success rate to advance
     evaluation_window: 50            # Evaluate over last 50 episodes
-    stage_overlap: 20                # 20 episode overlap between stages
+    # Overlap control between stages:
+    # - You may provide `stage_overlap` (absolute number of episodes to overlap)
+    # - OR provide `curriculum_overlap_pct` (fraction 0..1) which will be applied
+    #   proportionally to each stage after scaling. When both are present, the
+    #   fractional option `curriculum_overlap_pct` takes precedence.
+    # Example: curriculum_overlap_pct: 0.02 -> 2% overlap of each stage length
+    stage_overlap: 20                # 20 episode overlap between stages (legacy)
+    # Optional proportional overlap (fraction of stage length). Use instead of stage_overlap.
+    # curriculum_overlap_pct: 0.02
     
   # Reward shaping system
   reward_shaping:

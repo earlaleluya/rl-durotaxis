@@ -99,6 +99,51 @@ class ConfigLoader:
     def get_system_config(self) -> Dict[str, Any]:
         """Get system configuration"""
         return self.get_section('system')
+
+    def get_curriculum_config(self) -> Dict[str, Any]:
+        """
+        Return a normalized curriculum configuration.
+
+        This consolidates curriculum definitions found either under
+        `trainer.curriculum_learning` or `experimental.curriculum_learning` into a
+        canonical dictionary with:
+          - 'stages': ordered list of stage dicts {name, config}
+          - 'stage_overlap': numeric (episodes) if present
+          - 'curriculum_overlap_pct': optional fractional overlap (0-1)
+        """
+        # Look under trainer first, then experimental
+        trainer_section = self.config.get('trainer', {})
+        curriculum = trainer_section.get('curriculum_learning') or self.config.get('experimental', {}).get('curriculum_learning', {})
+
+        normalized = {}
+
+        # If user provided a 'stages' list, use it directly
+        if isinstance(curriculum.get('stages'), list):
+            normalized['stages'] = curriculum['stages']
+        else:
+            # Collect explicit stage_* keys in sorted order
+            stages = []
+            for key in sorted(curriculum.keys()):
+                if key.lower().startswith('stage') and isinstance(curriculum[key], dict):
+                    stages.append({'name': key, 'config': curriculum[key]})
+
+            normalized['stages'] = stages
+
+        # Overlap settings
+        if 'curriculum_overlap_pct' in curriculum:
+            normalized['curriculum_overlap_pct'] = float(curriculum['curriculum_overlap_pct'])
+        if 'stage_overlap' in curriculum:
+            # keep legacy absolute overlap as well
+            normalized['stage_overlap'] = int(curriculum['stage_overlap'])
+
+        # Pass through other top-level curriculum flags
+        normalized['enable_curriculum'] = bool(curriculum.get('enable_curriculum', False))
+        normalized['auto_advance'] = bool(curriculum.get('auto_advance', True))
+        normalized['advancement_criteria'] = curriculum.get('advancement_criteria')
+        normalized['min_success_rate'] = curriculum.get('min_success_rate')
+        normalized['evaluation_window'] = curriculum.get('evaluation_window')
+
+        return normalized
     
     def override_params(self, section_name: str, **kwargs) -> Dict[str, Any]:
         """
