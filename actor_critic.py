@@ -139,6 +139,9 @@ class HybridActorCritic(nn.Module):
         for component in self.value_components:
             self.value_heads[component] = nn.Linear(self.hidden_dim // 2, 1)
         
+        # Initialize continuous action heads for better starting values
+        self._init_continuous_heads()
+        
         # Parameter bounds for continuous actions
         self.register_buffer('action_bounds', torch.tensor([
             [0.1, 10.0],    # gamma bounds
@@ -146,6 +149,23 @@ class HybridActorCritic(nn.Module):
             [0.0, 2.0],     # noise bounds
             [-math.pi, math.pi]  # theta bounds
         ]))
+    
+    def _init_continuous_heads(self):
+        """Initialize continuous action heads to produce reasonable starting values."""
+        # Initialize mu head to output values that give mid-range results after sigmoid/tanh
+        # For sigmoid: output = 0 gives sigmoid(0) = 0.5, which maps to mid-range
+        # For tanh: output = 0 gives tanh(0) = 0, which maps to theta = 0
+        
+        # Initialize mu head final layer with positive bias to push away from boundary values
+        nn.init.normal_(self.continuous_mu_head[-1].weight, mean=0.0, std=0.3)
+        # Set bias to positive values to get mid-range after sigmoid
+        # sigmoid(1.0) ≈ 0.73, which gives good mid-range values
+        init_bias = torch.tensor([1.0, 1.0, 1.0, 0.0])  # gamma, alpha, noise, theta
+        self.continuous_mu_head[-1].bias.data.copy_(init_bias)
+        
+        # Initialize logstd head to produce reasonable initial variance
+        nn.init.normal_(self.continuous_logstd_head[-1].weight, mean=0.0, std=0.1)
+        nn.init.constant_(self.continuous_logstd_head[-1].bias, -0.3)  # log(0.74) ≈ -0.3
     
     def forward(self, state_dict: Dict[str, torch.Tensor], 
                 deterministic: bool = False,
@@ -287,13 +307,13 @@ class HybridActorCritic(nn.Module):
             discrete_actions = discrete_dist.sample()  # [num_nodes]
             discrete_log_probs = discrete_dist.log_prob(discrete_actions)  # [num_nodes]
             
-            # Sample continuous actions
-            continuous_dist = torch.distributions.Normal(continuous_mu_bounded, continuous_std)
-            continuous_actions = continuous_dist.sample()  # [num_nodes, continuous_dim]
-            continuous_log_probs = continuous_dist.log_prob(continuous_actions).sum(dim=-1)  # [num_nodes]
+            # Sample continuous actions from unbounded distribution, then apply bounds once
+            continuous_dist = torch.distributions.Normal(continuous_mu, continuous_std)
+            continuous_actions_raw = continuous_dist.sample()  # [num_nodes, continuous_dim]
+            continuous_log_probs = continuous_dist.log_prob(continuous_actions_raw).sum(dim=-1)  # [num_nodes]
             
             # Apply bounds to sampled continuous actions
-            continuous_actions = self._apply_bounds(continuous_actions)
+            continuous_actions = self._apply_bounds(continuous_actions_raw)
             
             output.update({
                 'discrete_actions': discrete_actions,
