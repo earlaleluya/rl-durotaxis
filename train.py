@@ -552,6 +552,33 @@ class DurotaxisTrainer:
         self.smoothed_losses = []   # Track moving average of losses
         self.best_total_reward = float('-inf')
         
+        # Enhanced detailed node logging per step
+        self.detailed_node_logs = []  # Store detailed node data per step per episode
+        
+        # Load detailed logging configuration from config file
+        detailed_logging_config = config.get('detailed_logging', {})
+        self.enable_detailed_logging = detailed_logging_config.get('enable_detailed_logging', True)
+        self.save_detailed_logs_to_json = detailed_logging_config.get('save_detailed_logs_to_json', True)
+        self.single_file_mode = detailed_logging_config.get('single_file_mode', True)
+        self.log_node_positions = detailed_logging_config.get('log_node_positions', True)
+        self.log_spawn_parameters = detailed_logging_config.get('log_spawn_parameters', True)
+        self.log_persistent_ids = detailed_logging_config.get('log_persistent_ids', True)
+        self.log_connectivity = detailed_logging_config.get('log_connectivity', True)
+        self.log_substrate_values = detailed_logging_config.get('log_substrate_values', True)
+        self.compress_logs = detailed_logging_config.get('compress_logs', False)
+        self.max_log_file_size_mb = detailed_logging_config.get('max_log_file_size_mb', 50)
+        
+        # Initialize single file logging variables
+        self.detailed_logs_file_path = None
+        self.all_episodes_data = {
+            'training_metadata': {
+                'created_timestamp': time.time(),
+                'total_episodes_logged': 0,
+                'configuration': {}
+            },
+            'episodes': []
+        }
+        
         # Spawn parameter tracking for each episode
         self.current_episode_spawn_params = {
             'gamma': [],
@@ -604,6 +631,17 @@ class DurotaxisTrainer:
         else:
             print(f"   Checkpoint frequency: disabled (only best + final models saved)")
         print(f"   Progress print frequency: every {self.progress_print_every} episodes")
+        print(f"   Detailed node logging: {'enabled' if self.enable_detailed_logging else 'disabled'}")
+        if self.enable_detailed_logging:
+            print(f"   └─ Save to JSON: {'enabled' if self.save_detailed_logs_to_json else 'disabled'}")
+            print(f"   └─ File mode: {'single file' if self.single_file_mode else 'separate files'}")
+            print(f"   └─ Log positions: {'yes' if self.log_node_positions else 'no'}")
+            print(f"   └─ Log spawn params: {'yes' if self.log_spawn_parameters else 'no'}")
+            print(f"   └─ Log persistent IDs: {'yes' if self.log_persistent_ids else 'no'}")
+            print(f"   └─ Log connectivity: {'yes' if self.log_connectivity else 'no'}")
+            print(f"   └─ Log substrate values: {'yes' if self.log_substrate_values else 'no'}")
+            print(f"   └─ Compression: {'enabled' if self.compress_logs else 'disabled'}")
+            print(f"   └─ Max file size: {self.max_log_file_size_mb} MB")
     
     def _initialize_learnable_weights(self):
         """Initialize the enhanced learnable component weighting system"""
@@ -1403,6 +1441,364 @@ class DurotaxisTrainer:
             'save_directory': self.save_dir
         }
     
+    def _extract_detailed_node_data(self, episode_num: int, step_num: int, executed_actions: Dict = None) -> Dict:
+        """
+        Extract comprehensive node data for current step
+        
+        Returns detailed information about each node including:
+        - Node positions (x, y)
+        - Spawn parameters (gamma, alpha, noise, theta) if available
+        - Persistent node IDs
+        - Graph connectivity information
+        - Substrate information at node positions
+        """
+        if not self.enable_detailed_logging:
+            return {}
+        
+        detailed_data = {
+            'episode': episode_num,
+            'step': step_num,
+            'timestamp': time.time(),
+            'nodes': [],
+            'graph_info': {},
+            'substrate_info': {},
+            'action_info': {
+                'spawn_actions': 0,
+                'delete_actions': 0,
+                'total_actions': 0
+            }
+        }
+        
+        # Count actions if provided
+        if executed_actions:
+            spawn_count = sum(1 for action in executed_actions.values() if action == 'spawn')
+            delete_count = sum(1 for action in executed_actions.values() if action == 'delete')
+            detailed_data['action_info'] = {
+                'spawn_actions': spawn_count,
+                'delete_actions': delete_count,
+                'total_actions': spawn_count + delete_count
+            }
+        
+        try:
+            # Get current topology and state
+            topology = self.env.topology if hasattr(self.env, 'topology') else None
+            if not topology or not hasattr(topology, 'graph'):
+                return detailed_data
+            
+            graph = topology.graph
+            num_nodes = graph.num_nodes()
+            
+            # Extract graph-level information
+            detailed_data['graph_info'] = {
+                'num_nodes': int(num_nodes),
+                'num_edges': int(graph.num_edges()),
+                'node_count_history': list(self.current_episode_node_counts) if hasattr(self, 'current_episode_node_counts') else []
+            }
+            
+            # Extract substrate information
+            if hasattr(self.env, 'substrate') and hasattr(self.env.substrate, 'substrate_kind'):
+                substrate_params = getattr(self, 'current_substrate_params', {})
+                detailed_data['substrate_info'] = {
+                    'type': substrate_params.get('kind', 'unknown'),
+                    'parameters': {
+                        'm': substrate_params.get('m', 0.0),
+                        'b': substrate_params.get('b', 0.0)
+                    }
+                }
+            
+            # Extract detailed node information
+            if num_nodes > 0:
+                # Get node data from the graph
+                node_data = graph.ndata
+                
+                for node_id in range(num_nodes):
+                    node_info = {
+                        'node_id': int(node_id),
+                    }
+                    
+                    # Add persistent ID if enabled
+                    if self.log_persistent_ids:
+                        node_info['persistent_id'] = int(node_id)  # Default to node_id, will try to get actual persistent ID
+                        # Try to get persistent ID if available
+                        if 'id' in node_data:
+                            node_info['persistent_id'] = int(node_data['id'][node_id])
+                        elif 'node_id' in node_data:
+                            node_info['persistent_id'] = int(node_data['node_id'][node_id])
+                        elif hasattr(topology, 'node_ids') and node_id < len(topology.node_ids):
+                            node_info['persistent_id'] = int(topology.node_ids[node_id])
+                    
+                    # Add position information if enabled
+                    if self.log_node_positions:
+                        node_info['position'] = {'x': 0.0, 'y': 0.0}  # Initialize default position
+                        if 'pos' in node_data:
+                            pos = node_data['pos'][node_id]
+                            if len(pos) >= 2:
+                                node_info['position']['x'] = float(pos[0])
+                                node_info['position']['y'] = float(pos[1])
+                        elif 'x' in node_data and 'y' in node_data:
+                            node_info['position']['x'] = float(node_data['x'][node_id])
+                            node_info['position']['y'] = float(node_data['y'][node_id])
+                    
+                    # Add spawn parameters if enabled
+                    if self.log_spawn_parameters:
+                        node_info['spawn_parameters'] = {
+                            'gamma': None,
+                            'alpha': None, 
+                            'noise': None,
+                            'theta': None
+                        }
+                        spawn_params = ['gamma', 'alpha', 'noise', 'theta']
+                        for param in spawn_params:
+                            if param in node_data:
+                                value = float(node_data[param][node_id])
+                                # Convert NaN to None for JSON serialization
+                                node_info['spawn_parameters'][param] = None if np.isnan(value) else value
+                    
+                    # Add connectivity information if enabled
+                    if self.log_connectivity:
+                        node_info['connectivity'] = {
+                            'degree': 0,
+                            'neighbors': []
+                        }
+                        if 'degree' in node_data:
+                            node_info['connectivity']['degree'] = int(node_data['degree'][node_id])
+                        
+                        # Get neighbors (edges from this node)
+                        try:
+                            # Get edges and find neighbors
+                            edges = graph.edges()
+                            if len(edges) >= 2:
+                                src_nodes, dst_nodes = edges
+                                # Find edges where this node is the source
+                                neighbors = []
+                                for i in range(len(src_nodes)):
+                                    if int(src_nodes[i]) == node_id:
+                                        neighbors.append(int(dst_nodes[i]))
+                                    elif int(dst_nodes[i]) == node_id:  # Also check reverse direction for undirected graphs
+                                        neighbors.append(int(src_nodes[i]))
+                                node_info['connectivity']['neighbors'] = list(set(neighbors))  # Remove duplicates
+                        except Exception:
+                            # Failed to extract neighbor information - leave empty
+                            node_info['connectivity']['neighbors'] = []
+                    
+                    # Add substrate value if enabled
+                    if self.log_substrate_values:
+                        node_info['substrate_value'] = 0.0
+                        try:
+                            if hasattr(self.env, 'substrate') and self.log_node_positions and 'position' in node_info:
+                                x_pos = node_info['position']['x']
+                                y_pos = node_info['position']['y']
+                                substrate_val = self.env.substrate.get_value(x_pos, y_pos)
+                                node_info['substrate_value'] = float(substrate_val)
+                        except Exception:
+                            node_info['substrate_value'] = 0.0
+                    
+                    detailed_data['nodes'].append(node_info)
+        
+        except Exception as e:
+            # Log error but don't fail training
+            print(f"⚠️  Warning: Failed to extract detailed node data at episode {episode_num}, step {step_num}: {e}")
+            
+        return detailed_data
+    
+    def save_detailed_node_logs(self, episode_num: int) -> str:
+        """
+        Save detailed node logs for the current episode
+        
+        Supports two modes:
+        1. Single file mode: Append episode data to one comprehensive JSON file
+        2. Separate file mode: Create individual JSON file per episode (legacy)
+        
+        Returns the filepath of the saved JSON file
+        """
+        if not self.save_detailed_logs_to_json or not self.detailed_node_logs:
+            return ""
+        
+        try:
+            # Prepare episode data
+            episode_data = {
+                'episode': episode_num,
+                'total_steps': len(self.detailed_node_logs),
+                'timestamp': time.time(),
+                'configuration': {
+                    'log_node_positions': self.log_node_positions,
+                    'log_spawn_parameters': self.log_spawn_parameters,
+                    'log_persistent_ids': self.log_persistent_ids,
+                    'log_connectivity': self.log_connectivity,
+                    'log_substrate_values': self.log_substrate_values,
+                    'compressed': self.compress_logs
+                },
+                'summary_statistics': {
+                    'total_nodes_tracked': sum(len(step_data.get('nodes', [])) for step_data in self.detailed_node_logs),
+                    'max_nodes_per_step': max((len(step_data.get('nodes', [])) for step_data in self.detailed_node_logs), default=0),
+                    'min_nodes_per_step': min((len(step_data.get('nodes', [])) for step_data in self.detailed_node_logs), default=0),
+                    'avg_nodes_per_step': sum(len(step_data.get('nodes', [])) for step_data in self.detailed_node_logs) / len(self.detailed_node_logs) if self.detailed_node_logs else 0
+                },
+                'steps': list(self.detailed_node_logs)  # Copy the step data
+            }
+            
+            if self.single_file_mode:
+                return self._save_to_single_file(episode_data, episode_num)
+            else:
+                return self._save_to_separate_file(episode_data, episode_num)
+                
+        except Exception as e:
+            print(f"❌ Failed to save detailed node logs for episode {episode_num}: {e}")
+            return ""
+    
+    def _save_to_single_file(self, episode_data: Dict, episode_num: int) -> str:
+        """Save episode data to a single comprehensive JSON file"""
+        try:
+            # Initialize single file path if not set
+            if self.detailed_logs_file_path is None:
+                filename = "detailed_nodes_all_episodes.json"
+                if self.compress_logs:
+                    filename += ".gz"
+                self.detailed_logs_file_path = os.path.join(self.run_dir, filename)
+                
+                # Initialize the file with metadata if it doesn't exist
+                self.all_episodes_data['training_metadata']['configuration'] = episode_data['configuration']
+                self.all_episodes_data['training_metadata']['run_directory'] = self.run_dir
+                self.all_episodes_data['training_metadata']['single_file_mode'] = True
+            
+            # Add episode data to the collection
+            self.all_episodes_data['episodes'].append(episode_data)
+            self.all_episodes_data['training_metadata']['total_episodes_logged'] += 1
+            self.all_episodes_data['training_metadata']['last_updated'] = time.time()
+            
+            # Save the entire data structure
+            if self.compress_logs:
+                import gzip
+                with gzip.open(self.detailed_logs_file_path, 'wt') as f:
+                    json.dump(self.all_episodes_data, f, indent=2, default=str)
+            else:
+                with open(self.detailed_logs_file_path, 'w') as f:
+                    json.dump(self.all_episodes_data, f, indent=2, default=str)
+            
+            filename = os.path.basename(self.detailed_logs_file_path)
+            total_episodes = self.all_episodes_data['training_metadata']['total_episodes_logged']
+            
+            print(f"📄 Appended episode {episode_num} to {filename} ({len(self.detailed_node_logs)} steps)")
+            print(f"   └─ Total episodes in file: {total_episodes}")
+            
+            # Print summary statistics for this episode
+            if episode_data['summary_statistics']['total_nodes_tracked'] > 0:
+                print(f"   └─ Episode summary: {episode_data['summary_statistics']['total_nodes_tracked']} total nodes tracked, "
+                      f"avg {episode_data['summary_statistics']['avg_nodes_per_step']:.1f} nodes/step, "
+                      f"range {episode_data['summary_statistics']['min_nodes_per_step']}-{episode_data['summary_statistics']['max_nodes_per_step']} nodes")
+            
+            return self.detailed_logs_file_path
+            
+        except Exception as e:
+            print(f"❌ Failed to save to single file: {e}")
+            return ""
+    
+    def _save_to_separate_file(self, episode_data: Dict, episode_num: int) -> str:
+        """Save episode data to a separate JSON file (legacy mode)"""
+        try:
+            # Create filename with episode number
+            filename = f"detailed_nodes_episode_{episode_num:04d}.json"
+            if self.compress_logs:
+                filename += ".gz"
+            filepath = os.path.join(self.run_dir, filename)
+            
+            # Save to JSON file (with optional compression)
+            if self.compress_logs:
+                import gzip
+                with gzip.open(filepath, 'wt') as f:
+                    json.dump(episode_data, f, indent=2, default=str)
+            else:
+                with open(filepath, 'w') as f:
+                    json.dump(episode_data, f, indent=2, default=str)
+            
+            print(f"📄 Saved detailed node logs: {filename} ({len(self.detailed_node_logs)} steps)")
+            
+            # Print summary statistics
+            if episode_data['summary_statistics']['total_nodes_tracked'] > 0:
+                print(f"   └─ Summary: {episode_data['summary_statistics']['total_nodes_tracked']} total nodes tracked, "
+                      f"avg {episode_data['summary_statistics']['avg_nodes_per_step']:.1f} nodes/step, "
+                      f"range {episode_data['summary_statistics']['min_nodes_per_step']}-{episode_data['summary_statistics']['max_nodes_per_step']} nodes")
+            
+            return filepath
+            
+        except Exception as e:
+            print(f"❌ Failed to save to separate file: {e}")
+            return ""
+    
+    def finalize_detailed_logging(self) -> str:
+        """
+        Finalize detailed logging by adding training completion metadata
+        Only applies to single file mode
+        """
+        if not self.single_file_mode or not self.save_detailed_logs_to_json:
+            return ""
+        
+        if self.detailed_logs_file_path and hasattr(self, 'all_episodes_data'):
+            try:
+                # Add completion metadata
+                self.all_episodes_data['training_metadata']['training_completed'] = True
+                self.all_episodes_data['training_metadata']['completion_timestamp'] = time.time()
+                self.all_episodes_data['training_metadata']['final_episode_count'] = self.all_episodes_data['training_metadata']['total_episodes_logged']
+                
+                # Calculate overall statistics
+                total_steps_all_episodes = sum(ep['total_steps'] for ep in self.all_episodes_data['episodes'])
+                total_nodes_all_episodes = sum(ep['summary_statistics']['total_nodes_tracked'] for ep in self.all_episodes_data['episodes'])
+                
+                self.all_episodes_data['training_metadata']['overall_statistics'] = {
+                    'total_steps_all_episodes': total_steps_all_episodes,
+                    'total_nodes_all_episodes': total_nodes_all_episodes,
+                    'avg_steps_per_episode': total_steps_all_episodes / len(self.all_episodes_data['episodes']) if self.all_episodes_data['episodes'] else 0,
+                    'avg_nodes_per_episode': total_nodes_all_episodes / len(self.all_episodes_data['episodes']) if self.all_episodes_data['episodes'] else 0
+                }
+                
+                # Save final version
+                if self.compress_logs:
+                    import gzip
+                    with gzip.open(self.detailed_logs_file_path, 'wt') as f:
+                        json.dump(self.all_episodes_data, f, indent=2, default=str)
+                else:
+                    with open(self.detailed_logs_file_path, 'w') as f:
+                        json.dump(self.all_episodes_data, f, indent=2, default=str)
+                
+                print(f"🏁 Finalized detailed logging: {os.path.basename(self.detailed_logs_file_path)}")
+                print(f"   └─ Total episodes: {self.all_episodes_data['training_metadata']['final_episode_count']}")
+                print(f"   └─ Total steps: {total_steps_all_episodes}")
+                print(f"   └─ Total nodes tracked: {total_nodes_all_episodes}")
+                
+                return self.detailed_logs_file_path
+                
+            except Exception as e:
+                print(f"❌ Failed to finalize detailed logging: {e}")
+                return ""
+        
+        return ""
+    
+    def get_detailed_logging_summary(self) -> Dict:
+        """
+        Get a summary of the detailed logging configuration and current state
+        """
+        return {
+            'enabled': self.enable_detailed_logging,
+            'save_to_json': self.save_detailed_logs_to_json,
+            'single_file_mode': self.single_file_mode,
+            'configuration': {
+                'log_node_positions': self.log_node_positions,
+                'log_spawn_parameters': self.log_spawn_parameters,
+                'log_persistent_ids': self.log_persistent_ids,
+                'log_connectivity': self.log_connectivity,
+                'log_substrate_values': self.log_substrate_values,
+                'compress_logs': self.compress_logs,
+                'max_log_file_size_mb': self.max_log_file_size_mb
+            },
+            'current_episode_steps_logged': len(self.detailed_node_logs),
+            'run_directory': getattr(self, 'run_dir', None),
+            'file_info': {
+                'single_file_path': getattr(self, 'detailed_logs_file_path', None),
+                'total_episodes_logged': self.all_episodes_data['training_metadata'].get('total_episodes_logged', 0) if hasattr(self, 'all_episodes_data') else 0,
+                'filename_format': 'detailed_nodes_all_episodes.json' if self.single_file_mode else 'detailed_nodes_episode_XXXX.json'
+            }
+        }
+    
     def _get_curriculum_config(self, episode_num: int) -> Dict[str, any]:
         """Get curriculum-adjusted configuration based on training progress."""
         if not self.enable_curriculum:
@@ -1610,7 +2006,7 @@ class DurotaxisTrainer:
         curriculum_config = self._get_curriculum_config(episode_num)
         self._apply_curriculum_to_env(curriculum_config)
         
-        # Reset spawn parameter tracking for this episode
+        # Reset tracking for this episode
         self.current_episode_spawn_params = {
             'gamma': [],
             'alpha': [],
@@ -1618,7 +2014,6 @@ class DurotaxisTrainer:
             'theta': []
         }
         
-        # Reset reward component tracking for this episode
         self.current_episode_rewards = {
             'graph_reward': [],
             'spawn_reward': [],
@@ -1628,6 +2023,9 @@ class DurotaxisTrainer:
             'total_reward': []
         }
         
+        # Clear detailed node logs for new episode
+        self.detailed_node_logs = []
+
         # Update substrate if using random type
         if self.substrate_type == 'random':
             self._update_random_substrate()
@@ -1649,7 +2047,14 @@ class DurotaxisTrainer:
         terminated = False
         truncated = False
         
+        # Track previous step's executed actions for detailed logging
+        previous_executed_actions = None
+        
         while not done and episode_length < self.max_steps:
+            # Extract detailed node data at the beginning of each step (with previous step's actions)
+            if self.enable_detailed_logging:
+                step_node_data = self._extract_detailed_node_data(episode_num, episode_length, previous_executed_actions)
+                self.detailed_node_logs.append(step_node_data)
             # Get current state
             state_dict = self.state_extractor.get_state_features(include_substrate=True)
 
@@ -1743,6 +2148,12 @@ class DurotaxisTrainer:
                     except Exception as e:
                         # Action failed - this is learning signal
                         continue
+                
+                # Store executed actions for next step's detailed logging
+                previous_executed_actions = topology_actions
+            else:
+                # No actions taken this step
+                previous_executed_actions = {}
             
             # Environment step
             next_obs, reward_components, terminated, truncated, info = self.env.step(0)
@@ -2454,6 +2865,10 @@ class DurotaxisTrainer:
                 # Compute and save reward component statistics
                 self.save_reward_statistics(episode_count)
                 
+                # Save detailed node logs for this episode
+                if self.enable_detailed_logging and self.detailed_node_logs:
+                    self.save_detailed_node_logs(episode_count)
+                
                 # Enhanced episode progress print with smoothed metrics
                 latest_loss = self.losses['total_loss'][-1] if self.losses['total_loss'] else 0.0
                 smoothed_reward = self.smoothed_rewards[-1] if self.smoothed_rewards else episode_total_reward
@@ -2618,6 +3033,11 @@ class DurotaxisTrainer:
         print(f"   Episodes trained: {episode_count}")
         print(f"   Batches completed: {batch_count}")
         print(f"   Best total reward: {self.best_total_reward:.3f}")
+        
+        # Finalize detailed logging if enabled
+        if self.enable_detailed_logging:
+            self.finalize_detailed_logging()
+        
         self.save_model("final_model.pt")
         self.save_metrics()
     

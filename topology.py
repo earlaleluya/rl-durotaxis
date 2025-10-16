@@ -164,40 +164,75 @@ class Topology:
         Spawns a new node from curr_node_id in the direction theta, at a distance determined by the Hill equation.
         Adds the new node to the graph and connects curr_node_id to the new node.
         """
-        r = self._hill_equation(curr_node_id, gamma, alpha, noise)
-        # Get current node position
-        curr_pos = self.graph.ndata['pos'][curr_node_id].numpy()
-        # Compute new node position
-        x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
-        new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
-        # Store current data before adding new node
-        current_positions = self.graph.ndata['pos']
-        current_new_node_flags = self.graph.ndata['new_node']
-        current_persistent_ids = self.graph.ndata.get('persistent_id', torch.arange(self.graph.num_nodes(), dtype=torch.long))
+        try:
+            r = self._hill_equation(curr_node_id, gamma, alpha, noise)
+            # Get current node position
+            curr_pos = self.graph.ndata['pos'][curr_node_id].numpy()
+            # Compute new node position
+            x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
+            new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
+            
+            # Store current graph state before modification
+            num_nodes_before = self.graph.num_nodes()
+            
+            # Store all current node data before adding new node
+            current_node_data = {}
+            for key, value in self.graph.ndata.items():
+                current_node_data[key] = value.clone()
+            
+            # Add new node to graph (this will automatically extend existing features)
+            self.graph.add_nodes(1)
+            
+            # Manually set the node features to avoid dimension mismatches
+            # Position data
+            self.graph.ndata['pos'] = torch.cat([current_node_data['pos'], new_node_coord.unsqueeze(0)], dim=0)
+            
+            # New node flags
+            current_new_node_flags = current_node_data.get('new_node', torch.zeros(num_nodes_before, dtype=torch.float32))
+            new_node_flag = torch.tensor([1.0], dtype=torch.float32)
+            self.graph.ndata['new_node'] = torch.cat([current_new_node_flags, new_node_flag], dim=0)
+            
+            # Persistent IDs
+            current_persistent_ids = current_node_data.get('persistent_id', torch.arange(num_nodes_before, dtype=torch.long))
+            new_persistent_id = torch.tensor([self._next_persistent_id], dtype=torch.long)
+            self.graph.ndata['persistent_id'] = torch.cat([current_persistent_ids, new_persistent_id], dim=0)
+            self._next_persistent_id += 1
+            
+            # Handle spawn parameters
+            self._update_spawn_parameters(num_nodes_before, gamma, alpha, noise, theta)
+            
+            # Get the NEW node ID (after adding the node)
+            new_node_id = self.graph.num_nodes() - 1  
+            
+            # Add edge from curr_node_id to new_node_id
+            self.graph.add_edges(curr_node_id, new_node_id)
+            
+            return new_node_id
+            
+        except Exception as e:
+            # If spawn fails, restore the graph to its previous state
+            # This is important to maintain consistency
+            return None
+    
+    def _update_spawn_parameters(self, num_nodes_before, gamma, alpha, noise, theta):
+        """Helper method to update spawn parameters safely."""
+        # When a node is added, DGL automatically extends all node features to match the new number of nodes
+        # We just need to set the spawn parameters for the new node (at index num_nodes_before)
         
-        # Add new node to graph
-        self.graph.add_nodes(1)
+        # Initialize spawn parameter arrays if they don't exist
+        if 'gamma' not in self.graph.ndata:
+            current_num_nodes = self.graph.num_nodes()
+            self.graph.ndata['gamma'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
+            self.graph.ndata['alpha'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
+            self.graph.ndata['noise'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
+            self.graph.ndata['theta'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
         
-        # Update position data by concatenating the new coordinate
-        updated_positions = torch.cat([current_positions, new_node_coord.unsqueeze(0)], dim=0)
-        self.graph.ndata['pos'] = updated_positions
-        
-        # Update new_node flags: existing nodes remain 0, new node gets 1
-        new_node_flag = torch.tensor([1.0], dtype=torch.float32)  # New node is flagged as 1
-        updated_new_node_flags = torch.cat([current_new_node_flags, new_node_flag], dim=0)
-        self.graph.ndata['new_node'] = updated_new_node_flags
-        
-        # Update persistent IDs: preserve existing IDs, assign new unique ID to new node
-        new_persistent_id = torch.tensor([self._next_persistent_id], dtype=torch.long)
-        updated_persistent_ids = torch.cat([current_persistent_ids, new_persistent_id], dim=0)
-        self.graph.ndata['persistent_id'] = updated_persistent_ids
-        self._next_persistent_id += 1  # Increment for next new node
-        
-        # Get the NEW node ID (after adding the node)
-        new_node_id = self.graph.num_nodes() - 1  
-        # Add edge from curr_node_id to new_node_id
-        self.graph.add_edges(curr_node_id, new_node_id)
-        return new_node_id
+        # Set the spawn parameters for the new node (at index num_nodes_before)
+        new_node_idx = num_nodes_before
+        self.graph.ndata['gamma'][new_node_idx] = gamma
+        self.graph.ndata['alpha'][new_node_idx] = alpha
+        self.graph.ndata['noise'][new_node_idx] = noise
+        self.graph.ndata['theta'][new_node_idx] = theta
 
 
 
@@ -253,6 +288,12 @@ class Topology:
         if 'persistent_id' in self.graph.ndata:
             persistent_ids = self.graph.ndata['persistent_id'].clone()
         
+        # Store spawn parameters before removal (if they exist)
+        spawn_params = {}
+        for param in ['gamma', 'alpha', 'noise', 'theta']:
+            if param in self.graph.ndata:
+                spawn_params[param] = self.graph.ndata[param].clone()
+        
         # Remove the current node
         self.graph = dgl.remove_nodes(self.graph, curr_node_id)
         
@@ -271,6 +312,14 @@ class Topology:
                 persistent_ids[curr_node_id+1:]
             ])
             self.graph.ndata['persistent_id'] = remaining_persistent_ids
+        
+        # Restore spawn parameters for remaining nodes (excluding deleted node)
+        for param, param_data in spawn_params.items():
+            remaining_param_values = torch.cat([
+                param_data[:curr_node_id],
+                param_data[curr_node_id+1:]
+            ])
+            self.graph.ndata[param] = remaining_param_values
         
         # After removal, node indices shift down for nodes after curr_node_id
         # Adjust indices for successors and predecessors
@@ -410,6 +459,12 @@ class Topology:
         self.graph.ndata['persistent_id'] = torch.tensor(persistent_ids, dtype=torch.long)
         self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
         self.graph.ndata['to_delete'] = torch.zeros(init_num_nodes, dtype=torch.float32)  # Initialize to_delete flags
+        
+        # Initialize spawn parameters for initial nodes (NaN since they weren't spawned)
+        self.graph.ndata['gamma'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
+        self.graph.ndata['alpha'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
+        self.graph.ndata['noise'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
+        self.graph.ndata['theta'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
         
         # Initial graph may start with no edges
         # Add some random initial connections
