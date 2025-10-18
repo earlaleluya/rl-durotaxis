@@ -14,6 +14,7 @@ This is designed to run immediately and show real training progress.
 import sys
 import os
 import json
+import subprocess
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2976,9 +2977,72 @@ class DurotaxisTrainer:
                             except Exception:
                                 pass
 
-                        # Update both spawn & reward stat files
+                        # Update both spawn & reward stat files with episode_loss and recent_total_loss
                         update_last_n_entries(os.path.join(self.run_dir, 'spawn_parameters_stats.json'))
                         update_last_n_entries(os.path.join(self.run_dir, 'reward_components_stats.json'))
+                        
+                        # Also update recent_total_loss field with the batch's total_loss
+                        if 'total_loss' in final_losses:
+                            total_loss_value = float(final_losses['total_loss'])
+                            
+                            # Define a version that updates with total_loss_value instead of episode_loss_value
+                            def update_recent_total_loss(filepath):
+                                if not os.path.exists(filepath):
+                                    return
+                                try:
+                                    with open(filepath, 'r') as f:
+                                        data = json.load(f)
+                                except Exception:
+                                    return
+
+                                if isinstance(data, dict):
+                                    # Old format: single dict, just set the key
+                                    data['recent_total_loss'] = total_loss_value
+                                    new_data = data
+                                elif isinstance(data, list):
+                                    # Update the last num_episodes_in_batch entries
+                                    for i in range(1, num_episodes_in_batch + 1):
+                                        if len(data) - i >= 0:
+                                            if isinstance(data[-i], dict):
+                                                data[-i]['recent_total_loss'] = total_loss_value
+                                    new_data = data
+                                else:
+                                    return
+
+                                # Write back
+                                try:
+                                    with open(filepath, 'w') as f:
+                                        json.dump(new_data, f, indent=2)
+                                except Exception:
+                                    pass
+                            
+                            update_recent_total_loss(os.path.join(self.run_dir, 'spawn_parameters_stats.json'))
+                            update_recent_total_loss(os.path.join(self.run_dir, 'reward_components_stats.json'))
+                            def update_recent_total_loss(filepath):
+                                if not os.path.exists(filepath):
+                                    return
+                                try:
+                                    with open(filepath, 'r') as f:
+                                        data = json.load(f)
+                                except Exception:
+                                    return
+
+                                if isinstance(data, list):
+                                    # Update the last num_episodes_in_batch entries with total_loss_value
+                                    for i in range(1, num_episodes_in_batch + 1):
+                                        if len(data) - i >= 0:
+                                            if isinstance(data[-i], dict):
+                                                data[-i]['recent_total_loss'] = total_loss_value
+
+                                # Write back
+                                try:
+                                    with open(filepath, 'w') as f:
+                                        json.dump(data, f, indent=2)
+                                except Exception:
+                                    pass
+                            
+                            update_recent_total_loss(os.path.join(self.run_dir, 'spawn_parameters_stats.json'))
+                            update_recent_total_loss(os.path.join(self.run_dir, 'reward_components_stats.json'))
                 except Exception:
                     # Non-critical: do not fail training if we can't update files
                     pass
@@ -3040,6 +3104,9 @@ class DurotaxisTrainer:
         
         self.save_model("final_model.pt")
         self.save_metrics()
+        
+        # Generate training visualization plots
+        self.generate_training_plots()
     
     def create_run_directory(self, base_dir: str) -> str:
         """Create a new run directory with automatic numbering (run0001, run0002, etc.)"""
@@ -3139,9 +3206,18 @@ class DurotaxisTrainer:
         stats_filepath = os.path.join(self.run_dir, 'spawn_parameters_stats.json')
         
         # Enrich stats with additional episode diagnostics
-        # Loss summary (total_loss may be tracked in self.losses)
+        # Loss summary - use most recent available loss from completed batches
         try:
-            recent_total_loss = self.losses.get('total_loss', [])[-1] if self.losses.get('total_loss') else None
+            # Get most recent loss from completed batches (self.losses is populated after batch completion)
+            if self.losses.get('total_loss'):
+                recent_total_loss = self.losses['total_loss'][-1]
+            # Fallback to using smoothed losses if available
+            elif hasattr(self, 'smoothed_losses') and self.smoothed_losses:
+                recent_total_loss = self.smoothed_losses[-1]
+            else:
+                # For episodes before first batch completion, recent_total_loss will be null
+                # This will be updated via the post-processing mechanism in save_loss_statistics
+                recent_total_loss = None
         except Exception:
             recent_total_loss = None
 
@@ -3313,7 +3389,16 @@ class DurotaxisTrainer:
         
         # Enrich stats with additional episode diagnostics
         try:
-            recent_total_loss = self.losses.get('total_loss', [])[-1] if self.losses.get('total_loss') else None
+            # Get most recent loss from completed batches (self.losses is populated after batch completion)
+            if self.losses.get('total_loss'):
+                recent_total_loss = self.losses['total_loss'][-1]
+            # Fallback to using smoothed losses if available
+            elif hasattr(self, 'smoothed_losses') and self.smoothed_losses:
+                recent_total_loss = self.smoothed_losses[-1]
+            else:
+                # For episodes before first batch completion, recent_total_loss will be null
+                # This will be updated via the post-processing mechanism in save_loss_statistics  
+                recent_total_loss = None
         except Exception:
             recent_total_loss = None
 
@@ -3451,6 +3536,41 @@ class DurotaxisTrainer:
             json.dump(metrics, f, indent=2)
         
         print(f"📊 Saved training metrics to run{self.run_number:04d}")
+    
+    def generate_training_plots(self):
+        """Generate plots for spawn parameters, reward components, and loss evolution after training completion"""
+        try:
+            print(f"📈 Generating training visualization plots...")
+            
+            # Call plotter.py with spawn parameters, reward components, and loss evolution
+            cmd = [
+                sys.executable, 'plotter.py',
+                '--input', self.run_dir,
+                '--combined', '--rewards', '--loss'
+            ]
+            
+            print(f"   Running: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=os.getcwd())
+            
+            if result.returncode == 0:
+                print(f"✅ Training plots generated successfully!")
+                print(f"   📁 Plots saved to: {self.run_dir}/")
+                print(f"   📊 Generated files:")
+                print(f"      • spawn_parameters_evolution_run{self.run_number:04d}.png")
+                print(f"      • spawn_parameters_combined_run{self.run_number:04d}.png") 
+                print(f"      • reward_components_run{self.run_number:04d}.png")
+                print(f"      • loss_evolution_run{self.run_number:04d}.png")
+            else:
+                print(f"⚠️  Warning: Plot generation failed")
+                print(f"   Error: {result.stderr}")
+                print(f"   Stdout: {result.stdout}")
+                print(f"   You can manually generate plots with:")
+                print(f"   python plotter.py --input {self.run_dir} --combined --rewards --loss")
+                
+        except Exception as e:
+            print(f"⚠️  Warning: Could not generate plots automatically: {e}")
+            print(f"   You can manually generate plots with:")
+            print(f"   python plotter.py --input {self.run_dir} --combined --rewards --loss")
     
     def _initialize_substrate(self):
         """Initialize substrate based on substrate_type"""
