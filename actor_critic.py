@@ -142,12 +142,19 @@ class HybridActorCritic(nn.Module):
         # Initialize continuous action heads for better starting values
         self._init_continuous_heads()
         
-        # Parameter bounds for continuous actions
+        # Parameter bounds for continuous actions from config
+        spawn_bounds = config.get('spawn_parameter_bounds', {
+            'gamma': [0.1, 10.0],
+            'alpha': [0.1, 5.0],
+            'noise': [0.0, 2.0],
+            'theta': [-math.pi, math.pi]
+        })
+        
         self.register_buffer('action_bounds', torch.tensor([
-            [0.1, 10.0],    # gamma bounds
-            [0.1, 5.0],     # alpha bounds  
-            [0.0, 2.0],     # noise bounds
-            [-math.pi, math.pi]  # theta bounds
+            spawn_bounds.get('gamma', [0.1, 10.0]),
+            spawn_bounds.get('alpha', [0.1, 5.0]),
+            spawn_bounds.get('noise', [0.0, 2.0]),
+            spawn_bounds.get('theta', [-math.pi, math.pi])
         ]))
     
     def _init_continuous_heads(self):

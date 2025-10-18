@@ -376,6 +376,13 @@ actor_critic:
   continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)
   dropout_rate: 0.1             # Dropout rate for regularization
   
+  # Spawn parameter bounds [min, max]
+  spawn_parameter_bounds:
+    gamma: [0.1, 10.0]          # Cell migration sensitivity parameter
+    alpha: [0.1, 5.0]           # Directional bias strength
+    noise: [0.0, 2.0]           # Stochastic noise level
+    theta: [-3.14159, 3.14159]  # Migration direction angle (-pi to pi)
+  
   # Value function components (list of reward components to predict)
   value_components:
     - 'total_reward'
