@@ -9,7 +9,7 @@ from topology import Topology
 from substrate import Substrate
 from state import TopologyState
 from encoder import GraphInputEncoder
-from policy import GraphPolicyNetwork, TopologyPolicyAgent
+from actor_critic import HybridActorCritic, HybridPolicyAgent
 from config_loader import ConfigLoader
 
 
@@ -131,7 +131,7 @@ class DurotaxisEnv(gym.Env):
         Component for extracting graph features and node attributes from topology.
     observation_encoder : GraphInputEncoder
         Graph neural network encoder for converting topology to fixed-size observations.
-    policy_agent : TopologyPolicyAgent
+    policy_agent : HybridPolicyAgent
         Graph transformer policy for intelligent action selection.
     action_space : gym.Space
         Discrete action space (dummy - actual actions determined by policy network).
@@ -419,11 +419,9 @@ class DurotaxisEnv(gym.Env):
             out_dim=self.encoder_out_dim,
             num_layers=self.encoder_num_layers
         )
-        
-        policy = GraphPolicyNetwork(encoder, hidden_dim=self.encoder_hidden_dim, noise_scale=0.1)
-        
+        policy = HybridActorCritic(encoder, hidden_dim=self.encoder_hidden_dim)
         # Create policy agent
-        self.policy_agent = TopologyPolicyAgent(self.topology, self.state_extractor, policy)
+        self.policy_agent = HybridPolicyAgent(self.topology, self.state_extractor, policy)
         self._policy_initialized = True
 
     def _get_edge_structure_hash(self, edge_index):
