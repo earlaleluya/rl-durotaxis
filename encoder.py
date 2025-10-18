@@ -86,7 +86,8 @@ class GraphInputEncoder(nn.Module):
         # Graph-level MLP → virtual node
         self.graph_mlp = nn.Sequential(
             nn.Linear(14, self.hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim),
             nn.Linear(self.hidden_dim, self.hidden_dim)
         )
         # Node projection
@@ -94,7 +95,8 @@ class GraphInputEncoder(nn.Module):
         # Edge projection
         self.edge_mlp = nn.Sequential(
             nn.Linear(3, self.hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim),
             nn.Linear(self.hidden_dim, self.hidden_dim)
         )
 
@@ -108,6 +110,17 @@ class GraphInputEncoder(nn.Module):
             dropout=0.1,
             edge_dim=self.hidden_dim  
         )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """
+        Initialize weights of linear layers with Xavier uniform initialization.
+        """
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
 
     def forward(self, graph_features, node_features, edge_features, edge_index, batch=None):
         """
@@ -286,7 +299,7 @@ class MyGraphTransformer(nn.Module):
             # Apply layer norm and activation
             x = norm(x)
             if i < len(self.layers) - 1:  # No activation on final layer
-                x = F.relu(x)
+                x = F.gelu(x)
             x = dropout(x)
             
         return x

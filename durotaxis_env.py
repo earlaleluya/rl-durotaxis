@@ -303,7 +303,10 @@ class DurotaxisEnv(gym.Env):
         self.survival_reward = self.graph_rewards['survival_reward']
         self.action_reward = self.graph_rewards['action_reward']
         
+        self.centroid_movement_reward = self.graph_rewards.get('centroid_movement_reward', 0.0)
+        
         self.movement_reward = self.node_rewards['movement_reward']
+        self.leftward_penalty = self.node_rewards.get('leftward_penalty', 0.0)
         self.intensity_penalty = self.node_rewards['intensity_penalty']
         self.intensity_bonus = self.node_rewards['intensity_bonus']
         self.substrate_reward = self.node_rewards['substrate_reward']
@@ -322,8 +325,14 @@ class DurotaxisEnv(gym.Env):
         self.timeout_penalty = self.termination_rewards['timeout_penalty']
         self.critical_nodes_penalty = self.termination_rewards['critical_nodes_penalty']
         
+        self.survival_reward_config = config.get('survival_reward_config', {'enabled': False})
+        self.milestone_rewards = config.get('milestone_rewards', {'enabled': False})
+
         self.current_step = 0
         self.current_episode = 0
+        
+        # Milestone tracking (reset each episode)
+        self._milestones_reached = set()
         
         # Centroid tracking for fail termination
         self.centroid_history = []  # Store centroid x-coordinates
@@ -932,6 +941,10 @@ class DurotaxisEnv(gym.Env):
         # Small reward for taking actions (encourages exploration)
         graph_reward += len(actions) * self.action_reward
         
+        # === CENTROID MOVEMENT REWARD: Collective rightward progress ===
+        centroid_reward = self._calculate_centroid_movement_reward(prev_state, new_state)
+        graph_reward += centroid_reward
+        
         # === SPAWN REWARD: Durotaxis-based spawning ===
         spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
         graph_reward += spawn_reward
@@ -960,14 +973,20 @@ class DurotaxisEnv(gym.Env):
             # 1. VECTORIZED Position-based rewards (durotaxis progression)
             node_positions = node_features_np[:, :2]  # [num_nodes, 2] - x, y coordinates
             
-            # Reward for moving rightward (positive durotaxis) - VECTORIZED
+            # Reward/penalize based on movement direction - VECTORIZED
             if hasattr(self, 'prev_node_positions') and len(self.prev_node_positions) > 0:
                 # Convert previous positions to numpy array
                 prev_positions = np.array(self.prev_node_positions[:num_nodes])  # Handle size mismatches
                 if prev_positions.shape[0] == num_nodes:
                     # Vectorized movement calculation
                     x_movement = node_positions[:, 0] - prev_positions[:, 0]  # [num_nodes]
-                    movement_rewards = x_movement * self.movement_reward  # [num_nodes]
+                    
+                    # Reward rightward movement, penalize leftward movement
+                    movement_rewards = np.where(
+                        x_movement > 0,
+                        x_movement * self.movement_reward,  # Rightward: strong reward
+                        x_movement * self.leftward_penalty  # Leftward: penalty (x_movement is negative, so this is negative)
+                    )
                     node_rewards_vec += movement_rewards
             
             # 2. VECTORIZED Substrate intensity rewards
@@ -1060,8 +1079,11 @@ class DurotaxisEnv(gym.Env):
         # Add survival reward if configured
         survival_reward = self.get_survival_reward(self.current_step)
         
+        # Add milestone rewards for reaching distance thresholds
+        milestone_reward = self._calculate_milestone_reward(new_state)
+        
         # Final combined reward
-        total_reward = graph_reward + total_node_reward + survival_reward
+        total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
         
         # Create detailed reward information dictionary
         reward_breakdown = {
@@ -1070,6 +1092,8 @@ class DurotaxisEnv(gym.Env):
             'spawn_reward': spawn_reward,
             'delete_reward': delete_reward,
             'edge_reward': edge_reward,
+            'centroid_reward': centroid_reward if 'centroid_reward' in locals() else 0.0,
+            'milestone_reward': milestone_reward,
             'node_rewards': node_rewards,
             'total_node_reward': total_node_reward,
             'survival_reward': survival_reward,
@@ -1081,6 +1105,84 @@ class DurotaxisEnv(gym.Env):
         
         return reward_breakdown
 
+    def _calculate_centroid_movement_reward(self, prev_state, new_state):
+        """
+        Calculate reward based on collective centroid movement to the right.
+        
+        This reward encourages the entire cell colony to migrate rightward as a group,
+        providing a strong signal for the primary goal of durotaxis.
+        
+        Args:
+            prev_state: Previous state dict containing graph_features with centroid
+            new_state: Current state dict containing graph_features with centroid
+            
+        Returns:
+            float: Positive reward for rightward movement, negative for leftward
+        """
+        if new_state['num_nodes'] == 0 or prev_state['num_nodes'] == 0:
+            return 0.0
+        
+        # Get centroid x-coordinates from graph features
+        prev_centroid_x = prev_state['graph_features'][3].item()
+        curr_centroid_x = new_state['graph_features'][3].item()
+        
+        # Calculate movement
+        centroid_movement = curr_centroid_x - prev_centroid_x
+        
+        # Apply reward multiplier
+        reward = centroid_movement * self.centroid_movement_reward
+        
+        return reward
+    
+    def _calculate_milestone_reward(self, new_state):
+        """
+        Calculate reward for reaching distance milestones.
+        
+        Provides progressive rewards as the agent reaches certain percentages
+        of the substrate width, creating intermediate goals that guide learning.
+        
+        Args:
+            new_state: Current state dict
+            
+        Returns:
+            float: Milestone reward if a new milestone is reached, 0.0 otherwise
+        """
+        if not hasattr(self, 'milestone_rewards') or not self.milestone_rewards.get('enabled', False):
+            return 0.0
+        
+        if new_state['num_nodes'] == 0:
+            return 0.0
+        
+        # Get the rightmost node position
+        node_features = new_state['node_features']
+        max_x = max(node_features[:, 0]).item()
+        
+        substrate_width = self.substrate.width
+        progress_percent = (max_x / substrate_width) * 100
+        
+        # Check if we've reached a new milestone (track in episode)
+        if not hasattr(self, '_milestones_reached'):
+            self._milestones_reached = set()
+        
+        reward = 0.0
+        
+        # Check each milestone threshold
+        milestones = [
+            (25, 'distance_25_percent'),
+            (50, 'distance_50_percent'),
+            (75, 'distance_75_percent'),
+            (90, 'distance_90_percent')
+        ]
+        
+        for threshold, key in milestones:
+            if progress_percent >= threshold and threshold not in self._milestones_reached:
+                self._milestones_reached.add(threshold)
+                milestone_reward = self.milestone_rewards.get(key, 0.0)
+                reward += milestone_reward
+                print(f"🎯 MILESTONE REACHED! {threshold}% of substrate width! Reward: +{milestone_reward}")
+        
+        return reward
+    
     def _calculate_spawn_reward(self, prev_state, new_state, actions):
         """
         Calculate reward for durotaxis-based spawning.
@@ -1647,14 +1749,32 @@ class DurotaxisEnv(gym.Env):
             self.consecutive_left_moves_limit = termination_config['consecutive_left_moves']
             
     def get_survival_reward(self, step_count: int) -> float:
-        """Calculate survival reward based on step count and configuration."""
-        survival_config = getattr(self, '_survival_config', {})
+        """
+        Calculate time-based survival reward that increases with episode length.
+        
+        Encourages the agent to survive longer by providing:
+        1. Base reward for each step
+        2. Bonus reward after reaching a threshold
+        3. Progressive scaling based on max_steps
+        
+        Args:
+            step_count: Current step number in episode
+            
+        Returns:
+            float: Survival reward for current step
+        """
+        # Check if survival rewards are configured and enabled
+        if not hasattr(self, 'survival_reward_config'):
+            return 0.0
+        
+        survival_config = self.survival_reward_config
         if not survival_config.get('enabled', False):
             return 0.0
-            
-        base_reward = survival_config.get('base_reward', 0.1)
-        bonus_threshold = survival_config.get('bonus_threshold', 10)
-        bonus_reward = survival_config.get('bonus_reward', 0.2)
+        
+        base_reward = survival_config.get('base_reward', 0.02)
+        bonus_threshold = survival_config.get('bonus_threshold', 100)
+        bonus_reward = survival_config.get('bonus_reward', 0.05)
+        max_step_factor = survival_config.get('max_step_factor', 0.8)
         
         # Base survival reward for each step
         reward = base_reward
@@ -1662,7 +1782,13 @@ class DurotaxisEnv(gym.Env):
         # Bonus for reaching threshold
         if step_count >= bonus_threshold:
             reward += bonus_reward
-            
+        
+        # Progressive scaling: reward increases as episode progresses
+        # This creates a strong incentive to reach longer episodes
+        if step_count > 0 and self.max_steps > 0:
+            progress_factor = min(step_count / (self.max_steps * max_step_factor), 1.0)
+            reward *= (1.0 + progress_factor)  # Up to 2x multiplier
+        
         return reward
 
     def reset(self, seed=None, options=None):
@@ -1688,6 +1814,9 @@ class DurotaxisEnv(gym.Env):
         # Reset node-level reward tracking
         self.prev_node_positions = []
         self.last_reward_breakdown = None
+        
+        # Reset milestone tracking for new episode
+        self._milestones_reached = set()
         
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)

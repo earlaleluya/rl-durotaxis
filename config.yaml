@@ -13,124 +13,145 @@ trainer:
   # proportionally so the curriculum covers the full training run.
   total_episodes: 1000
   max_steps: 1000
-  learning_rate: 0.00008   # Slightly increased for faster learning with better exploration
+  learning_rate: 0.0001   
   save_dir: "./training_results"
   
   # ============================================================================
-  # CURRICULUM LEARNING SYSTEM - Progressive Skill Development
+  # CURRICULUM LEARNING SYSTEM - Progressive Migration Training
   # ============================================================================
+  # This curriculum works WITH the new reward structure to progressively
+  # guide the agent from basic survival to successful rightmost migration
   curriculum_learning:
     enable_curriculum: true           # Enable progressive learning stages
     
-    # Stage 1: Navigation Fundamentals (Episodes 0-50)
+    # Stage 1: Survival & Basic Movement (Episodes 0-200)
+    # GOAL: Learn to stay alive and move rightward without catastrophic failures
     stage_1_navigation:
       episode_start: 0
-      episode_end: 50
-      focus: "basic_navigation"
-      description: "Learn to move from left to right without hitting boundaries"
+      episode_end: 200
+      focus: "survival_and_movement"
+      description: "Master survival, avoid boundaries, and learn rightward movement"
       
-      # Simplified environment for stage 1
-      max_nodes_allowed: 5            # Limit complexity
-      simplified_actions: true        # Reduce action space complexity
+      # Simplified environment for early learning
+      max_nodes_allowed: 30           # Moderate complexity (was 5, too restrictive)
+      simplified_actions: false       # Keep full actions to learn properly
       
-      # Stage 1 specific rewards (emphasize navigation)
+      # Stage 1: Emphasize survival and basic movement
       reward_multipliers:
-        movement_reward: 5.0          # 5x bonus for rightward movement
-        boundary_penalty: 10.0        # Heavy penalty for boundary violations
-        survival_reward: 2.0          # 2x bonus for staying alive
-        node_count_penalty: 0.1       # Minimal penalty for node management
+        survival_reward: 3.0          # 3x survival bonus (learn to stay alive)
+        movement_reward: 2.0          # 2x movement reward (learn direction)
+        centroid_movement_reward: 2.0 # 2x centroid reward (collective movement)
+        boundary_penalty: 5.0         # 5x boundary penalty (avoid catastrophe)
+        milestone_rewards: 2.0        # 2x milestone rewards (celebrate progress)
         
       # Success criteria for stage 1
       success_criteria:
-        min_episode_length: 10        # Must survive at least 10 steps
-        max_boundary_violations: 0    # No boundary violations allowed
-        min_rightward_progress: 5.0   # Must move at least 5 units right
+        min_episode_length: 50        # Survive at least 50 steps
+        max_boundary_violations: 2    # Allow some exploration mistakes
+        min_rightward_progress: 50.0  # Must reach 50 units right (approx 8% of 600)
+        min_centroid_x: 100.0         # Centroid must reach x=100
         
-    # Stage 2: Node Management (Episodes 51-100)  
+    # Stage 2: Distance Milestones (Episodes 201-500)  
+    # GOAL: Reach progressive distance milestones (25%, 50%, 75%)
     stage_2_management:
-      episode_start: 51
-      episode_end: 100
-      focus: "spawn_delete_control"
-      description: "Learn efficient spawning and deletion of nodes"
+      episode_start: 201
+      episode_end: 500
+      focus: "milestone_achievement"
+      description: "Reach 25%, 50%, and 75% distance milestones consistently"
       
-      # Moderate complexity for stage 2
-      max_nodes_allowed: 15           # Allow more nodes
-      unlock_advanced_actions: true   # Enable full action space
+      # Increased complexity for intermediate learning
+      max_nodes_allowed: 50           # Standard complexity (was 15)
+      unlock_advanced_actions: true   # Full action space
       
-      # Stage 2 specific rewards (emphasize node control)
+      # Stage 2: Emphasize milestone achievement and sustained movement
       reward_multipliers:
-        movement_reward: 2.0          # Reduced navigation focus
-        spawn_success_reward: 3.0     # 3x bonus for successful spawning
-        deletion_efficiency: 4.0      # 4x bonus for efficient deletion
-        node_diversity_bonus: 2.0     # Bonus for maintaining diverse nodes
-        connectivity_bonus: 1.5       # Bonus for good connectivity
+        survival_reward: 2.0          # Still important but reduced
+        movement_reward: 1.5          # Still rewarded
+        centroid_movement_reward: 2.5 # 2.5x centroid (group progress crucial)
+        milestone_rewards: 3.0        # 3x milestone rewards (primary focus!)
+        spawn_success_reward: 1.5     # 1.5x spawn (efficient expansion)
+        intensity_bonus: 2.0          # 2x intensity bonus (seek better substrate)
         
       # Success criteria for stage 2
       success_criteria:
-        min_episode_length: 20        # Longer episodes required
-        max_boundary_violations: 1    # Allow occasional violations
-        min_spawn_actions: 3          # Must spawn at least 3 nodes
-        min_delete_actions: 2         # Must delete at least 2 nodes
+        min_episode_length: 100       # Longer episodes required
+        max_boundary_violations: 1    # Fewer mistakes allowed
+        min_rightward_progress: 150.0 # Must reach 150 units (25% of 600)
+        milestone_25_percent: true    # Must trigger 25% milestone
+        milestone_50_percent: true    # Aim for 50% milestone
         
-    # Stage 3: Optimization (Episodes 101-150)
+    # Stage 3: Goal Achievement (Episodes 501-1000)
+    # GOAL: Consistently reach the rightmost substrate (100% success)
     stage_3_optimization:
-      episode_start: 101
-      episode_end: 150
-      focus: "full_optimization"
-      description: "Master all constraints and optimize performance"
+      episode_start: 501
+      episode_end: 1000
+      focus: "goal_completion"
+      description: "Master full migration to rightmost substrate"
       
-      # Full complexity for stage 3
-      max_nodes_allowed: 50           # No restrictions
+      # Full complexity for final mastery
+      max_nodes_allowed: 75           # Maximum capacity (was 50)
       enable_all_constraints: true    # Full problem complexity
       
-      # Stage 3 balanced rewards (full optimization)
+      # Stage 3: Balanced rewards with emphasis on goal completion
       reward_multipliers:
-        movement_reward: 1.0          # Standard navigation rewards
-        spawn_success_reward: 1.0     # Standard spawning rewards
-        deletion_efficiency: 1.0      # Standard deletion rewards
-        success_completion: 10.0      # 10x bonus for task completion
-        efficiency_bonus: 5.0         # 5x bonus for efficiency metrics
+        survival_reward: 1.5          # Reduced but still present
+        movement_reward: 1.0          # Standard (well-learned by now)
+        centroid_movement_reward: 2.0 # Still important for group coordination
+        milestone_rewards: 1.5        # Reduced (should be easy now)
+        success_reward: 2.0           # 2x success reward (MAIN GOAL!)
+        spawn_success_reward: 1.2     # Slightly boosted for efficiency
+        efficiency_bonus: 3.0         # 3x efficiency (optimize path)
         
       # Success criteria for stage 3  
       success_criteria:
-        min_episode_length: 50        # Long episodes required
+        min_episode_length: 200       # Long sustainable episodes
         max_boundary_violations: 0    # No violations in final stage
-        completion_rate: 0.1          # 10% task completion rate
-        efficiency_threshold: 0.8     # 80% efficiency required
+        min_rightward_progress: 450.0 # Must reach 450+ units (75%+)
+        completion_rate: 0.15         # 15% success rate to advance
+        milestone_90_percent: true    # Must trigger 90% milestone
+        efficiency_threshold: 0.7     # 70% efficiency required
         
-  # Curriculum progression settings
+  # Curriculum progression settings - ALIGNED WITH NEW REWARD STRUCTURE
   curriculum_progression:
     auto_advance: true                # Automatically advance stages
-    advancement_criteria: "success_rate"  # Advance based on success rate
-    min_success_rate: 0.6            # 60% success rate to advance
-    evaluation_window: 50            # Evaluate over last 50 episodes
+    advancement_criteria: "mixed"     # Use both success rate AND episode thresholds
+    min_success_rate: 0.10           # 10% success rate to advance (was 60%, too strict)
+    evaluation_window: 100           # Evaluate over last 100 episodes (more stable)
+    allow_early_advance: true        # Allow advancing if criteria met before episode_end
+    force_advance_at_end: true       # Always advance at episode_end regardless of performance
     # Overlap control between stages:
     # - You may provide `stage_overlap` (absolute number of episodes to overlap)
     # - OR provide `curriculum_overlap_pct` (fraction 0..1) which will be applied
     #   proportionally to each stage after scaling. When both are present, the
     #   fractional option `curriculum_overlap_pct` takes precedence.
     # Example: curriculum_overlap_pct: 0.02 -> 2% overlap of each stage length
-    stage_overlap: 20                # 20 episode overlap between stages (legacy)
+    stage_overlap: 50                # 50 episode overlap for gradual transition
     # Optional proportional overlap (fraction of stage length). Use instead of stage_overlap.
-    # curriculum_overlap_pct: 0.02
+    # curriculum_overlap_pct: 0.05
     
-  # Reward shaping system
+  # Reward shaping system - ALIGNED WITH MIGRATION GOAL
   reward_shaping:
     enable_progressive_shaping: true  # Enable progressive reward shaping
     stage_specific_bonuses: true     # Enable stage-specific bonus rewards
     milestone_rewards: true          # Enable milestone achievement rewards
     
-    # Milestone definitions
+    # Milestone definitions - FOCUSED ON MIGRATION PROGRESS
     milestones:
-      first_successful_navigation: 50.0    # Bonus for first successful navigation
-      first_successful_spawn: 30.0         # Bonus for first successful spawn
-      first_successful_deletion: 25.0      # Bonus for first successful deletion
-      first_long_episode: 40.0             # Bonus for first 30+ step episode
-      boundary_violation_free: 60.0        # Bonus for episode without violations
-      task_completion: 100.0               # Bonus for completing the task
+      first_survival_50_steps: 30.0        # Bonus for first 50+ step episode (Stage 1)
+      first_survival_100_steps: 50.0       # Bonus for first 100+ step episode (Stage 2)
+      first_rightward_50_units: 40.0       # Bonus for reaching 50 units right (Stage 1)
+      first_rightward_150_units: 60.0      # Bonus for reaching 150 units (25%) (Stage 2)
+      first_rightward_300_units: 100.0     # Bonus for reaching 300 units (50%) (Stage 2)
+      first_rightward_450_units: 150.0     # Bonus for reaching 450 units (75%) (Stage 3)
+      boundary_violation_free: 40.0        # Bonus for episode without violations
+      first_milestone_25_percent: 80.0     # Bonus for triggering first 25% milestone
+      first_milestone_50_percent: 120.0    # Bonus for triggering first 50% milestone
+      first_milestone_75_percent: 180.0    # Bonus for triggering first 75% milestone
+      first_milestone_90_percent: 250.0    # Bonus for triggering first 90% milestone
+      task_completion: 300.0               # HUGE bonus for first goal completion!
   
   # Loss weighting and optimization
-  entropy_bonus_coeff: 0.1        # INCREASED from 0.01 for more exploration bonus
+  entropy_bonus_coeff: 0.02        # INCREASED from 0.01 for more exploration bonus
   weight_momentum: 0.9
   normalize_weights_every: 10
   
@@ -240,17 +261,21 @@ trainer:
 # DurotaxisEnv Configuration
 # ============================================================================
 environment:
-  # Basic environment parameters
-  substrate_size: [200, 200]
+  # Basic environment parameters - EXPANDED for successful migration
+  substrate_size: [600, 400]  # Much larger substrate (3x width)
   substrate_type: 'linear'
   substrate_params:
     m: 0.01
     b: 1.0
   
-  # Node and topology parameters
-  init_num_nodes: 1
-  max_critical_nodes: 50
-  threshold_critical_nodes: 200
+  # Node and topology parameters - RELAXED for learning
+  init_num_nodes: 3           # Start with more nodes for stability
+  max_critical_nodes: 75      # Allow more nodes
+  threshold_critical_nodes: 250  # Higher threshold before termination
+  max_steps: 1000             # Much more time to reach goal
+  
+  # Termination behavior - RELAXED for exploration
+  consecutive_left_moves_limit: 30  # More forgiving (was implicitly 6)
   
   # ============================================================================
   # CURRICULUM-SPECIFIC ENVIRONMENT SETTINGS
@@ -286,19 +311,21 @@ environment:
   flush_delay: 0.0001
   enable_visualization: false
   
-  # Reward structure - Graph rewards (Base values - modified by curriculum)
+  # Reward structure - Graph rewards (OPTIMIZED for migration success)
   graph_rewards:
-    connectivity_penalty: 2.0     # Base penalty (curriculum multipliers apply)
-    growth_penalty: 2.0           # Base penalty (curriculum multipliers apply) 
-    survival_reward: 0.5          # Base reward (curriculum multipliers apply)
-    action_reward: 0.1            # Base reward (curriculum multipliers apply)
+    connectivity_penalty: 5.0     # Moderate penalty for losing connectivity
+    growth_penalty: 5.0           # Moderate penalty for excessive growth
+    survival_reward: 0.1          # Reward for each step survived
+    action_reward: 0.01           # Small reward for taking actions
+    centroid_movement_reward: 2.0 # NEW: Strong reward for collective rightward movement
   
-  # Reward structure - Node rewards (Base values - modified by curriculum)
+  # Reward structure - Node rewards (OPTIMIZED for migration)
   node_rewards:
-    movement_reward: 0.1          # Base reward (curriculum multipliers apply)
-    intensity_penalty: 2.0        # Base penalty (curriculum multipliers apply)
-    intensity_bonus: 0.1          # Base bonus (curriculum multipliers apply)
-    substrate_reward: 0.2         # Base reward (curriculum multipliers apply)
+    movement_reward: 2.0          # HUGE rightward movement incentive
+    leftward_penalty: 1.0         # NEW: Penalty for leftward movement
+    intensity_penalty: 0.5        # REDUCED 75%: Very gentle for exploration
+    intensity_bonus: 1.5          # INCREASED 15x: Strong bonus for good positions
+    substrate_reward: 0.3         # Increased substrate interaction reward
   
   # Curriculum-specific reward bonuses
   curriculum_rewards:
@@ -344,21 +371,30 @@ environment:
     left_edge_penalty: 0.2        # Penalty for being near left edge
     edge_position_penalty: 0.1    # Penalty for being near top/bottom edges
   
-  # Reward structure - Termination rewards
+  # Reward structure - Termination rewards (OPTIMIZED for learning)
   termination_rewards:
-    success_reward: 100.0         # Large reward for reaching rightmost location
-    out_of_bounds_penalty: -15.0  # Reduced from -30.0 for gentler learning
-    no_nodes_penalty: -15.0       # Reduced from -30.0 for gentler learning
-    leftward_drift_penalty: -15.0 # Reduced from -30.0 for gentler learning
-    timeout_penalty: -5.0         # Reduced from -10.0 for gentler learning
-    critical_nodes_penalty: -12.5 # Reduced from -25.0 for gentler learning
-    
-  # NEW: Node survival rewards to encourage maintenance
-  survival_rewards:
-    node_maintenance_bonus: 0.1   # Bonus per step for maintaining nodes
-    episode_length_bonus: 0.05    # Bonus multiplier for longer episodes
-    connectivity_bonus: 0.2       # Bonus for maintaining connectivity
-    multi_node_bonus: 0.15        # Extra bonus for maintaining multiple nodes
+    success_reward: 500.0         # MASSIVE reward for reaching goal (5x increase)
+    out_of_bounds_penalty: -100.0 # SEVERE penalty to discourage boundary violations
+    no_nodes_penalty: -100.0      # SEVERE penalty to discourage losing all nodes
+    leftward_drift_penalty: -50.0 # Strong penalty for persistent leftward movement
+    timeout_penalty: 0.0          # NO penalty for timeout (exploration is good!)
+    critical_nodes_penalty: -15.0 # Moderate penalty
+  
+  # NEW: Progressive milestone rewards for reaching distance thresholds
+  milestone_rewards:
+    enabled: true
+    distance_25_percent: 25.0     # Reward for reaching 25% of substrate width
+    distance_50_percent: 50.0     # Reward for reaching 50% of substrate width
+    distance_75_percent: 100.0    # Reward for reaching 75% of substrate width
+    distance_90_percent: 200.0    # Huge reward for almost reaching goal
+  
+  # NEW: Time-based survival rewards (encourage longevity)
+  survival_reward_config:
+    enabled: true
+    base_reward: 0.02            # Reward per step for staying alive
+    bonus_threshold: 100         # After 100 steps, give bonus
+    bonus_reward: 0.05           # Additional reward after threshold
+    max_step_factor: 0.8         # Scale rewards up to 80% of max_steps
 
 # ============================================================================
 # GraphInputEncoder Configuration
@@ -401,12 +437,12 @@ algorithm:
   gae_lambda: 0.95              # GAE lambda parameter
   
   # PPO (Proximal Policy Optimization) parameters
-  ppo_epochs: 1                 # Number of PPO epochs per update
-  clip_epsilon: 0.2             # PPO clipping parameter
-  value_loss_coeff: 1.0         # Increased from 0.5 for better value estimation
+  ppo_epochs: 4                 # Number of PPO epochs per update
+  clip_epsilon: 0.1             # PPO clipping parameter
+  value_loss_coeff: 0.5         # Increased from 0.5 for better value estimation
   
   # Optimization parameters
-  max_grad_norm: 1.0            # Increased from 0.5 for less aggressive clipping
+  max_grad_norm: 0.5            # Increased from 0.5 for less aggressive clipping
 
 # ============================================================================
 # Device and Performance Configuration
@@ -439,28 +475,27 @@ experimental:
   # Substrate variation
   substrate_variation: true     # Enable substrate parameter variation during training
   
-  # NEW: Curriculum learning system - ENABLED FOR BETTER LEARNING
+  # CURRICULUM LEARNING - Now using advanced 3-stage system from trainer section
+  # The old simple 3-phase system is DEPRECATED and replaced by the comprehensive
+  # curriculum_learning configuration in the trainer section above.
+  # That system includes reward multipliers, milestone tracking, and adaptive progression.
   curriculum_learning:
-    enable_curriculum: true           # Enable curriculum learning
-    phase_1_episodes: 60             # Easy phase: focus on node maintenance (reduced for experiment)
-    phase_2_episodes: 120            # Medium phase: balanced learning (reduced for experiment)
-    # Phase 3: remaining episodes with full complexity
-    
-    # Phase-specific configurations
+    enable_curriculum: false          # DISABLED: Use trainer curriculum instead
+    # Legacy phase configuration kept for reference but not used
+    phase_1_episodes: 60
+    phase_2_episodes: 120
     phase_1_config:
-      max_critical_nodes: 30          # Reduced complexity
-      init_num_nodes: 3               # Start with more nodes
-      no_nodes_penalty_multiplier: 0.5  # Reduced harsh penalties
-      
+      max_critical_nodes: 30
+      init_num_nodes: 3
+      no_nodes_penalty_multiplier: 0.5
     phase_2_config:
-      max_critical_nodes: 40          # Gradual increase
-      init_num_nodes: 2               # Moderate start
-      no_nodes_penalty_multiplier: 0.75 # Gradual penalty increase
-      
+      max_critical_nodes: 40
+      init_num_nodes: 2
+      no_nodes_penalty_multiplier: 0.75
     phase_3_config:
-      max_critical_nodes: 50          # Full complexity
-      init_num_nodes: 1               # Standard start
-      no_nodes_penalty_multiplier: 1.0  # Full penalties
+      max_critical_nodes: 50
+      init_num_nodes: 1
+      no_nodes_penalty_multiplier: 1.0
   
   # NEW: Enhanced success criteria
   success_criteria:
