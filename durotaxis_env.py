@@ -315,8 +315,22 @@ class DurotaxisEnv(gym.Env):
         self.left_edge_penalty = self.position_rewards['left_edge_penalty']
         self.edge_position_penalty = self.position_rewards['edge_position_penalty']
         
+        # Enhanced boundary avoidance parameters
+        self.danger_zone_penalty = self.position_rewards.get('danger_zone_penalty', 2.0)
+        self.critical_zone_penalty = self.position_rewards.get('critical_zone_penalty', 5.0)
+        self.edge_zone_threshold = self.position_rewards.get('edge_zone_threshold', 0.15)
+        self.danger_zone_threshold = self.position_rewards.get('danger_zone_threshold', 0.08)
+        self.critical_zone_threshold = self.position_rewards.get('critical_zone_threshold', 0.03)
+        self.safe_center_bonus = self.position_rewards.get('safe_center_bonus', 0.05)
+        self.safe_center_range = self.position_rewards.get('safe_center_range', 0.30)
+        
         self.spawn_success_reward = self.spawn_rewards['spawn_success_reward']
         self.spawn_failure_penalty = self.spawn_rewards['spawn_failure_penalty']
+        
+        # Boundary-aware spawn penalties
+        self.spawn_near_boundary_penalty = self.spawn_rewards.get('spawn_near_boundary_penalty', 3.0)
+        self.spawn_in_danger_zone_penalty = self.spawn_rewards.get('spawn_in_danger_zone_penalty', 8.0)
+        self.spawn_boundary_check = self.spawn_rewards.get('spawn_boundary_check', True)
         
         self.success_reward = self.termination_rewards['success_reward']
         self.out_of_bounds_penalty = self.termination_rewards['out_of_bounds_penalty']
@@ -903,13 +917,38 @@ class DurotaxisEnv(gym.Env):
             'reward_breakdown': reward_components  # Detailed reward information as dictionary
         }
         
-        # 📊 One-line performance summary
+        # 📊 One-line performance summary with boundary warnings
         centroid_x = new_state.get('graph_features', [0, 0, 0, 0])[3] if new_state['num_nodes'] > 0 else 0
         centroid_direction = "→" if len(self.centroid_history) >= 2 and centroid_x > self.centroid_history[-2] else "←" if len(self.centroid_history) >= 2 and centroid_x < self.centroid_history[-2] else "="
         spawn_r = reward_components.get('spawn_reward', 0)
         node_r = reward_components.get('total_node_reward', 0)
         edge_r = reward_components.get('edge_reward', 0)
-        print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction} | A={len(executed_actions):2d} | T={terminated} {truncated}")
+        
+        # Check if any nodes are in boundary danger zones
+        boundary_warning = ""
+        if new_state['num_nodes'] > 0:
+            node_features = new_state['node_features']
+            substrate_height = self.substrate.height
+            nodes_in_danger = 0
+            nodes_in_critical = 0
+            
+            for i in range(new_state['num_nodes']):
+                y_pos = node_features[i][1].item()
+                dist_from_top = y_pos / substrate_height
+                dist_from_bottom = (substrate_height - y_pos) / substrate_height
+                min_dist = min(dist_from_top, dist_from_bottom)
+                
+                if min_dist < self.critical_zone_threshold:
+                    nodes_in_critical += 1
+                elif min_dist < self.danger_zone_threshold:
+                    nodes_in_danger += 1
+            
+            if nodes_in_critical > 0:
+                boundary_warning = f" 🚨CRITICAL:{nodes_in_critical}"
+            elif nodes_in_danger > 0:
+                boundary_warning = f" ⚠️DANGER:{nodes_in_danger}"
+        
+        print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction}{boundary_warning} | A={len(executed_actions):2d} | T={terminated} {truncated}")
         
         # Auto-render after each step to ensure visualization is always updated
         # This ensures visualization works consistently
@@ -1001,7 +1040,7 @@ class DurotaxisEnv(gym.Env):
                 boundary_rewards = np.where(boundary_flags > 0.5, self.boundary_bonus, 0.0)  # [num_nodes]
                 node_rewards_vec += boundary_rewards
             
-            # 4. VECTORIZED Positional penalties (avoid substrate edges)
+            # 4. VECTORIZED Positional penalties (avoid substrate edges) - ENHANCED BOUNDARY AVOIDANCE
             substrate_width = self.substrate.width
             substrate_height = self.substrate.height
             
@@ -1010,11 +1049,43 @@ class DurotaxisEnv(gym.Env):
             left_edge_penalties = np.where(left_edge_mask, -self.left_edge_penalty, 0.0)  # [num_nodes]
             node_rewards_vec += left_edge_penalties
             
-            # Top/bottom edge penalty - VECTORIZED  
-            top_bottom_mask = ((node_positions[:, 1] < substrate_height * 0.1) | 
-                              (node_positions[:, 1] > substrate_height * 0.9))  # [num_nodes]
-            edge_penalties = np.where(top_bottom_mask, -self.edge_position_penalty, 0.0)  # [num_nodes]
-            node_rewards_vec += edge_penalties
+            # ENHANCED: Progressive top/bottom edge penalties - VECTORIZED
+            # Calculate distance from top and bottom boundaries
+            y_positions = node_positions[:, 1]  # [num_nodes]
+            dist_from_top = y_positions / substrate_height  # 0.0 = top, 1.0 = bottom
+            dist_from_bottom = (substrate_height - y_positions) / substrate_height  # 0.0 = bottom, 1.0 = top
+            
+            # Get minimum distance to either boundary (0.0 = at boundary, 0.5 = center)
+            min_dist_to_boundary = np.minimum(dist_from_top, dist_from_bottom)  # [num_nodes]
+            
+            # Define zone thresholds
+            edge_threshold = self.edge_zone_threshold      # 15% - edge zone
+            danger_threshold = self.danger_zone_threshold  # 8% - danger zone
+            critical_threshold = self.critical_zone_threshold  # 3% - critical zone
+            safe_center_range = self.safe_center_range     # 30% - safe center
+            
+            # Progressive penalties based on proximity to boundary
+            boundary_penalties = np.zeros(num_nodes, dtype=np.float32)
+            
+            # Critical zone: SEVERE penalty (within 3% of boundary)
+            critical_mask = min_dist_to_boundary < critical_threshold
+            boundary_penalties = np.where(critical_mask, -self.critical_zone_penalty, boundary_penalties)
+            
+            # Danger zone: Strong penalty (within 8% of boundary)
+            danger_mask = (min_dist_to_boundary >= critical_threshold) & (min_dist_to_boundary < danger_threshold)
+            boundary_penalties = np.where(danger_mask, -self.danger_zone_penalty, boundary_penalties)
+            
+            # Edge zone: Moderate penalty (within 15% of boundary)
+            edge_mask = (min_dist_to_boundary >= danger_threshold) & (min_dist_to_boundary < edge_threshold)
+            boundary_penalties = np.where(edge_mask, -self.edge_position_penalty, boundary_penalties)
+            
+            # Safe center zone: Small bonus (center 30% of height)
+            center_dist = np.abs(y_positions - substrate_height/2) / (substrate_height/2)  # 0.0 = center, 1.0 = edge
+            safe_center_mask = center_dist < safe_center_range
+            safe_center_rewards = np.where(safe_center_mask, self.safe_center_bonus, 0.0)
+            
+            node_rewards_vec += boundary_penalties
+            node_rewards_vec += safe_center_rewards
             
             # 5. Per-node intensity comparison (requires loop for complexity)
             if self.dequeued_topology is not None and node_features_np.shape[1] > 2:
@@ -1222,13 +1293,34 @@ class DurotaxisEnv(gym.Env):
                         # Get substrate intensity (3rd feature, index 2)
                         if len(node_feature_vector) > 2:
                             new_node_intensity = node_feature_vector[2].item()
+                            new_node_pos = node_feature_vector[:2]  # x, y coordinates
+                            new_node_y = new_node_pos[1].item()
+                            
+                            # Check if spawned near boundary (boundary-aware spawning)
+                            if self.spawn_boundary_check:
+                                substrate_height = self.substrate.height
+                                
+                                # Calculate distance from top/bottom boundaries
+                                dist_from_top = new_node_y / substrate_height
+                                dist_from_bottom = (substrate_height - new_node_y) / substrate_height
+                                min_dist_to_boundary = min(dist_from_top, dist_from_bottom)
+                                
+                                # Apply penalties for spawning near boundaries
+                                if min_dist_to_boundary < self.danger_zone_threshold:  # Within 8% - danger zone
+                                    spawn_reward -= self.spawn_in_danger_zone_penalty
+                                    # print(f"⚠️ Spawn in DANGER ZONE! Y={new_node_y:.1f}, "
+                                    #       f"dist={min_dist_to_boundary:.2%} < {self.danger_zone_threshold:.2%}, "
+                                    #       f"penalty: -{self.spawn_in_danger_zone_penalty}")
+                                elif min_dist_to_boundary < self.edge_zone_threshold:  # Within 15% - edge zone
+                                    spawn_reward -= self.spawn_near_boundary_penalty
+                                    # print(f"⚠️ Spawn near boundary! Y={new_node_y:.1f}, "
+                                    #       f"dist={min_dist_to_boundary:.2%} < {self.edge_zone_threshold:.2%}, "
+                                    #       f"penalty: -{self.spawn_near_boundary_penalty}")
                             
                             # Find parent node from previous state by checking actions
                             # For now, we'll use spatial proximity as backup
                             best_parent_intensity = None
                             min_distance = float('inf')
-                            
-                            new_node_pos = node_feature_vector[:2]  # x, y coordinates
                             
                             # Check against previous state nodes
                             if 'node_features' in prev_state:
@@ -1820,6 +1912,20 @@ class DurotaxisEnv(gym.Env):
         
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)
+        
+        # Verify initial centroid is in safe center zone
+        if self.init_num_nodes > 0:
+            initial_state = self.state_extractor.get_state_features(include_substrate=True)
+            if initial_state['num_nodes'] > 0:
+                initial_centroid_y = initial_state['graph_features'][4].item()  # Centroid Y
+                substrate_height = self.substrate.height
+                y_percentage = (initial_centroid_y / substrate_height) * 100
+                
+                # Check if in safe zone (40-60%)
+                in_safe_zone = 40 <= y_percentage <= 60
+                zone_indicator = "✅" if in_safe_zone else "⚠️"
+                
+                print(f"   {zone_indicator} Initial centroid Y: {initial_centroid_y:.1f} ({y_percentage:.1f}% of height) - {'SAFE CENTER' if in_safe_zone else 'NOT CENTERED'}")
         
         # Initialize to_delete flags for all nodes to 0 (not marked for deletion)
         self._clear_all_to_delete_flags()
