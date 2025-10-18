@@ -355,21 +355,39 @@ environment:
     rightward_bonus: 0.5          # INCREASED from 0.1 for better directional incentive
     leftward_penalty: 0.05        # REDUCED from 0.1 for gentler penalty
   
-  # Reward structure - Spawn rewards
+  # Reward structure - Spawn rewards (ENHANCED for boundary-safe spawning)
   spawn_rewards:
     spawn_success_reward: 1.0     # Reward for successful durotaxis spawning
     spawn_failure_penalty: 1.0    # Penalty for failed durotaxis spawning
+    
+    # NEW: Boundary-aware spawn penalties
+    spawn_near_boundary_penalty: 3.0  # Strong penalty for spawning nodes near boundaries
+    spawn_in_danger_zone_penalty: 8.0 # SEVERE penalty for spawning in danger zone
+    spawn_boundary_check: true    # Enable boundary checking for new spawns
   
   # Reward structure - Delete rewards
   delete_reward:
     proper_deletion: 2.0          # Reward for proper node deletion
     persistence_penalty: 2.0      # Penalty for inappropriate persistence
   
-  # Reward structure - Position rewards
+  # Reward structure - Position rewards (ENHANCED for boundary avoidance)
   position_rewards:
-    boundary_bonus: 0.1           # Bonus for boundary/frontier nodes
+    boundary_bonus: 0.1           # Bonus for boundary/frontier nodes (horizontal edges only)
     left_edge_penalty: 0.2        # Penalty for being near left edge
-    edge_position_penalty: 0.1    # Penalty for being near top/bottom edges
+    
+    # ENHANCED: Progressive penalties for approaching top/bottom boundaries
+    edge_position_penalty: 0.5    # Base penalty for being near top/bottom edges (INCREASED 5x)
+    danger_zone_penalty: 2.0      # NEW: Strong penalty for danger zone (very close to boundary)
+    critical_zone_penalty: 5.0    # NEW: SEVERE penalty for critical zone (about to violate)
+    
+    # Boundary zone thresholds (as percentage of substrate height)
+    edge_zone_threshold: 0.15     # Within 15% of top/bottom = edge zone
+    danger_zone_threshold: 0.08   # Within 8% of top/bottom = danger zone  
+    critical_zone_threshold: 0.03 # Within 3% of top/bottom = critical zone
+    
+    # Safe zone rewards (encourage staying in center)
+    safe_center_bonus: 0.05       # NEW: Small bonus for staying in safe center zone
+    safe_center_range: 0.30       # Center 30% of height is "safe zone"
   
   # Reward structure - Termination rewards (OPTIMIZED for learning)
   termination_rewards:
