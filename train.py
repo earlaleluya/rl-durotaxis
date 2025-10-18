@@ -1512,6 +1512,11 @@ class DurotaxisTrainer:
                 # Get node data from the graph
                 node_data = graph.ndata
                 
+                # Initialize centroid calculation variables
+                centroid_x_sum = 0.0
+                centroid_y_sum = 0.0
+                valid_position_count = 0
+                
                 for node_id in range(num_nodes):
                     node_info = {
                         'node_id': int(node_id),
@@ -1536,9 +1541,17 @@ class DurotaxisTrainer:
                             if len(pos) >= 2:
                                 node_info['position']['x'] = float(pos[0])
                                 node_info['position']['y'] = float(pos[1])
+                                # Accumulate for centroid calculation
+                                centroid_x_sum += node_info['position']['x']
+                                centroid_y_sum += node_info['position']['y']
+                                valid_position_count += 1
                         elif 'x' in node_data and 'y' in node_data:
                             node_info['position']['x'] = float(node_data['x'][node_id])
                             node_info['position']['y'] = float(node_data['y'][node_id])
+                            # Accumulate for centroid calculation
+                            centroid_x_sum += node_info['position']['x']
+                            centroid_y_sum += node_info['position']['y']
+                            valid_position_count += 1
                     
                     # Add spawn parameters if enabled
                     if self.log_spawn_parameters:
@@ -1595,6 +1608,29 @@ class DurotaxisTrainer:
                             node_info['substrate_value'] = 0.0
                     
                     detailed_data['nodes'].append(node_info)
+                
+                # Calculate and add graph centroid
+                if valid_position_count > 0:
+                    centroid_x = centroid_x_sum / valid_position_count
+                    centroid_y = centroid_y_sum / valid_position_count
+                    detailed_data['graph_info']['centroid'] = {
+                        'x': float(centroid_x),
+                        'y': float(centroid_y),
+                        'node_count': valid_position_count
+                    }
+                else:
+                    detailed_data['graph_info']['centroid'] = {
+                        'x': 0.0,
+                        'y': 0.0,
+                        'node_count': 0
+                    }
+            else:
+                # No nodes - set centroid to origin
+                detailed_data['graph_info']['centroid'] = {
+                    'x': 0.0,
+                    'y': 0.0,
+                    'node_count': 0
+                }
         
         except Exception as e:
             # Log error but don't fail training
