@@ -2821,8 +2821,7 @@ class DurotaxisTrainer:
     
     def train(self):
         """Main training loop with batch updates"""
-        # Create run directory for this training session
-        self.run_dir = self.create_run_directory(self.save_dir)
+        # Run directory already created in __init__, just confirm it exists
         print(f"🏋️ Starting training for {self.total_episodes} episodes (Run #{self.run_number:04d})")
         print(f"📁 Saving to: {self.run_dir}")
         print(f"📊 Batch Training: {self.rollout_batch_size} episodes per batch, {self.update_epochs} update epochs, {self.minibatch_size} minibatch size")
