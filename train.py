@@ -487,10 +487,14 @@ class DurotaxisTrainer:
         # Get environment configuration
         env_config = self.config_loader.get_environment_config()
         
-        # Environment setup
+        # Environment setup (propagate empty-graph recovery preferences)
+        env_overrides = dict(overrides)
+        env_overrides.setdefault('empty_graph_recovery_enabled', self.enable_graceful_recovery)
+        env_overrides.setdefault('empty_graph_recovery_nodes', self.recovery_num_nodes)
+
         self.env = DurotaxisEnv(
             config_path=config_path,
-            **overrides  # Allow overrides for environment parameters too
+            **env_overrides  # Allow overrides for environment parameters too
         )
         
         # Initialize substrate based on type
@@ -2195,6 +2199,10 @@ class DurotaxisTrainer:
             # Environment step
             next_obs, reward_components, terminated, truncated, info = self.env.step(0)
             done = terminated or truncated
+
+            # Track environment-side empty graph recoveries for logging consistency
+            if info.get('empty_graph_recovered'):
+                self.empty_graph_recovery_count += 1
 
             # Enhanced milestone-based reward shaping
             if 'milestone_bonus' not in reward_components:

@@ -338,6 +338,29 @@ class DurotaxisEnv(gym.Env):
         self.leftward_drift_penalty = self.termination_rewards['leftward_drift_penalty']
         self.timeout_penalty = self.termination_rewards['timeout_penalty']
         self.critical_nodes_penalty = self.termination_rewards['critical_nodes_penalty']
+
+        # Empty-graph recovery configuration (prevent instant termination when possible)
+        default_recovery_penalty = self.no_nodes_penalty * 0.5 if self.no_nodes_penalty < 0 else -abs(self.no_nodes_penalty)
+        recovery_config = config.get('empty_graph_recovery', {})
+        self.enable_empty_graph_recovery = config.get(
+            'empty_graph_recovery_enabled',
+            recovery_config.get('enabled', True)
+        )
+        recovery_nodes = config.get(
+            'empty_graph_recovery_nodes',
+            recovery_config.get('spawn_nodes', max(1, self.init_num_nodes))
+        )
+        self.empty_graph_recovery_nodes = max(1, int(recovery_nodes))
+        recovery_penalty_cfg = config.get(
+            'empty_graph_recovery_penalty',
+            recovery_config.get('penalty', default_recovery_penalty)
+        )
+        self.empty_graph_recovery_penalty = recovery_penalty_cfg if recovery_penalty_cfg <= 0 else -abs(recovery_penalty_cfg)
+        self.empty_graph_recovery_max_attempts = config.get(
+            'empty_graph_recovery_max_attempts',
+            recovery_config.get('max_attempts', 2)
+        )
+        self.empty_graph_recovery_noise = recovery_config.get('position_noise', 5.0)
         
         self.survival_reward_config = config.get('survival_reward_config', {'enabled': False})
         self.milestone_rewards = config.get('milestone_rewards', {'enabled': False})
@@ -374,6 +397,12 @@ class DurotaxisEnv(gym.Env):
         # Node-level reward tracking
         self.prev_node_positions = []  # Store previous node positions for movement rewards
         self.last_reward_breakdown = None  # Store detailed reward information
+
+        # Empty graph recovery bookkeeping
+        self.empty_graph_recovery_attempts = 0
+        self.empty_graph_recoveries_this_episode = 0
+        self.total_empty_graph_recoveries = 0
+        self.empty_graph_recovery_last_step = None
         
         # Curriculum learning parameters (initialized to defaults)
         self._curriculum_penalty_multiplier = 1.0
@@ -882,12 +911,26 @@ class DurotaxisEnv(gym.Env):
         
         # Get new state
         new_state = self.state_extractor.get_state_features(include_substrate=True)
-        
-        # Get observation from GraphInputEncoder output
+
+        # Attempt graceful recovery if topology collapsed to zero nodes
+        empty_graph_recovered = False
+        if self.enable_empty_graph_recovery and new_state['num_nodes'] == 0:
+            recovered_state = self._recover_empty_graph(prev_state)
+            if recovered_state is not None and recovered_state['num_nodes'] > 0:
+                new_state = recovered_state
+                empty_graph_recovered = True
+
+        # Get observation from GraphInputEncoder output (after any recovery adjustments)
         observation = self._get_encoder_observation(new_state)
         
         # Calculate reward components (returns detailed breakdown)
         reward_components = self._calculate_reward(prev_state, new_state, executed_actions)
+
+        # Apply penalty when empty-graph recovery was needed (discourage aggressive deletions)
+        if empty_graph_recovered:
+            recovery_penalty = self.empty_graph_recovery_penalty
+            reward_components['empty_graph_recovery_penalty'] = recovery_penalty
+            reward_components['total_reward'] += recovery_penalty
         
         # Reset new_node flags after reward calculation (they've served their purpose)
         self._reset_new_node_flags()
@@ -914,7 +957,10 @@ class DurotaxisEnv(gym.Env):
             'actions_taken': len(executed_actions),
             'step': self.current_step,
             'policy_initialized': self._policy_initialized,
-            'reward_breakdown': reward_components  # Detailed reward information as dictionary
+            'reward_breakdown': reward_components,  # Detailed reward information as dictionary
+            'empty_graph_recovered': empty_graph_recovered,
+            'empty_graph_recovery_attempts': self.empty_graph_recovery_attempts,
+            'empty_graph_recoveries_this_episode': self.empty_graph_recoveries_this_episode
         }
         
         # 📊 One-line performance summary with boundary warnings
@@ -948,7 +994,14 @@ class DurotaxisEnv(gym.Env):
             elif nodes_in_danger > 0:
                 boundary_warning = f" ⚠️DANGER:{nodes_in_danger}"
         
-        print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction}{boundary_warning} | A={len(executed_actions):2d} | T={terminated} {truncated}")
+        recovery_flag = " ♻️" if empty_graph_recovered else ""
+        print(
+            f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
+            f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
+            f"R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | "
+            f"C={centroid_x:5.1f}{centroid_direction}{boundary_warning}{recovery_flag} | "
+            f"A={len(executed_actions):2d} | T={terminated} {truncated}"
+        )
         
         # Auto-render after each step to ensure visualization is always updated
         # This ensures visualization works consistently
@@ -1175,6 +1228,77 @@ class DurotaxisEnv(gym.Env):
         self.last_reward_breakdown = reward_breakdown
         
         return reward_breakdown
+
+    def _recover_empty_graph(self, prev_state):
+        """Attempt to recover from an empty topology without terminating the episode."""
+        if self.empty_graph_recovery_max_attempts <= 0:
+            return None
+        if self.empty_graph_recovery_attempts >= self.empty_graph_recovery_max_attempts:
+            print(f"⚠️  Empty graph recovery skipped: max attempts reached ({self.empty_graph_recovery_max_attempts})")
+            return None
+
+        self.empty_graph_recovery_attempts += 1
+        self.empty_graph_recoveries_this_episode += 1
+        self.total_empty_graph_recoveries += 1
+        self.empty_graph_recovery_last_step = self.current_step
+
+        spawn_nodes = max(1, int(self.empty_graph_recovery_nodes))
+        print(
+            f"♻️  Empty graph recovery triggered at step {self.current_step} "
+            f"(attempt {self.empty_graph_recovery_attempts}/{self.empty_graph_recovery_max_attempts}) — respawning {spawn_nodes} node(s)"
+        )
+
+        # Reset topology with minimal nodes then reposition near previous centroid if possible
+        self.topology.reset(init_num_nodes=spawn_nodes)
+
+        if prev_state is not None and prev_state.get('num_nodes', 0) > 0:
+            self._reposition_recovered_nodes(prev_state)
+
+        # Clear deletion flags and reset trackers to align with new graph
+        self._clear_all_to_delete_flags()
+        self.prev_node_positions = []
+        self.topology_history = []
+        self.dequeued_topology = None
+
+        # Ensure state extractor references the updated topology
+        if hasattr(self, 'state_extractor'):
+            self.state_extractor.set_topology(self.topology)
+
+        return self.state_extractor.get_state_features(include_substrate=True)
+
+    def _reposition_recovered_nodes(self, prev_state):
+        """Shift recovered nodes near the previous centroid to preserve spatial continuity."""
+        if self.topology.graph.num_nodes() == 0:
+            return
+
+        try:
+            prev_graph_features = prev_state.get('graph_features')
+            if isinstance(prev_graph_features, torch.Tensor):
+                target_centroid = prev_graph_features[3:5].detach().cpu()
+            else:
+                target_centroid = torch.tensor(prev_graph_features[3:5], dtype=torch.float32)
+        except Exception as exc:
+            print(f"⚠️  Empty graph recovery repositioning failed: {exc}")
+            return
+
+        positions = self.topology.graph.ndata['pos']
+        current_centroid = positions.mean(dim=0)
+        shift = target_centroid.to(positions.device) - current_centroid
+        adjusted_positions = positions + shift
+
+        if self.empty_graph_recovery_noise and self.empty_graph_recovery_noise > 0:
+            noise = torch.empty_like(adjusted_positions).uniform_(
+                -self.empty_graph_recovery_noise,
+                self.empty_graph_recovery_noise
+            )
+            adjusted_positions = adjusted_positions + noise
+
+        width = float(self.substrate.width)
+        height = float(self.substrate.height)
+        adjusted_positions[:, 0] = torch.clamp(adjusted_positions[:, 0], 0.0, max(width - 1e-3, 0.0))
+        adjusted_positions[:, 1] = torch.clamp(adjusted_positions[:, 1], 0.0, max(height - 1e-3, 0.0))
+
+        self.topology.graph.ndata['pos'] = adjusted_positions
 
     def _calculate_centroid_movement_reward(self, prev_state, new_state):
         """
@@ -1909,6 +2033,11 @@ class DurotaxisEnv(gym.Env):
         
         # Reset milestone tracking for new episode
         self._milestones_reached = set()
+
+        # Reset empty-graph recovery tracking for new episode
+        self.empty_graph_recovery_attempts = 0
+        self.empty_graph_recoveries_this_episode = 0
+        self.empty_graph_recovery_last_step = None
         
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)

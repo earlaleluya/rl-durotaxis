@@ -170,6 +170,27 @@ class Topology:
             curr_pos = self.graph.ndata['pos'][curr_node_id].numpy()
             # Compute new node position
             x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
+
+            # Keep spawned nodes inside substrate bounds to avoid instant termination
+            if hasattr(self.substrate, 'width') and hasattr(self.substrate, 'height'):
+                width = float(self.substrate.width)
+                height = float(self.substrate.height)
+                # Small safety margin prevents hugging boundaries (helps boundary penalties work proactively)
+                margin_x = max(2.0, 0.01 * width)
+                margin_y = max(2.0, 0.01 * height)
+
+                # Reflect positions that exit bounds back into the safe zone
+                if x < margin_x:
+                    # If spawn aimed left, mirror it just inside the margin
+                    x = margin_x
+                elif x > width - margin_x:
+                    x = width - margin_x
+
+                if y < margin_y:
+                    y = margin_y
+                elif y > height - margin_y:
+                    y = height - margin_y
+
             new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
             
             # Store current graph state before modification
