@@ -170,6 +170,27 @@ class Topology:
             curr_pos = self.graph.ndata['pos'][curr_node_id].numpy()
             # Compute new node position
             x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
+
+            # Keep spawned nodes inside substrate bounds to avoid instant termination
+            if hasattr(self.substrate, 'width') and hasattr(self.substrate, 'height'):
+                width = float(self.substrate.width)
+                height = float(self.substrate.height)
+                # Small safety margin prevents hugging boundaries (helps boundary penalties work proactively)
+                margin_x = max(2.0, 0.01 * width)
+                margin_y = max(2.0, 0.01 * height)
+
+                # Reflect positions that exit bounds back into the safe zone
+                if x < margin_x:
+                    # If spawn aimed left, mirror it just inside the margin
+                    x = margin_x
+                elif x > width - margin_x:
+                    x = width - margin_x
+
+                if y < margin_y:
+                    y = margin_y
+                elif y > height - margin_y:
+                    y = height - margin_y
+
             new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
             
             # Store current graph state before modification
@@ -357,13 +378,24 @@ class Topology:
         positions = self.graph.ndata['pos'].numpy()
         
         try:
+            # Suppress qhull warnings by checking for collinearity first
+            # Check if all x-coordinates are the same
+            x_coords = positions[:, 0]
+            y_coords = positions[:, 1]
+            
+            x_unique = len(np.unique(x_coords)) > 1
+            y_unique = len(np.unique(y_coords)) > 1
+            
+            # If points are collinear or degenerate, use fallback
+            if not (x_unique and y_unique):
+                return self._get_extreme_nodes()
+            
             # Compute convex hull
             hull = ConvexHull(positions)
             # Return the indices of vertices that form the convex hull
             return hull.vertices.tolist()
-        except Exception as e:
-            print(f"Error computing convex hull: {e}")
-            # Fallback: return nodes with extreme coordinates
+        except Exception:
+            # Silently fallback to extreme nodes (no verbose error printing)
             return self._get_extreme_nodes()
     
     
@@ -391,8 +423,16 @@ class Topology:
         Reset topology with initial nodes positioned in a specific substrate region.
         
         Creates a new graph with the specified number of initial nodes, positioned
-        randomly within the leftmost fraction of the substrate (defined by init_bin).
-        Nodes are connected in a left-to-right chain to establish initial connectivity.
+        randomly within the leftmost fraction of the substrate (defined by init_bin)
+        and vertically centered to avoid boundary violations.
+        
+        Initial Node Placement Strategy:
+        - X-axis: Leftmost init_bin fraction (e.g., 0-10% of width)
+        - Y-axis: Centered at 40-60% of substrate height (safe center zone)
+        
+        This centered initialization helps the agent avoid top/bottom boundaries
+        from the start, allowing it to focus on the primary goal of rightward
+        migration without early termination from boundary violations.
         
         Parameters
         ----------
@@ -411,10 +451,23 @@ class Topology:
         Notes
         -----
         Each node gets:
-        - 'pos': 2D position coordinates
+        - 'pos': 2D position coordinates [X: 0-10% width, Y: 40-60% height]
         - 'persistent_id': Unique identifier that persists across operations
         - 'new_node': Flag indicating if node was recently spawned (starts as 0)
         - 'to_delete': Flag for deletion marking (starts as 0)
+        
+        The vertical centering (40-60% height) ensures:
+        - Initial centroid is in safe center zone
+        - No nodes start in edge/danger/critical zones
+        - Agent receives safe_center_bonus from step 1
+        - Reduced early-episode boundary violations
+        
+        Example
+        -------
+        For a 600x400 substrate:
+        - X placement: 0-60 pixels (leftmost 10%)
+        - Y placement: 160-240 pixels (center 40-60%)
+        - Centroid: ~(30, 200) - safe center position
         """
         """
         Reset topology with initial nodes.
@@ -443,13 +496,21 @@ class Topology:
         # Calculate the x-range for initial placement based on init_bin
         max_x = self.substrate.width * init_bin
         
-        # Initialize node positions within the specified bin
+        # Calculate y-range for vertical center placement (40-60% of height)
+        # This helps agent avoid boundaries from the start
+        y_center = self.substrate.height * 0.5  # Center point
+        y_range = self.substrate.height * 0.1   # ±10% from center = 40-60% range
+        min_y = y_center - y_range
+        max_y = y_center + y_range
+        
+        # Initialize node positions within the specified bin (X) and centered vertically (Y)
         positions = []
         persistent_ids = []
         for i in range(init_num_nodes):
-            # Random position within the leftmost init_bin fraction of substrate
+            # Random position within the leftmost init_bin fraction of substrate (X-axis)
             x = np.random.uniform(0, max_x)
-            y = np.random.uniform(0, self.substrate.height)
+            # Random position within center 20% of substrate height (Y-axis: 40-60%)
+            y = np.random.uniform(min_y, max_y)
             positions.append([x, y])
             persistent_ids.append(self._next_persistent_id)
             self._next_persistent_id += 1

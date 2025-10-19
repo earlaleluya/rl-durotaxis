@@ -121,17 +121,17 @@ def extract_parameter_means(data):
     for episode_data in data:
         episodes.append(episode_data['episode'])
         
-        # Extract mean and std values for each parameter
+        # Extract mean and std values for each parameter (handle None/null values)
         params = episode_data['parameters']
-        gamma_means.append(params['gamma']['mean'])
-        alpha_means.append(params['alpha']['mean'])
-        noise_means.append(params['noise']['mean'])
-        theta_means.append(params['theta']['mean'])
+        gamma_means.append(params['gamma']['mean'] if params['gamma']['mean'] is not None else 0.0)
+        alpha_means.append(params['alpha']['mean'] if params['alpha']['mean'] is not None else 0.0)
+        noise_means.append(params['noise']['mean'] if params['noise']['mean'] is not None else 0.0)
+        theta_means.append(params['theta']['mean'] if params['theta']['mean'] is not None else 0.0)
         
-        gamma_stds.append(params['gamma']['std'])
-        alpha_stds.append(params['alpha']['std'])
-        noise_stds.append(params['noise']['std'])
-        theta_stds.append(params['theta']['std'])
+        gamma_stds.append(params['gamma']['std'] if params['gamma']['std'] is not None else 0.0)
+        alpha_stds.append(params['alpha']['std'] if params['alpha']['std'] is not None else 0.0)
+        noise_stds.append(params['noise']['std'] if params['noise']['std'] is not None else 0.0)
+        theta_stds.append(params['theta']['std'] if params['theta']['std'] is not None else 0.0)
     
     return (episodes, gamma_means, alpha_means, noise_means, theta_means,
             gamma_stds, alpha_stds, noise_stds, theta_stds)
@@ -412,22 +412,22 @@ def extract_reward_components(data):
     for episode_data in data:
         episodes.append(episode_data['episode'])
         
-        # Extract mean values for each reward component
+        # Extract mean values for each reward component (handle None/null values)
         rewards = episode_data['reward_components']
-        graph_reward_means.append(rewards['graph_reward']['mean'])
-        spawn_reward_means.append(rewards['spawn_reward']['mean'])
-        delete_reward_means.append(rewards['delete_reward']['mean'])
-        edge_reward_means.append(rewards['edge_reward']['mean'])
-        total_node_reward_means.append(rewards['total_node_reward']['mean'])
-        total_reward_means.append(rewards['total_reward']['mean'])
+        graph_reward_means.append(rewards['graph_reward']['mean'] if rewards['graph_reward']['mean'] is not None else 0.0)
+        spawn_reward_means.append(rewards['spawn_reward']['mean'] if rewards['spawn_reward']['mean'] is not None else 0.0)
+        delete_reward_means.append(rewards['delete_reward']['mean'] if rewards['delete_reward']['mean'] is not None else 0.0)
+        edge_reward_means.append(rewards['edge_reward']['mean'] if rewards['edge_reward']['mean'] is not None else 0.0)
+        total_node_reward_means.append(rewards['total_node_reward']['mean'] if rewards['total_node_reward']['mean'] is not None else 0.0)
+        total_reward_means.append(rewards['total_reward']['mean'] if rewards['total_reward']['mean'] is not None else 0.0)
         
-        # Extract std values for each reward component
-        graph_reward_stds.append(rewards['graph_reward']['std'])
-        spawn_reward_stds.append(rewards['spawn_reward']['std'])
-        delete_reward_stds.append(rewards['delete_reward']['std'])
-        edge_reward_stds.append(rewards['edge_reward']['std'])
-        total_node_reward_stds.append(rewards['total_node_reward']['std'])
-        total_reward_stds.append(rewards['total_reward']['std'])
+        # Extract std values for each reward component (handle None/null values)
+        graph_reward_stds.append(rewards['graph_reward']['std'] if rewards['graph_reward']['std'] is not None else 0.0)
+        spawn_reward_stds.append(rewards['spawn_reward']['std'] if rewards['spawn_reward']['std'] is not None else 0.0)
+        delete_reward_stds.append(rewards['delete_reward']['std'] if rewards['delete_reward']['std'] is not None else 0.0)
+        edge_reward_stds.append(rewards['edge_reward']['std'] if rewards['edge_reward']['std'] is not None else 0.0)
+        total_node_reward_stds.append(rewards['total_node_reward']['std'] if rewards['total_node_reward']['std'] is not None else 0.0)
+        total_reward_stds.append(rewards['total_reward']['std'] if rewards['total_reward']['std'] is not None else 0.0)
     
     return (episodes, 
             graph_reward_means, spawn_reward_means, delete_reward_means, 

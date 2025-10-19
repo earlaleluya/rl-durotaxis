@@ -9,7 +9,7 @@ from topology import Topology
 from substrate import Substrate
 from state import TopologyState
 from encoder import GraphInputEncoder
-from policy import GraphPolicyNetwork, TopologyPolicyAgent
+from actor_critic import HybridActorCritic, HybridPolicyAgent
 from config_loader import ConfigLoader
 
 
@@ -131,7 +131,7 @@ class DurotaxisEnv(gym.Env):
         Component for extracting graph features and node attributes from topology.
     observation_encoder : GraphInputEncoder
         Graph neural network encoder for converting topology to fixed-size observations.
-    policy_agent : TopologyPolicyAgent
+    policy_agent : HybridPolicyAgent
         Graph transformer policy for intelligent action selection.
     action_space : gym.Space
         Discrete action space (dummy - actual actions determined by policy network).
@@ -303,7 +303,10 @@ class DurotaxisEnv(gym.Env):
         self.survival_reward = self.graph_rewards['survival_reward']
         self.action_reward = self.graph_rewards['action_reward']
         
+        self.centroid_movement_reward = self.graph_rewards.get('centroid_movement_reward', 0.0)
+        
         self.movement_reward = self.node_rewards['movement_reward']
+        self.leftward_penalty = self.node_rewards.get('leftward_penalty', 0.0)
         self.intensity_penalty = self.node_rewards['intensity_penalty']
         self.intensity_bonus = self.node_rewards['intensity_bonus']
         self.substrate_reward = self.node_rewards['substrate_reward']
@@ -312,8 +315,22 @@ class DurotaxisEnv(gym.Env):
         self.left_edge_penalty = self.position_rewards['left_edge_penalty']
         self.edge_position_penalty = self.position_rewards['edge_position_penalty']
         
+        # Enhanced boundary avoidance parameters
+        self.danger_zone_penalty = self.position_rewards.get('danger_zone_penalty', 2.0)
+        self.critical_zone_penalty = self.position_rewards.get('critical_zone_penalty', 5.0)
+        self.edge_zone_threshold = self.position_rewards.get('edge_zone_threshold', 0.15)
+        self.danger_zone_threshold = self.position_rewards.get('danger_zone_threshold', 0.08)
+        self.critical_zone_threshold = self.position_rewards.get('critical_zone_threshold', 0.03)
+        self.safe_center_bonus = self.position_rewards.get('safe_center_bonus', 0.05)
+        self.safe_center_range = self.position_rewards.get('safe_center_range', 0.30)
+        
         self.spawn_success_reward = self.spawn_rewards['spawn_success_reward']
         self.spawn_failure_penalty = self.spawn_rewards['spawn_failure_penalty']
+        
+        # Boundary-aware spawn penalties
+        self.spawn_near_boundary_penalty = self.spawn_rewards.get('spawn_near_boundary_penalty', 3.0)
+        self.spawn_in_danger_zone_penalty = self.spawn_rewards.get('spawn_in_danger_zone_penalty', 8.0)
+        self.spawn_boundary_check = self.spawn_rewards.get('spawn_boundary_check', True)
         
         self.success_reward = self.termination_rewards['success_reward']
         self.out_of_bounds_penalty = self.termination_rewards['out_of_bounds_penalty']
@@ -321,9 +338,38 @@ class DurotaxisEnv(gym.Env):
         self.leftward_drift_penalty = self.termination_rewards['leftward_drift_penalty']
         self.timeout_penalty = self.termination_rewards['timeout_penalty']
         self.critical_nodes_penalty = self.termination_rewards['critical_nodes_penalty']
+
+        # Empty-graph recovery configuration (prevent instant termination when possible)
+        default_recovery_penalty = self.no_nodes_penalty * 0.5 if self.no_nodes_penalty < 0 else -abs(self.no_nodes_penalty)
+        recovery_config = config.get('empty_graph_recovery', {})
+        self.enable_empty_graph_recovery = config.get(
+            'empty_graph_recovery_enabled',
+            recovery_config.get('enabled', True)
+        )
+        recovery_nodes = config.get(
+            'empty_graph_recovery_nodes',
+            recovery_config.get('spawn_nodes', max(1, self.init_num_nodes))
+        )
+        self.empty_graph_recovery_nodes = max(1, int(recovery_nodes))
+        recovery_penalty_cfg = config.get(
+            'empty_graph_recovery_penalty',
+            recovery_config.get('penalty', default_recovery_penalty)
+        )
+        self.empty_graph_recovery_penalty = recovery_penalty_cfg if recovery_penalty_cfg <= 0 else -abs(recovery_penalty_cfg)
+        self.empty_graph_recovery_max_attempts = config.get(
+            'empty_graph_recovery_max_attempts',
+            recovery_config.get('max_attempts', 2)
+        )
+        self.empty_graph_recovery_noise = recovery_config.get('position_noise', 5.0)
         
+        self.survival_reward_config = config.get('survival_reward_config', {'enabled': False})
+        self.milestone_rewards = config.get('milestone_rewards', {'enabled': False})
+
         self.current_step = 0
         self.current_episode = 0
+        
+        # Milestone tracking (reset each episode)
+        self._milestones_reached = set()
         
         # Centroid tracking for fail termination
         self.centroid_history = []  # Store centroid x-coordinates
@@ -351,6 +397,12 @@ class DurotaxisEnv(gym.Env):
         # Node-level reward tracking
         self.prev_node_positions = []  # Store previous node positions for movement rewards
         self.last_reward_breakdown = None  # Store detailed reward information
+
+        # Empty graph recovery bookkeeping
+        self.empty_graph_recovery_attempts = 0
+        self.empty_graph_recoveries_this_episode = 0
+        self.total_empty_graph_recoveries = 0
+        self.empty_graph_recovery_last_step = None
         
         # Curriculum learning parameters (initialized to defaults)
         self._curriculum_penalty_multiplier = 1.0
@@ -419,11 +471,9 @@ class DurotaxisEnv(gym.Env):
             out_dim=self.encoder_out_dim,
             num_layers=self.encoder_num_layers
         )
-        
-        policy = GraphPolicyNetwork(encoder, hidden_dim=self.encoder_hidden_dim, noise_scale=0.1)
-        
+        policy = HybridActorCritic(encoder, hidden_dim=self.encoder_hidden_dim)
         # Create policy agent
-        self.policy_agent = TopologyPolicyAgent(self.topology, self.state_extractor, policy)
+        self.policy_agent = HybridPolicyAgent(self.topology, self.state_extractor, policy)
         self._policy_initialized = True
 
     def _get_edge_structure_hash(self, edge_index):
@@ -846,27 +896,59 @@ class DurotaxisEnv(gym.Env):
             # Dequeue the oldest topology to maintain capacity
             self.dequeued_topology = self.topology_history.pop(0)  # Remove from front (FIFO)
         
-        # Execute actions using the policy network
+        # Check for empty graph BEFORE executing actions to prevent policy from seeing invalid state
+        empty_graph_recovered_pre = False
+        if self.enable_empty_graph_recovery and prev_num_nodes == 0:
+            print(f"⚠️  Pre-action empty graph detected at step {self.current_step}, recovering...")
+            recovered_state = self._recover_empty_graph(prev_state)
+            if recovered_state is not None and recovered_state['num_nodes'] > 0:
+                prev_state = recovered_state
+                prev_num_nodes = recovered_state['num_nodes']
+                empty_graph_recovered_pre = True
+                # Update state extractor to point to recovered topology
+                self.state_extractor.set_topology(self.topology)
+
+        # Execute actions using the policy network (now guaranteed to have nodes)
         if self.policy_agent is not None and prev_num_nodes > 0:
             try:
                 executed_actions = self.policy_agent.act_with_policy(
                     deterministic=False
                 )
             except Exception as e:
-                print(f"Policy execution failed: {e}")
+                print(f"⚠️  Policy execution failed: {e}")
                 executed_actions = {}
         else:
-            # Fallback to random actions if policy fails
-            executed_actions = self.topology.act()
+            # Fallback to random actions if policy fails or no nodes
+            if prev_num_nodes > 0:
+                executed_actions = self.topology.act()
+            else:
+                executed_actions = {}
         
-        # Get new state
+        # Get new state after actions
         new_state = self.state_extractor.get_state_features(include_substrate=True)
-        
-        # Get observation from GraphInputEncoder output
+
+        # Attempt graceful recovery if topology collapsed to zero nodes AFTER actions
+        empty_graph_recovered_post = False
+        if self.enable_empty_graph_recovery and new_state['num_nodes'] == 0:
+            recovered_state = self._recover_empty_graph(prev_state)
+            if recovered_state is not None and recovered_state['num_nodes'] > 0:
+                new_state = recovered_state
+                empty_graph_recovered_post = True
+
+        # Track if ANY recovery happened this step
+        empty_graph_recovered = empty_graph_recovered_pre or empty_graph_recovered_post
+
+        # Get observation from GraphInputEncoder output (after any recovery adjustments)
         observation = self._get_encoder_observation(new_state)
         
         # Calculate reward components (returns detailed breakdown)
         reward_components = self._calculate_reward(prev_state, new_state, executed_actions)
+
+        # Apply penalty when empty-graph recovery was needed (discourage aggressive deletions)
+        if empty_graph_recovered:
+            recovery_penalty = self.empty_graph_recovery_penalty
+            reward_components['empty_graph_recovery_penalty'] = recovery_penalty
+            reward_components['total_reward'] += recovery_penalty
         
         # Reset new_node flags after reward calculation (they've served their purpose)
         self._reset_new_node_flags()
@@ -893,16 +975,51 @@ class DurotaxisEnv(gym.Env):
             'actions_taken': len(executed_actions),
             'step': self.current_step,
             'policy_initialized': self._policy_initialized,
-            'reward_breakdown': reward_components  # Detailed reward information as dictionary
+            'reward_breakdown': reward_components,  # Detailed reward information as dictionary
+            'empty_graph_recovered': empty_graph_recovered,
+            'empty_graph_recovery_attempts': self.empty_graph_recovery_attempts,
+            'empty_graph_recoveries_this_episode': self.empty_graph_recoveries_this_episode
         }
         
-        # 📊 One-line performance summary
+        # 📊 One-line performance summary with boundary warnings
         centroid_x = new_state.get('graph_features', [0, 0, 0, 0])[3] if new_state['num_nodes'] > 0 else 0
         centroid_direction = "→" if len(self.centroid_history) >= 2 and centroid_x > self.centroid_history[-2] else "←" if len(self.centroid_history) >= 2 and centroid_x < self.centroid_history[-2] else "="
         spawn_r = reward_components.get('spawn_reward', 0)
         node_r = reward_components.get('total_node_reward', 0)
         edge_r = reward_components.get('edge_reward', 0)
-        print(f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | C={centroid_x:5.1f}{centroid_direction} | A={len(executed_actions):2d} | T={terminated} {truncated}")
+        
+        # Check if any nodes are in boundary danger zones
+        boundary_warning = ""
+        if new_state['num_nodes'] > 0:
+            node_features = new_state['node_features']
+            substrate_height = self.substrate.height
+            nodes_in_danger = 0
+            nodes_in_critical = 0
+            
+            for i in range(new_state['num_nodes']):
+                y_pos = node_features[i][1].item()
+                dist_from_top = y_pos / substrate_height
+                dist_from_bottom = (substrate_height - y_pos) / substrate_height
+                min_dist = min(dist_from_top, dist_from_bottom)
+                
+                if min_dist < self.critical_zone_threshold:
+                    nodes_in_critical += 1
+                elif min_dist < self.danger_zone_threshold:
+                    nodes_in_danger += 1
+            
+            if nodes_in_critical > 0:
+                boundary_warning = f" 🚨CRITICAL:{nodes_in_critical}"
+            elif nodes_in_danger > 0:
+                boundary_warning = f" ⚠️DANGER:{nodes_in_danger}"
+        
+        recovery_flag = " ♻️" if empty_graph_recovered else ""
+        print(
+            f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
+            f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
+            f"R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | "
+            f"C={centroid_x:5.1f}{centroid_direction}{boundary_warning}{recovery_flag} | "
+            f"A={len(executed_actions):2d} | T={terminated} {truncated}"
+        )
         
         # Auto-render after each step to ensure visualization is always updated
         # This ensures visualization works consistently
@@ -934,6 +1051,10 @@ class DurotaxisEnv(gym.Env):
         # Small reward for taking actions (encourages exploration)
         graph_reward += len(actions) * self.action_reward
         
+        # === CENTROID MOVEMENT REWARD: Collective rightward progress ===
+        centroid_reward = self._calculate_centroid_movement_reward(prev_state, new_state)
+        graph_reward += centroid_reward
+        
         # === SPAWN REWARD: Durotaxis-based spawning ===
         spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
         graph_reward += spawn_reward
@@ -962,14 +1083,20 @@ class DurotaxisEnv(gym.Env):
             # 1. VECTORIZED Position-based rewards (durotaxis progression)
             node_positions = node_features_np[:, :2]  # [num_nodes, 2] - x, y coordinates
             
-            # Reward for moving rightward (positive durotaxis) - VECTORIZED
+            # Reward/penalize based on movement direction - VECTORIZED
             if hasattr(self, 'prev_node_positions') and len(self.prev_node_positions) > 0:
                 # Convert previous positions to numpy array
                 prev_positions = np.array(self.prev_node_positions[:num_nodes])  # Handle size mismatches
                 if prev_positions.shape[0] == num_nodes:
                     # Vectorized movement calculation
                     x_movement = node_positions[:, 0] - prev_positions[:, 0]  # [num_nodes]
-                    movement_rewards = x_movement * self.movement_reward  # [num_nodes]
+                    
+                    # Reward rightward movement, penalize leftward movement
+                    movement_rewards = np.where(
+                        x_movement > 0,
+                        x_movement * self.movement_reward,  # Rightward: strong reward
+                        x_movement * self.leftward_penalty  # Leftward: penalty (x_movement is negative, so this is negative)
+                    )
                     node_rewards_vec += movement_rewards
             
             # 2. VECTORIZED Substrate intensity rewards
@@ -984,7 +1111,7 @@ class DurotaxisEnv(gym.Env):
                 boundary_rewards = np.where(boundary_flags > 0.5, self.boundary_bonus, 0.0)  # [num_nodes]
                 node_rewards_vec += boundary_rewards
             
-            # 4. VECTORIZED Positional penalties (avoid substrate edges)
+            # 4. VECTORIZED Positional penalties (avoid substrate edges) - ENHANCED BOUNDARY AVOIDANCE
             substrate_width = self.substrate.width
             substrate_height = self.substrate.height
             
@@ -993,11 +1120,43 @@ class DurotaxisEnv(gym.Env):
             left_edge_penalties = np.where(left_edge_mask, -self.left_edge_penalty, 0.0)  # [num_nodes]
             node_rewards_vec += left_edge_penalties
             
-            # Top/bottom edge penalty - VECTORIZED  
-            top_bottom_mask = ((node_positions[:, 1] < substrate_height * 0.1) | 
-                              (node_positions[:, 1] > substrate_height * 0.9))  # [num_nodes]
-            edge_penalties = np.where(top_bottom_mask, -self.edge_position_penalty, 0.0)  # [num_nodes]
-            node_rewards_vec += edge_penalties
+            # ENHANCED: Progressive top/bottom edge penalties - VECTORIZED
+            # Calculate distance from top and bottom boundaries
+            y_positions = node_positions[:, 1]  # [num_nodes]
+            dist_from_top = y_positions / substrate_height  # 0.0 = top, 1.0 = bottom
+            dist_from_bottom = (substrate_height - y_positions) / substrate_height  # 0.0 = bottom, 1.0 = top
+            
+            # Get minimum distance to either boundary (0.0 = at boundary, 0.5 = center)
+            min_dist_to_boundary = np.minimum(dist_from_top, dist_from_bottom)  # [num_nodes]
+            
+            # Define zone thresholds
+            edge_threshold = self.edge_zone_threshold      # 15% - edge zone
+            danger_threshold = self.danger_zone_threshold  # 8% - danger zone
+            critical_threshold = self.critical_zone_threshold  # 3% - critical zone
+            safe_center_range = self.safe_center_range     # 30% - safe center
+            
+            # Progressive penalties based on proximity to boundary
+            boundary_penalties = np.zeros(num_nodes, dtype=np.float32)
+            
+            # Critical zone: SEVERE penalty (within 3% of boundary)
+            critical_mask = min_dist_to_boundary < critical_threshold
+            boundary_penalties = np.where(critical_mask, -self.critical_zone_penalty, boundary_penalties)
+            
+            # Danger zone: Strong penalty (within 8% of boundary)
+            danger_mask = (min_dist_to_boundary >= critical_threshold) & (min_dist_to_boundary < danger_threshold)
+            boundary_penalties = np.where(danger_mask, -self.danger_zone_penalty, boundary_penalties)
+            
+            # Edge zone: Moderate penalty (within 15% of boundary)
+            edge_mask = (min_dist_to_boundary >= danger_threshold) & (min_dist_to_boundary < edge_threshold)
+            boundary_penalties = np.where(edge_mask, -self.edge_position_penalty, boundary_penalties)
+            
+            # Safe center zone: Small bonus (center 30% of height)
+            center_dist = np.abs(y_positions - substrate_height/2) / (substrate_height/2)  # 0.0 = center, 1.0 = edge
+            safe_center_mask = center_dist < safe_center_range
+            safe_center_rewards = np.where(safe_center_mask, self.safe_center_bonus, 0.0)
+            
+            node_rewards_vec += boundary_penalties
+            node_rewards_vec += safe_center_rewards
             
             # 5. Per-node intensity comparison (requires loop for complexity)
             if self.dequeued_topology is not None and node_features_np.shape[1] > 2:
@@ -1062,8 +1221,11 @@ class DurotaxisEnv(gym.Env):
         # Add survival reward if configured
         survival_reward = self.get_survival_reward(self.current_step)
         
+        # Add milestone rewards for reaching distance thresholds
+        milestone_reward = self._calculate_milestone_reward(new_state)
+        
         # Final combined reward
-        total_reward = graph_reward + total_node_reward + survival_reward
+        total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
         
         # Create detailed reward information dictionary
         reward_breakdown = {
@@ -1072,6 +1234,8 @@ class DurotaxisEnv(gym.Env):
             'spawn_reward': spawn_reward,
             'delete_reward': delete_reward,
             'edge_reward': edge_reward,
+            'centroid_reward': centroid_reward if 'centroid_reward' in locals() else 0.0,
+            'milestone_reward': milestone_reward,
             'node_rewards': node_rewards,
             'total_node_reward': total_node_reward,
             'survival_reward': survival_reward,
@@ -1083,6 +1247,175 @@ class DurotaxisEnv(gym.Env):
         
         return reward_breakdown
 
+    def _recover_empty_graph(self, prev_state):
+        """Attempt to recover from an empty topology without terminating the episode."""
+        if self.empty_graph_recovery_max_attempts <= 0:
+            return None
+        if self.empty_graph_recovery_attempts >= self.empty_graph_recovery_max_attempts:
+            print(f"⚠️  Empty graph recovery skipped: max attempts reached ({self.empty_graph_recovery_max_attempts})")
+            return None
+
+        self.empty_graph_recovery_attempts += 1
+        self.empty_graph_recoveries_this_episode += 1
+        self.total_empty_graph_recoveries += 1
+        self.empty_graph_recovery_last_step = self.current_step
+
+        spawn_nodes = max(1, int(self.empty_graph_recovery_nodes))
+        print(
+            f"♻️  Empty graph recovery triggered at step {self.current_step} "
+            f"(attempt {self.empty_graph_recovery_attempts}/{self.empty_graph_recovery_max_attempts}) — respawning {spawn_nodes} node(s)"
+        )
+
+        # Reset topology with minimal nodes then reposition near previous centroid if possible
+        self.topology.reset(init_num_nodes=spawn_nodes)
+
+        if prev_state is not None and prev_state.get('num_nodes', 0) > 0:
+            self._reposition_recovered_nodes(prev_state)
+
+        # Clear deletion flags and reset trackers to align with new graph
+        self._clear_all_to_delete_flags()
+        self.prev_node_positions = []
+        self.topology_history = []
+        self.dequeued_topology = None
+
+        # Ensure state extractor references the updated topology
+        if hasattr(self, 'state_extractor'):
+            self.state_extractor.set_topology(self.topology)
+
+        return self.state_extractor.get_state_features(include_substrate=True)
+
+    def _reposition_recovered_nodes(self, prev_state):
+        """Shift recovered nodes near the previous centroid to preserve spatial continuity."""
+        if self.topology.graph.num_nodes() == 0:
+            return
+
+        try:
+            prev_graph_features = prev_state.get('graph_features')
+            if isinstance(prev_graph_features, torch.Tensor):
+                target_centroid = prev_graph_features[3:5].detach().cpu()
+            else:
+                target_centroid = torch.tensor(prev_graph_features[3:5], dtype=torch.float32)
+        except Exception as exc:
+            print(f"⚠️  Empty graph recovery repositioning failed: {exc}")
+            return
+
+        positions = self.topology.graph.ndata['pos']
+        num_nodes = positions.shape[0]
+        
+        # IMPORTANT: Add diversity to prevent collinear nodes
+        # Generate random offsets for each node to ensure they're not all at same position
+        base_noise = max(5.0, self.empty_graph_recovery_noise if self.empty_graph_recovery_noise else 5.0)
+        
+        # Create diverse positions by radiating from target centroid
+        if num_nodes == 1:
+            # Single node: place at target with small noise
+            adjusted_positions = target_centroid.to(positions.device).unsqueeze(0)
+            noise = torch.randn_like(adjusted_positions) * (base_noise * 0.5)
+            adjusted_positions = adjusted_positions + noise
+        else:
+            # Multiple nodes: arrange in a circle around target centroid to ensure diversity
+            angles = torch.linspace(0, 2 * np.pi, num_nodes + 1)[:-1]  # Evenly spaced angles
+            radius = base_noise * 2.0  # Radius of circle
+            
+            adjusted_positions = torch.zeros_like(positions)
+            target_x, target_y = target_centroid[0].item(), target_centroid[1].item()
+            
+            for i in range(num_nodes):
+                angle = angles[i].item()
+                # Place on circle
+                x = target_x + radius * np.cos(angle)
+                y = target_y + radius * np.sin(angle)
+                # Add small random jitter to break perfect symmetry
+                x += np.random.uniform(-base_noise * 0.3, base_noise * 0.3)
+                y += np.random.uniform(-base_noise * 0.3, base_noise * 0.3)
+                adjusted_positions[i] = torch.tensor([x, y], dtype=positions.dtype, device=positions.device)
+
+        # Clamp to substrate bounds
+        width = float(self.substrate.width)
+        height = float(self.substrate.height)
+        adjusted_positions[:, 0] = torch.clamp(adjusted_positions[:, 0], 0.0, max(width - 1e-3, 0.0))
+        adjusted_positions[:, 1] = torch.clamp(adjusted_positions[:, 1], 0.0, max(height - 1e-3, 0.0))
+
+        self.topology.graph.ndata['pos'] = adjusted_positions
+
+    def _calculate_centroid_movement_reward(self, prev_state, new_state):
+        """
+        Calculate reward based on collective centroid movement to the right.
+        
+        This reward encourages the entire cell colony to migrate rightward as a group,
+        providing a strong signal for the primary goal of durotaxis.
+        
+        Args:
+            prev_state: Previous state dict containing graph_features with centroid
+            new_state: Current state dict containing graph_features with centroid
+            
+        Returns:
+            float: Positive reward for rightward movement, negative for leftward
+        """
+        if new_state['num_nodes'] == 0 or prev_state['num_nodes'] == 0:
+            return 0.0
+        
+        # Get centroid x-coordinates from graph features
+        prev_centroid_x = prev_state['graph_features'][3].item()
+        curr_centroid_x = new_state['graph_features'][3].item()
+        
+        # Calculate movement
+        centroid_movement = curr_centroid_x - prev_centroid_x
+        
+        # Apply reward multiplier
+        reward = centroid_movement * self.centroid_movement_reward
+        
+        return reward
+    
+    def _calculate_milestone_reward(self, new_state):
+        """
+        Calculate reward for reaching distance milestones.
+        
+        Provides progressive rewards as the agent reaches certain percentages
+        of the substrate width, creating intermediate goals that guide learning.
+        
+        Args:
+            new_state: Current state dict
+            
+        Returns:
+            float: Milestone reward if a new milestone is reached, 0.0 otherwise
+        """
+        if not hasattr(self, 'milestone_rewards') or not self.milestone_rewards.get('enabled', False):
+            return 0.0
+        
+        if new_state['num_nodes'] == 0:
+            return 0.0
+        
+        # Get the rightmost node position
+        node_features = new_state['node_features']
+        max_x = max(node_features[:, 0]).item()
+        
+        substrate_width = self.substrate.width
+        progress_percent = (max_x / substrate_width) * 100
+        
+        # Check if we've reached a new milestone (track in episode)
+        if not hasattr(self, '_milestones_reached'):
+            self._milestones_reached = set()
+        
+        reward = 0.0
+        
+        # Check each milestone threshold
+        milestones = [
+            (25, 'distance_25_percent'),
+            (50, 'distance_50_percent'),
+            (75, 'distance_75_percent'),
+            (90, 'distance_90_percent')
+        ]
+        
+        for threshold, key in milestones:
+            if progress_percent >= threshold and threshold not in self._milestones_reached:
+                self._milestones_reached.add(threshold)
+                milestone_reward = self.milestone_rewards.get(key, 0.0)
+                reward += milestone_reward
+                print(f"🎯 MILESTONE REACHED! {threshold}% of substrate width! Reward: +{milestone_reward}")
+        
+        return reward
+    
     def _calculate_spawn_reward(self, prev_state, new_state, actions):
         """
         Calculate reward for durotaxis-based spawning.
@@ -1122,13 +1455,34 @@ class DurotaxisEnv(gym.Env):
                         # Get substrate intensity (3rd feature, index 2)
                         if len(node_feature_vector) > 2:
                             new_node_intensity = node_feature_vector[2].item()
+                            new_node_pos = node_feature_vector[:2]  # x, y coordinates
+                            new_node_y = new_node_pos[1].item()
+                            
+                            # Check if spawned near boundary (boundary-aware spawning)
+                            if self.spawn_boundary_check:
+                                substrate_height = self.substrate.height
+                                
+                                # Calculate distance from top/bottom boundaries
+                                dist_from_top = new_node_y / substrate_height
+                                dist_from_bottom = (substrate_height - new_node_y) / substrate_height
+                                min_dist_to_boundary = min(dist_from_top, dist_from_bottom)
+                                
+                                # Apply penalties for spawning near boundaries
+                                if min_dist_to_boundary < self.danger_zone_threshold:  # Within 8% - danger zone
+                                    spawn_reward -= self.spawn_in_danger_zone_penalty
+                                    # print(f"⚠️ Spawn in DANGER ZONE! Y={new_node_y:.1f}, "
+                                    #       f"dist={min_dist_to_boundary:.2%} < {self.danger_zone_threshold:.2%}, "
+                                    #       f"penalty: -{self.spawn_in_danger_zone_penalty}")
+                                elif min_dist_to_boundary < self.edge_zone_threshold:  # Within 15% - edge zone
+                                    spawn_reward -= self.spawn_near_boundary_penalty
+                                    # print(f"⚠️ Spawn near boundary! Y={new_node_y:.1f}, "
+                                    #       f"dist={min_dist_to_boundary:.2%} < {self.edge_zone_threshold:.2%}, "
+                                    #       f"penalty: -{self.spawn_near_boundary_penalty}")
                             
                             # Find parent node from previous state by checking actions
                             # For now, we'll use spatial proximity as backup
                             best_parent_intensity = None
                             min_distance = float('inf')
-                            
-                            new_node_pos = node_feature_vector[:2]  # x, y coordinates
                             
                             # Check against previous state nodes
                             if 'node_features' in prev_state:
@@ -1649,14 +2003,32 @@ class DurotaxisEnv(gym.Env):
             self.consecutive_left_moves_limit = termination_config['consecutive_left_moves']
             
     def get_survival_reward(self, step_count: int) -> float:
-        """Calculate survival reward based on step count and configuration."""
-        survival_config = getattr(self, '_survival_config', {})
+        """
+        Calculate time-based survival reward that increases with episode length.
+        
+        Encourages the agent to survive longer by providing:
+        1. Base reward for each step
+        2. Bonus reward after reaching a threshold
+        3. Progressive scaling based on max_steps
+        
+        Args:
+            step_count: Current step number in episode
+            
+        Returns:
+            float: Survival reward for current step
+        """
+        # Check if survival rewards are configured and enabled
+        if not hasattr(self, 'survival_reward_config'):
+            return 0.0
+        
+        survival_config = self.survival_reward_config
         if not survival_config.get('enabled', False):
             return 0.0
-            
-        base_reward = survival_config.get('base_reward', 0.1)
-        bonus_threshold = survival_config.get('bonus_threshold', 10)
-        bonus_reward = survival_config.get('bonus_reward', 0.2)
+        
+        base_reward = survival_config.get('base_reward', 0.02)
+        bonus_threshold = survival_config.get('bonus_threshold', 100)
+        bonus_reward = survival_config.get('bonus_reward', 0.05)
+        max_step_factor = survival_config.get('max_step_factor', 0.8)
         
         # Base survival reward for each step
         reward = base_reward
@@ -1664,7 +2036,13 @@ class DurotaxisEnv(gym.Env):
         # Bonus for reaching threshold
         if step_count >= bonus_threshold:
             reward += bonus_reward
-            
+        
+        # Progressive scaling: reward increases as episode progresses
+        # This creates a strong incentive to reach longer episodes
+        if step_count > 0 and self.max_steps > 0:
+            progress_factor = min(step_count / (self.max_steps * max_step_factor), 1.0)
+            reward *= (1.0 + progress_factor)  # Up to 2x multiplier
+        
         return reward
 
     def reset(self, seed=None, options=None):
@@ -1691,8 +2069,30 @@ class DurotaxisEnv(gym.Env):
         self.prev_node_positions = []
         self.last_reward_breakdown = None
         
+        # Reset milestone tracking for new episode
+        self._milestones_reached = set()
+
+        # Reset empty-graph recovery tracking for new episode
+        self.empty_graph_recovery_attempts = 0
+        self.empty_graph_recoveries_this_episode = 0
+        self.empty_graph_recovery_last_step = None
+        
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)
+        
+        # Verify initial centroid is in safe center zone
+        if self.init_num_nodes > 0:
+            initial_state = self.state_extractor.get_state_features(include_substrate=True)
+            if initial_state['num_nodes'] > 0:
+                initial_centroid_y = initial_state['graph_features'][4].item()  # Centroid Y
+                substrate_height = self.substrate.height
+                y_percentage = (initial_centroid_y / substrate_height) * 100
+                
+                # Check if in safe zone (40-60%)
+                in_safe_zone = 40 <= y_percentage <= 60
+                zone_indicator = "✅" if in_safe_zone else "⚠️"
+                
+                print(f"   {zone_indicator} Initial centroid Y: {initial_centroid_y:.1f} ({y_percentage:.1f}% of height) - {'SAFE CENTER' if in_safe_zone else 'NOT CENTERED'}")
         
         # Initialize to_delete flags for all nodes to 0 (not marked for deletion)
         self._clear_all_to_delete_flags()

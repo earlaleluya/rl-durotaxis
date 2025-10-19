@@ -92,10 +92,12 @@ class HybridActorCritic(nn.Module):
         # Input: [node_features + graph_context] = [encoder.out_dim * 2]
         self.shared_node_mlp = nn.Sequential(
             nn.Linear(self.encoder.out_dim * 2, self.hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim),
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim),
             nn.Dropout(self.dropout_rate),
         )
         
@@ -104,7 +106,8 @@ class HybridActorCritic(nn.Module):
         # Discrete action head (spawn/delete per node)
         self.discrete_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim // 2),
             nn.Linear(self.hidden_dim // 2, self.num_discrete_actions)
         )
         
@@ -112,14 +115,16 @@ class HybridActorCritic(nn.Module):
         # Mean values for continuous actions
         self.continuous_mu_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim // 2),
             nn.Linear(self.hidden_dim // 2, self.continuous_dim)
         )
         
         # Log standard deviation for continuous actions
         self.continuous_logstd_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim // 2),
             nn.Linear(self.hidden_dim // 2, self.continuous_dim)
         )
         
@@ -128,10 +133,12 @@ class HybridActorCritic(nn.Module):
         # Graph-level value estimation using graph token
         self.graph_value_mlp = nn.Sequential(
             nn.Linear(self.encoder.out_dim, self.hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim),
             nn.Dropout(self.dropout_rate),
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_dim // 2),
         )
         
         # Multi-component value heads
@@ -142,13 +149,22 @@ class HybridActorCritic(nn.Module):
         # Initialize continuous action heads for better starting values
         self._init_continuous_heads()
         
-        # Parameter bounds for continuous actions
+        # Parameter bounds for continuous actions from config
+        spawn_bounds = config.get('spawn_parameter_bounds', {
+            'gamma': [0.1, 10.0],
+            'alpha': [0.1, 5.0],
+            'noise': [0.0, 2.0],
+            'theta': [-math.pi, math.pi]
+        })
+        
         self.register_buffer('action_bounds', torch.tensor([
-            [0.1, 10.0],    # gamma bounds
-            [0.1, 5.0],     # alpha bounds  
-            [0.0, 2.0],     # noise bounds
-            [-math.pi, math.pi]  # theta bounds
+            spawn_bounds.get('gamma', [0.1, 10.0]),
+            spawn_bounds.get('alpha', [0.1, 5.0]),
+            spawn_bounds.get('noise', [0.0, 2.0]),
+            spawn_bounds.get('theta', [-math.pi, math.pi])
         ]))
+        
+        self.apply(self._init_weights)
     
     def _init_continuous_heads(self):
         """Initialize continuous action heads to produce reasonable starting values."""
@@ -166,6 +182,13 @@ class HybridActorCritic(nn.Module):
         # Initialize logstd head to produce reasonable initial variance
         nn.init.normal_(self.continuous_logstd_head[-1].weight, mean=0.0, std=0.1)
         nn.init.constant_(self.continuous_logstd_head[-1].bias, -0.3)  # log(0.74) ≈ -0.3
+
+    def _init_weights(self, module):
+        """Initialize the weights."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                module.bias.data.fill_(0.01)
     
     def forward(self, state_dict: Dict[str, torch.Tensor], 
                 deterministic: bool = False,

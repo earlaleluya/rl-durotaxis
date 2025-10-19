@@ -163,7 +163,8 @@ class TopologyState:
         
         # 2. Normalized direction vector
         direction = dst_pos - src_pos
-        direction_norm = F.normalize(direction, p=2, dim=1)
+        # Add small epsilon to avoid division by zero when src and dst are at same position
+        direction_norm = F.normalize(direction + 1e-8, p=2, dim=1)
         
         edge_features = torch.cat([distances, direction_norm], dim=1)
         
@@ -264,9 +265,17 @@ class TopologyState:
             else:
                 pos_i = positions[i]
                 distances = torch.norm(positions - pos_i, dim=1)
-                avg_distance = torch.mean(distances[distances > 0])  # exclude self
-                centrality = 1.0 / (avg_distance + 1e-6)  # avoid division by zero
-                centralities.append(centrality.item())
+                non_zero_distances = distances[distances > 1e-6]  # exclude self and nearly-identical positions
+                
+                # Handle case where all nodes are at same position
+                if len(non_zero_distances) == 0:
+                    # All nodes at same position -> use default centrality
+                    centrality = 1.0
+                else:
+                    avg_distance = torch.mean(non_zero_distances)
+                    centrality = 1.0 / (avg_distance + 1e-6)  # avoid division by zero
+                
+                centralities.append(centrality.item() if isinstance(centrality, torch.Tensor) else centrality)
         
         return torch.tensor(centralities, dtype=torch.float32).unsqueeze(1)
 
@@ -281,7 +290,9 @@ class TopologyState:
         try:
             outmost_indices = self.topology.get_outmost_nodes()
             boundary_flags[outmost_indices] = 1.0
-        except:
+        except Exception as e:
+            # Silently handle convex hull errors (collinear points, etc.)
+            # All nodes marked as non-boundary (zeros) in this case
             pass
         
         return boundary_flags
