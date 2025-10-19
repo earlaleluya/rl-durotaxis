@@ -269,10 +269,10 @@ environment:
     b: 1.0
   
   # Node and topology parameters - RELAXED for learning
-  init_num_nodes: 3           # Start with more nodes for stability
-  max_critical_nodes: 75      # Allow more nodes
-  threshold_critical_nodes: 250  # Higher threshold before termination
-  max_steps: 1000             # Much more time to reach goal
+  init_num_nodes: 3              # Start with more nodes for stability
+  max_critical_nodes: 75         # Allow more nodes
+  threshold_critical_nodes: 500  # Higher threshold before termination
+  max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
   consecutive_left_moves_limit: 30  # More forgiving (was implicitly 6)

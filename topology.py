@@ -378,13 +378,24 @@ class Topology:
         positions = self.graph.ndata['pos'].numpy()
         
         try:
+            # Suppress qhull warnings by checking for collinearity first
+            # Check if all x-coordinates are the same
+            x_coords = positions[:, 0]
+            y_coords = positions[:, 1]
+            
+            x_unique = len(np.unique(x_coords)) > 1
+            y_unique = len(np.unique(y_coords)) > 1
+            
+            # If points are collinear or degenerate, use fallback
+            if not (x_unique and y_unique):
+                return self._get_extreme_nodes()
+            
             # Compute convex hull
             hull = ConvexHull(positions)
             # Return the indices of vertices that form the convex hull
             return hull.vertices.tolist()
-        except Exception as e:
-            print(f"Error computing convex hull: {e}")
-            # Fallback: return nodes with extreme coordinates
+        except Exception:
+            # Silently fallback to extreme nodes (no verbose error printing)
             return self._get_extreme_nodes()
     
     

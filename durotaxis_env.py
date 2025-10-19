@@ -896,29 +896,47 @@ class DurotaxisEnv(gym.Env):
             # Dequeue the oldest topology to maintain capacity
             self.dequeued_topology = self.topology_history.pop(0)  # Remove from front (FIFO)
         
-        # Execute actions using the policy network
+        # Check for empty graph BEFORE executing actions to prevent policy from seeing invalid state
+        empty_graph_recovered_pre = False
+        if self.enable_empty_graph_recovery and prev_num_nodes == 0:
+            print(f"⚠️  Pre-action empty graph detected at step {self.current_step}, recovering...")
+            recovered_state = self._recover_empty_graph(prev_state)
+            if recovered_state is not None and recovered_state['num_nodes'] > 0:
+                prev_state = recovered_state
+                prev_num_nodes = recovered_state['num_nodes']
+                empty_graph_recovered_pre = True
+                # Update state extractor to point to recovered topology
+                self.state_extractor.set_topology(self.topology)
+
+        # Execute actions using the policy network (now guaranteed to have nodes)
         if self.policy_agent is not None and prev_num_nodes > 0:
             try:
                 executed_actions = self.policy_agent.act_with_policy(
                     deterministic=False
                 )
             except Exception as e:
-                print(f"Policy execution failed: {e}")
+                print(f"⚠️  Policy execution failed: {e}")
                 executed_actions = {}
         else:
-            # Fallback to random actions if policy fails
-            executed_actions = self.topology.act()
+            # Fallback to random actions if policy fails or no nodes
+            if prev_num_nodes > 0:
+                executed_actions = self.topology.act()
+            else:
+                executed_actions = {}
         
-        # Get new state
+        # Get new state after actions
         new_state = self.state_extractor.get_state_features(include_substrate=True)
 
-        # Attempt graceful recovery if topology collapsed to zero nodes
-        empty_graph_recovered = False
+        # Attempt graceful recovery if topology collapsed to zero nodes AFTER actions
+        empty_graph_recovered_post = False
         if self.enable_empty_graph_recovery and new_state['num_nodes'] == 0:
             recovered_state = self._recover_empty_graph(prev_state)
             if recovered_state is not None and recovered_state['num_nodes'] > 0:
                 new_state = recovered_state
-                empty_graph_recovered = True
+                empty_graph_recovered_post = True
+
+        # Track if ANY recovery happened this step
+        empty_graph_recovered = empty_graph_recovered_pre or empty_graph_recovered_post
 
         # Get observation from GraphInputEncoder output (after any recovery adjustments)
         observation = self._get_encoder_observation(new_state)
@@ -1282,17 +1300,37 @@ class DurotaxisEnv(gym.Env):
             return
 
         positions = self.topology.graph.ndata['pos']
-        current_centroid = positions.mean(dim=0)
-        shift = target_centroid.to(positions.device) - current_centroid
-        adjusted_positions = positions + shift
-
-        if self.empty_graph_recovery_noise and self.empty_graph_recovery_noise > 0:
-            noise = torch.empty_like(adjusted_positions).uniform_(
-                -self.empty_graph_recovery_noise,
-                self.empty_graph_recovery_noise
-            )
+        num_nodes = positions.shape[0]
+        
+        # IMPORTANT: Add diversity to prevent collinear nodes
+        # Generate random offsets for each node to ensure they're not all at same position
+        base_noise = max(5.0, self.empty_graph_recovery_noise if self.empty_graph_recovery_noise else 5.0)
+        
+        # Create diverse positions by radiating from target centroid
+        if num_nodes == 1:
+            # Single node: place at target with small noise
+            adjusted_positions = target_centroid.to(positions.device).unsqueeze(0)
+            noise = torch.randn_like(adjusted_positions) * (base_noise * 0.5)
             adjusted_positions = adjusted_positions + noise
+        else:
+            # Multiple nodes: arrange in a circle around target centroid to ensure diversity
+            angles = torch.linspace(0, 2 * np.pi, num_nodes + 1)[:-1]  # Evenly spaced angles
+            radius = base_noise * 2.0  # Radius of circle
+            
+            adjusted_positions = torch.zeros_like(positions)
+            target_x, target_y = target_centroid[0].item(), target_centroid[1].item()
+            
+            for i in range(num_nodes):
+                angle = angles[i].item()
+                # Place on circle
+                x = target_x + radius * np.cos(angle)
+                y = target_y + radius * np.sin(angle)
+                # Add small random jitter to break perfect symmetry
+                x += np.random.uniform(-base_noise * 0.3, base_noise * 0.3)
+                y += np.random.uniform(-base_noise * 0.3, base_noise * 0.3)
+                adjusted_positions[i] = torch.tensor([x, y], dtype=positions.dtype, device=positions.device)
 
+        # Clamp to substrate bounds
         width = float(self.substrate.width)
         height = float(self.substrate.height)
         adjusted_positions[:, 0] = torch.clamp(adjusted_positions[:, 0], 0.0, max(width - 1e-3, 0.0))

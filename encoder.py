@@ -159,6 +159,19 @@ class GraphInputEncoder(nn.Module):
             The graph token (first output element) contains global graph information
             and can be used for graph-level predictions or as context for node decisions.
         """
+        
+        # Safety check: replace NaN/Inf values with zeros to prevent propagation
+        if torch.isnan(graph_features).any() or torch.isinf(graph_features).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in graph_features, replacing with zeros")
+            graph_features = torch.nan_to_num(graph_features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if torch.isnan(node_features).any() or torch.isinf(node_features).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in node_features, replacing with zeros")
+            node_features = torch.nan_to_num(node_features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if torch.isnan(edge_features).any() or torch.isinf(edge_features).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in edge_features, replacing with zeros")
+            edge_features = torch.nan_to_num(edge_features, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Encode graph-level features as "virtual node"
         # Handle both single graph [feature_dim] and batched graphs [batch_size, feature_dim]
@@ -200,6 +213,11 @@ class GraphInputEncoder(nn.Module):
 
         # Run GraphTransformer
         out = self.gnn(x, edge_index, edge_emb, batch)
+        
+        # Final safety check on output
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in encoder output, replacing with zeros")
+            out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
         return out  # [num_nodes+1, out_dim]
 
