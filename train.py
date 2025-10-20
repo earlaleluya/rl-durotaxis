@@ -548,7 +548,7 @@ class DurotaxisTrainer:
         # Learning rate scheduler for long runs
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=500)
         
-        # Training tracking
+        # Training tracking - initialize before potential checkpoint loading
         self.episode_rewards = defaultdict(list)
         self.losses = defaultdict(list)
         # Per-episode loss tracking (one value per episode: average total loss applied to episodes in a batch)
@@ -556,6 +556,15 @@ class DurotaxisTrainer:
         self.smoothed_rewards = []  # Track moving average of total rewards
         self.smoothed_losses = []   # Track moving average of losses
         self.best_total_reward = float('-inf')
+        self.start_episode = 0  # For resume training
+        
+        # Resume training if configured (check both trainer.resume_training and top-level)
+        resume_config = self.config_loader.config.get('trainer', {}).get('resume_training', {})
+        if not resume_config:
+            # Fallback to top-level resume_training for backward compatibility
+            resume_config = self.config_loader.config.get('resume_training', {})
+        if resume_config.get('enabled', False):
+            self._load_checkpoint_for_resume(resume_config)
         
         # Enhanced detailed node logging per step
         self.detailed_node_logs = []  # Store detailed node data per step per episode
@@ -2831,11 +2840,13 @@ class DurotaxisTrainer:
         """Main training loop with batch updates"""
         # Run directory already created in __init__, just confirm it exists
         print(f"🏋️ Starting training for {self.total_episodes} episodes (Run #{self.run_number:04d})")
+        if self.start_episode > 0:
+            print(f"🔄 Resuming from episode {self.start_episode}")
         print(f"📁 Saving to: {self.run_dir}")
         print(f"📊 Batch Training: {self.rollout_batch_size} episodes per batch, {self.update_epochs} update epochs, {self.minibatch_size} minibatch size")
         print(f"📊 Progress format: Batch | R: Current (MA: MovingAvg, Best: Best) | Loss | Entropy | LR: Learning Rate | Episodes | Success Rate | Focus: Component(Weight)")
         
-        episode_count = 0
+        episode_count = self.start_episode
         batch_count = 0
         
         while episode_count < self.total_episodes:
@@ -3127,11 +3138,11 @@ class DurotaxisTrainer:
                 best_batch_reward = max(batch_episode_rewards) if batch_episode_rewards else 0.0
                 if best_batch_reward > self.best_total_reward:
                     self.best_total_reward = best_batch_reward
-                    self.save_model(f"best_model_batch{batch_count}.pt")
+                    self.save_model(f"best_model_batch{batch_count}.pt", episode_count)
                 
                 # Periodic saves (only if checkpoint_every is configured)
                 if self.checkpoint_every is not None and batch_count % (self.checkpoint_every // self.rollout_batch_size) == 0 and batch_count > 0:
-                    self.save_model(f"checkpoint_batch{batch_count}.pt")
+                    self.save_model(f"checkpoint_batch{batch_count}.pt", episode_count)
                     print(f"💾 Checkpoint saved at batch {batch_count} (episode {episode_count})")
                 
                 batch_count += 1
@@ -3145,7 +3156,7 @@ class DurotaxisTrainer:
         if self.enable_detailed_logging:
             self.finalize_detailed_logging()
         
-        self.save_model("final_model.pt")
+        self.save_model("final_model.pt", episode_count)
         self.save_metrics()
         
         # Generate training visualization plots
@@ -3500,8 +3511,20 @@ class DurotaxisTrainer:
         
         self.current_reward_summary = active_components
     
-    def save_model(self, filename: str):
-        """Save model checkpoint to run directory"""
+    def save_model(self, filename: str, episode_count: int = None):
+        """
+        Save model checkpoint to run directory
+        
+        Parameters
+        ----------
+        filename : str
+            Name of checkpoint file
+        episode_count : int, optional
+            Current episode count (for resume). If not provided, uses self.start_episode
+        """
+        if episode_count is None:
+            episode_count = getattr(self, 'start_episode', 0)
+        
         checkpoint = {
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -3510,12 +3533,113 @@ class DurotaxisTrainer:
             'losses': dict(self.losses),
             'best_reward': self.best_total_reward,
             'component_weights': self.component_weights,
-            'run_number': self.run_number
+            'run_number': self.run_number,
+            'episode_count': episode_count,  # Track episode progress
+            'smoothed_rewards': self.smoothed_rewards,
+            'smoothed_losses': self.smoothed_losses,
         }
         
         filepath = os.path.join(self.run_dir, filename)
         torch.save(checkpoint, filepath)
-        print(f"💾 Saved: {filename} (Run #{self.run_number})")
+        print(f"💾 Saved: {filename} (Run #{self.run_number}, Episode {episode_count})")
+    
+    def _load_checkpoint_for_resume(self, resume_config: dict):
+        """
+        Load checkpoint to resume training
+        
+        Parameters
+        ----------
+        resume_config : dict
+            Configuration with keys:
+            - checkpoint_path: Path to checkpoint file (required)
+            - resume_from_best: If True, load best_model.pt instead of last checkpoint
+            - reset_optimizer: If True, don't restore optimizer state
+            - reset_episode_count: If True, start from episode 0
+        """
+        # Determine checkpoint file
+        checkpoint_path = resume_config.get('checkpoint_path')
+        if resume_config.get('resume_from_best', False):
+            # Look for best_model*.pt files
+            import glob
+            best_models = glob.glob(os.path.join(self.run_dir, 'best_model*.pt'))
+            if best_models:
+                # Use the most recent best model
+                checkpoint_path = max(best_models, key=os.path.getmtime)
+                print(f"🏆 Resume from best model: {os.path.basename(checkpoint_path)}")
+        
+        if not checkpoint_path:
+            print(f"❌ Resume training enabled but no checkpoint_path specified")
+            return
+        
+        # Handle relative paths
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.join(os.getcwd(), checkpoint_path)
+        
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ Checkpoint file not found: {checkpoint_path}")
+            return
+        
+        print(f"🔄 Loading checkpoint for resume: {checkpoint_path}")
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Always load network state
+            self.network.load_state_dict(checkpoint['network_state_dict'])
+            print(f"   ✅ Loaded network weights")
+            
+            # Conditionally load optimizer state
+            if not resume_config.get('reset_optimizer', False):
+                if 'optimizer_state_dict' in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print(f"   ✅ Loaded optimizer state")
+                if 'scheduler_state_dict' in checkpoint:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    print(f"   ✅ Loaded scheduler state")
+            else:
+                print(f"   ⚠️ Optimizer state reset (as configured)")
+            
+            # Conditionally load episode count
+            if not resume_config.get('reset_episode_count', False):
+                if 'episode_count' in checkpoint:
+                    self.start_episode = checkpoint['episode_count']
+                    print(f"   ✅ Resuming from episode {self.start_episode}")
+            else:
+                self.start_episode = 0
+                print(f"   ⚠️ Episode count reset to 0 (as configured)")
+            
+            # Load training history
+            if 'episode_rewards' in checkpoint:
+                self.episode_rewards = defaultdict(list, checkpoint['episode_rewards'])
+                print(f"   ✅ Loaded {len(self.episode_rewards.get('total_reward', []))} episode reward history")
+            
+            if 'losses' in checkpoint:
+                self.losses = defaultdict(list, checkpoint['losses'])
+                print(f"   ✅ Loaded loss history")
+            
+            if 'best_reward' in checkpoint:
+                self.best_total_reward = checkpoint['best_reward']
+                print(f"   ✅ Best reward so far: {self.best_total_reward:.2f}")
+            
+            if 'component_weights' in checkpoint:
+                self.component_weights = checkpoint['component_weights']
+                print(f"   ✅ Loaded component weights")
+            
+            if 'smoothed_rewards' in checkpoint:
+                self.smoothed_rewards = checkpoint['smoothed_rewards']
+                print(f"   ✅ Loaded smoothed rewards")
+            
+            if 'smoothed_losses' in checkpoint:
+                self.smoothed_losses = checkpoint['smoothed_losses']
+                print(f"   ✅ Loaded smoothed losses")
+            
+            print(f"✅ Resume checkpoint loaded successfully!")
+            
+        except Exception as e:
+            print(f"❌ Failed to load checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+
     
     def load_model(self, filename: str):
         """Load model checkpoint from file"""

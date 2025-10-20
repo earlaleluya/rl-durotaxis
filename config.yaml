@@ -16,6 +16,14 @@ trainer:
   learning_rate: 0.0001   
   save_dir: "./training_results"
   
+  # Resume training configuration
+  resume_training:
+    enabled: false                      # Set to true to resume from checkpoint
+    checkpoint_path: null               # Path to checkpoint file (e.g., "./training_results/run0001/checkpoint_episode_500.pt")
+    resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
+    reset_optimizer: false              # If true, create fresh optimizer (useful if changing learning rate)
+    reset_episode_count: false          # If true, restart episode counter from 0
+  
   # ============================================================================
   # CURRICULUM LEARNING SYSTEM - Progressive Migration Training
   # ============================================================================
