@@ -16,6 +16,14 @@ trainer:
   learning_rate: 0.0001   
   save_dir: "./training_results"
   
+  # Resume training configuration
+  resume_training:
+    enabled: false                      # Set to true to resume from checkpoint
+    checkpoint_path: null               # Path to checkpoint file (e.g., "./training_results/run0001/checkpoint_episode_500.pt")
+    resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
+    reset_optimizer: false              # If true, create fresh optimizer (useful if changing learning rate)
+    reset_episode_count: false          # If true, restart episode counter from 0
+  
   # ============================================================================
   # CURRICULUM LEARNING SYSTEM - Progressive Migration Training
   # ============================================================================
@@ -189,7 +197,7 @@ trainer:
   # Empty graph handling configuration
   empty_graph_handling:
     enable_graceful_recovery: true  # Enable graceful handling instead of breaking episodes
-    recovery_num_nodes: 1           # Number of nodes to spawn when recovering from empty graph
+    recovery_num_nodes: 5           # Number of nodes to spawn when recovering from empty graph
     log_recoveries: true            # Log when empty graph recovery occurs
   
   # Encoder configuration
@@ -269,7 +277,7 @@ environment:
     b: 1.0
   
   # Node and topology parameters - RELAXED for learning
-  init_num_nodes: 3              # Start with more nodes for stability
+  init_num_nodes: 5              # Start with more nodes for stability
   max_critical_nodes: 75         # Allow more nodes
   threshold_critical_nodes: 500  # Higher threshold before termination
   max_steps: 1000                # Much more time to reach goal
@@ -432,10 +440,10 @@ actor_critic:
   
   # Spawn parameter bounds [min, max]
   spawn_parameter_bounds:
-    gamma: [0.1, 10.0]          # Cell migration sensitivity parameter
-    alpha: [0.1, 5.0]           # Directional bias strength
-    noise: [0.0, 2.0]           # Stochastic noise level
-    theta: [-3.14159, 3.14159]  # Migration direction angle (-pi to pi)
+    gamma: [2.0, 8.0]          # Cell migration sensitivity parameter
+    alpha: [0.5, 4.0]           # Directional bias strength
+    noise: [0.05, 2.0]           # Stochastic noise level
+    theta: [-1.5708, 1.5708]    # Migration direction angle (-pi/2 to pi/2)
   
   # Value function components (list of reward components to predict)
   value_components:
