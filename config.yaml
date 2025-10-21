@@ -440,10 +440,10 @@ actor_critic:
   
   # Spawn parameter bounds [min, max]
   spawn_parameter_bounds:
-    gamma: [2.0, 8.0]          # Cell migration sensitivity parameter
+    gamma: [2.0, 8.0]           # Cell migration sensitivity parameter
     alpha: [0.5, 4.0]           # Directional bias strength
-    noise: [0.05, 2.0]           # Stochastic noise level
-    theta: [-1.5708, 1.5708]    # Migration direction angle (-pi/2 to pi/2)
+    noise: [0.05, 0.5]          # Stochastic noise level
+    theta: [-0.7854, 0.7854]    # Migration direction angle (-π/4 to π/4, -45° to +45°, biased toward rightward)
   
   # Value function components (list of reward components to predict)
   value_components:
