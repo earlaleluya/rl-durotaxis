@@ -258,6 +258,10 @@ class HybridActorCritic(nn.Module):
         # Combine node tokens with graph context
         combined_features = torch.cat([node_tokens, graph_context], dim=-1)  # [num_nodes, out_dim*2]
         shared_features = self.shared_node_mlp(combined_features)  # [num_nodes, hidden_dim]
+        # Safety: sanitize shared features to prevent NaN propagation
+        if torch.isnan(shared_features).any() or torch.isinf(shared_features).any():
+            print(f"⚠️ WARNING: NaN/Inf detected in shared_node_features, replacing with zeros")
+            shared_features = torch.nan_to_num(shared_features, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Discrete action logits and probabilities
         discrete_logits = self.discrete_head(shared_features)  # [num_nodes, num_discrete_actions]
@@ -270,7 +274,7 @@ class HybridActorCritic(nn.Module):
             
             # Set invalid action logits to -inf (will become 0 probability after softmax)
             discrete_logits = discrete_logits.masked_fill(~action_mask, -float('inf'))
-        
+
         # Sanitize discrete_logits before softmax to prevent NaN
         # Clamp to prevent extreme values that cause softmax to produce NaN
         discrete_logits = torch.clamp(discrete_logits, min=-20.0, max=20.0)
@@ -306,8 +310,10 @@ class HybridActorCritic(nn.Module):
             continuous_logstd = torch.where(torch.isnan(continuous_logstd) | torch.isinf(continuous_logstd),
                                            torch.zeros_like(continuous_logstd),
                                            continuous_logstd)
-        
-        continuous_std = torch.exp(torch.clamp(continuous_logstd, -5, 2))  # Prevent extreme values
+
+        # Further clamp logstd to prevent overflow/underflow in exp
+        continuous_logstd = torch.clamp(continuous_logstd, min=-10.0, max=5.0)
+        continuous_std = torch.exp(torch.clamp(continuous_logstd, -10.0, 5.0))  # Prevent extreme values
         
         # Apply parameter bounds to continuous actions
         continuous_mu_bounded = self._apply_bounds(continuous_mu)
