@@ -243,10 +243,11 @@ class Topology:
         # Initialize spawn parameter arrays if they don't exist
         if 'gamma' not in self.graph.ndata:
             current_num_nodes = self.graph.num_nodes()
-            self.graph.ndata['gamma'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
-            self.graph.ndata['alpha'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
-            self.graph.ndata['noise'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
-            self.graph.ndata['theta'] = torch.full((current_num_nodes,), float('nan'), dtype=torch.float32)
+            # Initialize spawn parameters to zeros for safety (avoid NaN propagation)
+            self.graph.ndata['gamma'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
+            self.graph.ndata['alpha'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
+            self.graph.ndata['noise'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
+            self.graph.ndata['theta'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
         
         # Set the spawn parameters for the new node (at index num_nodes_before)
         new_node_idx = num_nodes_before
@@ -276,7 +277,17 @@ class Topology:
         """
         node_pos = self.graph.ndata['pos'][node_id].numpy()
         node_intensity = self.substrate.get_intensity(node_pos)
-        return gamma * (1 / (1 + (alpha / node_intensity)**2)) + noise
+        # Guard against zero or non-finite intensities
+        try:
+            node_intensity = float(node_intensity)
+        except Exception:
+            node_intensity = 1.0
+
+        if not np.isfinite(node_intensity) or node_intensity <= 1e-6:
+            # Use a safe fallback intensity to avoid division by zero
+            node_intensity = 1.0
+
+        return float(gamma) * (1.0 / (1.0 + (float(alpha) / node_intensity)**2)) + float(noise)
 
 
 
@@ -521,11 +532,11 @@ class Topology:
         self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
         self.graph.ndata['to_delete'] = torch.zeros(init_num_nodes, dtype=torch.float32)  # Initialize to_delete flags
         
-        # Initialize spawn parameters for initial nodes (NaN since they weren't spawned)
-        self.graph.ndata['gamma'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
-        self.graph.ndata['alpha'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
-        self.graph.ndata['noise'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
-        self.graph.ndata['theta'] = torch.full((init_num_nodes,), float('nan'), dtype=torch.float32)
+        # Initialize spawn parameters for initial nodes (zeros for safety to avoid NaN propagation)
+        self.graph.ndata['gamma'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
+        self.graph.ndata['alpha'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
+        self.graph.ndata['noise'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
+        self.graph.ndata['theta'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
         
         # Initial graph may start with no edges
         # Add some random initial connections
