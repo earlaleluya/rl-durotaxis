@@ -271,11 +271,42 @@ class HybridActorCritic(nn.Module):
             # Set invalid action logits to -inf (will become 0 probability after softmax)
             discrete_logits = discrete_logits.masked_fill(~action_mask, -float('inf'))
         
+        # Sanitize discrete_logits before softmax to prevent NaN
+        # Clamp to prevent extreme values that cause softmax to produce NaN
+        discrete_logits = torch.clamp(discrete_logits, min=-20.0, max=20.0)
+        
+        # Check for NaN/Inf in logits before softmax
+        if torch.isnan(discrete_logits).any() or torch.isinf(discrete_logits).any():
+            print(f"⚠️ WARNING: Invalid discrete_logits detected before softmax")
+            discrete_logits = torch.where(torch.isnan(discrete_logits) | torch.isinf(discrete_logits), 
+                                         torch.zeros_like(discrete_logits), 
+                                         discrete_logits)
+        
         discrete_probs = F.softmax(discrete_logits, dim=-1)
+        
+        # Additional sanitization: if softmax still produces NaN/Inf, use uniform distribution
+        if torch.isnan(discrete_probs).any() or torch.isinf(discrete_probs).any():
+            print(f"⚠️ WARNING: NaN/Inf in discrete_probs after softmax, using uniform distribution")
+            num_actions = discrete_probs.shape[-1]
+            discrete_probs = torch.ones_like(discrete_probs) / num_actions
         
         # Continuous action parameters
         continuous_mu = self.continuous_mu_head(shared_features)  # [num_nodes, continuous_dim]
         continuous_logstd = self.continuous_logstd_head(shared_features)  # [num_nodes, continuous_dim]
+        
+        # Sanitize continuous parameters to prevent NaN
+        if torch.isnan(continuous_mu).any() or torch.isinf(continuous_mu).any():
+            print(f"⚠️ WARNING: NaN/Inf detected in continuous_mu, replacing with zeros")
+            continuous_mu = torch.where(torch.isnan(continuous_mu) | torch.isinf(continuous_mu),
+                                       torch.zeros_like(continuous_mu),
+                                       continuous_mu)
+        
+        if torch.isnan(continuous_logstd).any() or torch.isinf(continuous_logstd).any():
+            print(f"⚠️ WARNING: NaN/Inf detected in continuous_logstd, replacing with zeros")
+            continuous_logstd = torch.where(torch.isnan(continuous_logstd) | torch.isinf(continuous_logstd),
+                                           torch.zeros_like(continuous_logstd),
+                                           continuous_logstd)
+        
         continuous_std = torch.exp(torch.clamp(continuous_logstd, -5, 2))  # Prevent extreme values
         
         # Apply parameter bounds to continuous actions
@@ -433,7 +464,17 @@ class HybridActorCritic(nn.Module):
             }
         
         # Evaluate discrete actions
-        discrete_dist = torch.distributions.Categorical(probs=output['discrete_probs'])
+        # Final safety check before creating Categorical distribution
+        discrete_probs = output['discrete_probs']
+        if torch.isnan(discrete_probs).any() or torch.isinf(discrete_probs).any():
+            print(f"⚠️ CRITICAL: NaN/Inf in discrete_probs at evaluate_actions, using uniform distribution")
+            num_actions = discrete_probs.shape[-1]
+            discrete_probs = torch.ones_like(discrete_probs) / num_actions
+        
+        # Ensure probs sum to 1 (numerical stability)
+        discrete_probs = discrete_probs / (discrete_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        discrete_dist = torch.distributions.Categorical(probs=discrete_probs)
         discrete_log_probs = discrete_dist.log_prob(discrete_actions)
         discrete_entropy = discrete_dist.entropy()
         
