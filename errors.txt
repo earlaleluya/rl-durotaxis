@@ -1,0 +1,35 @@
+📊 Ep11 Step  6: N= 4 E= 3 | R=+0.083 (S:-3.0 N:+1.5 E:+0.4) | C= 14.7→ | A= 4 | T=False False
+⚠️  Empty graph recovery skipped: max attempts reached (2)
+⚪ Episode terminated: No nodes remaining
+📊 Ep11 Step  7: N= 0 E= 0 | R=-104.900 (S:+0.0 N:+0.0 E:+0.0) | C=  0.0← | A= 8 | T=True False
+📄 Appended episode 9 to detailed_nodes_all_episodes.json (7 steps)
+   └─ Total episodes in file: 10
+   └─ Episode summary: 27 total nodes tracked, avg 3.9 nodes/step, range 2-5 nodes
+Episode    9: R=-231.442 (Smooth=-194.83) | MB=46.0 | Steps=  7 | Success=False | Loss= 0.0000
+Traceback (most recent call last):
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 3821, in <module>
+    main()
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 3817, in main
+    trainer.train()
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 2969, in train
+    losses = self.update_policy_minibatch(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 2654, in update_policy_minibatch
+    return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, episode)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 2749, in update_policy_with_value_clipping
+    hybrid_loss_dict = self.compute_hybrid_policy_loss(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 2412, in compute_hybrid_policy_loss
+    adaptive_discrete_weight, adaptive_continuous_weight = self.compute_adaptive_gradient_scaling(
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 1184, in compute_adaptive_gradient_scaling
+    discrete_grads = torch.autograd.grad(
+                     ^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/autograd/__init__.py", line 436, in grad
+    result = _engine_run_backward(
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/autograd/graph.py", line 768, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0! (when checking argument for argument weight in method wrapper_CUDA__native_batch_norm_backward)
