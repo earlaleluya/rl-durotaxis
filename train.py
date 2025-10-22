@@ -1072,9 +1072,9 @@ class DurotaxisTrainer:
         batch_size = next(iter(advantages.values())).shape[0]
         
         # Step 1: Extract advantages in component order
-        advantage_tensor = torch.stack([
-            advantages[comp] for comp in self.component_names
-        ], dim=1)  # Shape: [batch_size, num_components]
+        # Each advantages[comp] should be [batch_size], stack to get [batch_size, num_components]
+        advantage_list = [advantages[comp] for comp in self.component_names]
+        advantage_tensor = torch.stack(advantage_list, dim=1)  # Shape: [batch_size, num_components]
         
         # Step 2: Learnable base weights (Tier 1)
         base_weights = torch.softmax(self.learnable_component_weights.base_weights, dim=0)
@@ -1083,7 +1083,15 @@ class DurotaxisTrainer:
         if self.enable_attention_weighting and self.learnable_component_weights.attention_weights is not None:
             # Compute attention weights based on advantage magnitudes
             advantage_magnitudes = torch.abs(advantage_tensor).mean(dim=0)  # [num_components]
-            attention_logits = self.learnable_component_weights.attention_weights(advantage_magnitudes.unsqueeze(0))  # Add batch dim
+            
+            # Ensure advantage_magnitudes is a 1D tensor, then add batch dimension correctly
+            if advantage_magnitudes.dim() == 2:
+                # If somehow it's [num_components, 1], squeeze and reshape
+                advantage_magnitudes = advantage_magnitudes.squeeze()
+            
+            # Add batch dimension: [num_components] -> [1, num_components]
+            attention_input = advantage_magnitudes.unsqueeze(0)  # [1, num_components]
+            attention_logits = self.learnable_component_weights.attention_weights(attention_input)  # [1, num_components]
             attention_logits = attention_logits.squeeze(0)  # Remove batch dim -> [num_components]
             attention_weights = torch.softmax(attention_logits, dim=0)
             
@@ -1171,10 +1179,14 @@ class DurotaxisTrainer:
         discrete_gradients = []
         continuous_gradients = []
         
+        # Ensure losses are scalars by taking mean if necessary
+        discrete_loss_scalar = discrete_loss.mean() if discrete_loss.numel() > 1 else discrete_loss
+        continuous_loss_scalar = continuous_loss.mean() if continuous_loss.numel() > 1 else continuous_loss
+        
         # Get gradients for discrete loss
-        if discrete_loss.requires_grad:
+        if discrete_loss_scalar.requires_grad:
             discrete_grads = torch.autograd.grad(
-                discrete_loss, 
+                discrete_loss_scalar, 
                 [p for p in self.network.parameters() if p.requires_grad], 
                 retain_graph=True, 
                 create_graph=False,
@@ -1183,9 +1195,9 @@ class DurotaxisTrainer:
             discrete_gradients = [g for g in discrete_grads if g is not None]
         
         # Get gradients for continuous loss  
-        if continuous_loss.requires_grad:
+        if continuous_loss_scalar.requires_grad:
             continuous_grads = torch.autograd.grad(
-                continuous_loss,
+                continuous_loss_scalar,
                 [p for p in self.network.parameters() if p.requires_grad], 
                 retain_graph=True, 
                 create_graph=False,
