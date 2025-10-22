@@ -65,13 +65,9 @@ class Actor(nn.Module):
         num_nodes = node_tokens.shape[0]
         device = node_tokens.device
         
-        # Determine if we need CPU fallback for ResNet only
-        use_cpu_fallback = (num_nodes > 200 and device.type == 'cuda')
-        
-        # If using CPU fallback, temporarily move ResNet to CPU
-        if use_cpu_fallback:
-            resnet_device = next(self.resnet_body.parameters()).device
-            self.resnet_body.cpu()
+        # For very large graphs on CUDA, use gradient checkpointing to save memory
+        # instead of moving to CPU (which causes device mismatch in backward pass)
+        use_checkpointing = (num_nodes > 200 and device.type == 'cuda')
         
         graph_context = graph_token.unsqueeze(0).repeat(num_nodes, 1)
         combined_features = torch.cat([node_tokens, graph_context], dim=-1)
@@ -90,35 +86,26 @@ class Actor(nn.Module):
         batch_size = 64  # Small batch size for 4GB GPU
         if num_nodes <= batch_size:
             # Small enough, process all at once
-            if use_cpu_fallback:
-                # Process on CPU (ResNet already moved above)
-                image_like_features_cpu = image_like_features.cpu()
-                resnet_out = self.resnet_body(image_like_features_cpu)
-                shared_features = resnet_out.view(num_nodes, -1).to(device)
-            else:
-                resnet_out = self.resnet_body(image_like_features)
-                shared_features = resnet_out.view(num_nodes, -1)
+            resnet_out = self.resnet_body(image_like_features)
+            shared_features = resnet_out.view(num_nodes, -1)
         else:
-            # Process in batches
+            # Process in batches to reduce peak memory usage
             resnet_outputs = []
             for i in range(0, num_nodes, batch_size):
                 batch_end = min(i + batch_size, num_nodes)
                 batch_features = image_like_features[i:batch_end]
                 
-                if use_cpu_fallback:
-                    # Process on CPU (ResNet already moved above)
-                    batch_features_cpu = batch_features.cpu()
-                    batch_out = self.resnet_body(batch_features_cpu)
-                    resnet_outputs.append(batch_out.view(batch_end - i, -1).to(device))
+                # Use gradient checkpointing for large graphs to save memory
+                if use_checkpointing and torch.is_grad_enabled():
+                    batch_out = torch.utils.checkpoint.checkpoint(
+                        self.resnet_body, batch_features, use_reentrant=False
+                    )
                 else:
                     batch_out = self.resnet_body(batch_features)
-                    resnet_outputs.append(batch_out.view(batch_end - i, -1))
+                
+                resnet_outputs.append(batch_out.view(batch_end - i, -1))
             
             shared_features = torch.cat(resnet_outputs, dim=0)
-
-        # Move ResNet back to original device if we used CPU fallback
-        if use_cpu_fallback:
-            self.resnet_body.to(resnet_device)
 
         # Pass through final MLP (stays on original device)
         shared_features = self.action_mlp(shared_features)
