@@ -1,0 +1,49 @@
+📊 Ep11 Step  6: N= 4 E= 3 | R=+2.031 (S:-3.0 N:+6.4 E:-0.2) | C= 44.1← | A= 4 | T=False False
+♻️  Empty graph recovery triggered at step 7 (attempt 2/2) — respawning 5 node(s)
+📊 Ep11 Step  7: N= 5 E= 4 | R=-45.783 (S:+0.0 N:+2.9 E:+0.3) | C= 42.5← ♻️ | A= 2 | T=False False
+⚠️  Empty graph recovery skipped: max attempts reached (2)
+⚪ Episode terminated: No nodes remaining
+📊 Ep11 Step  8: N= 0 E= 0 | R=-104.960 (S:+0.0 N:+0.0 E:+0.0) | C=  0.0← | A= 2 | T=True False
+📄 Appended episode 9 to detailed_nodes_all_episodes.json (8 steps)
+   └─ Total episodes in file: 10
+   └─ Episode summary: 27 total nodes tracked, avg 3.4 nodes/step, range 2-5 nodes
+Episode    9: R=-96.906 (Smooth=-163.55) | MB=56.0 | Steps=  8 | Success=False | Loss= 0.0000
+Traceback (most recent call last):
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 3825, in <module>
+    main()
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 3821, in main
+    trainer.train()
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 2973, in train
+    losses = self.update_policy_minibatch(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 2658, in update_policy_minibatch
+    return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, episode)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/train.py", line 2720, in update_policy_with_value_clipping
+    batched_eval_output = self.network.evaluate_actions(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/actor_critic.py", line 413, in evaluate_actions
+    output = self.forward(state_dict, deterministic=True, action_mask=action_mask)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/actor_critic.py", line 312, in forward
+    discrete_logits, continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/d/GitHub/rl-durotaxis/actor_critic.py", line 86, in forward
+    projected_features = self.feature_proj(combined_features) # [num_nodes, 512]
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 117, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu! (when checking argument for argument mat1 in method wrapper_CUDA_addmm)
