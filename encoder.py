@@ -7,6 +7,50 @@ from torch_geometric.nn import TransformerConv
 from config_loader import ConfigLoader
 
 
+class SimplicialEmbedding(nn.Module):
+    """
+    Simplicial Embedding (SEM) Layer.
+
+    This layer constrains the latent features to lie on a product of geometric
+    simplices. It partitions the input, applies a group-wise softmax, and
+    introduces a geometric inductive bias that can stabilize training.
+
+    Args:
+        input_dim (int): The dimension of the input feature vector.
+        num_groups (int): The number of groups (L) to partition the input into.
+        temperature (float): The temperature parameter (τ) for the softmax.
+    """
+    def __init__(self, input_dim: int, num_groups: int, temperature: float = 1.0):
+        super().__init__()
+        if input_dim % num_groups != 0:
+            raise ValueError(f"input_dim ({input_dim}) must be divisible by num_groups ({num_groups})")
+        
+        self.input_dim = input_dim
+        self.num_groups = num_groups
+        self.group_size = input_dim // num_groups
+        self.temperature = temperature
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the simplicial embedding transformation.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (..., input_dim).
+
+        Returns:
+            torch.Tensor: The transformed tensor with the same shape as the input.
+        """
+        # Reshape for group-wise softmax
+        original_shape = x.shape
+        x_reshaped = x.view(-1, self.num_groups, self.group_size)
+
+        # Apply softmax with temperature to each group
+        z = F.softmax(x_reshaped / self.temperature, dim=-1)
+
+        # Reshape back to the original input shape (except for the last dim)
+        return z.view(*original_shape)
+
+
 class GraphInputEncoder(nn.Module):
     """
     Graph Input Encoder using Graph Transformer architecture for durotaxis simulation.
@@ -63,25 +107,20 @@ class GraphInputEncoder(nn.Module):
         """
         super().__init__()
         
-        # Load configuration if not provided as overrides
-        if not overrides or any(param not in overrides for param in ['hidden_dim', 'out_dim', 'num_layers']):
-            config_loader = ConfigLoader(config_path)
-            config = config_loader.get_encoder_config()
-            
-            # Apply overrides
-            for key, value in overrides.items():
-                if value is not None:
-                    config[key] = value
-                    
-            # Note: hidden_dim was moved to actor_critic section, use fallback default
-            self.hidden_dim = config.get('hidden_dim', 128)  # Fallback since removed from encoder config
-            self.out_dim = config.get('out_dim', 64)
-            self.num_layers = config.get('num_layers', 4)
-        else:
-            # Use overrides directly (for backward compatibility)
-            self.hidden_dim = overrides.get('hidden_dim', 128)
-            self.out_dim = overrides.get('out_dim', 64)
-            self.num_layers = overrides.get('num_layers', 4)
+        # Load configuration from YAML file
+        config_loader = ConfigLoader(config_path)
+        config = config_loader.get_encoder_config()
+        
+        # Apply overrides
+        for key, value in overrides.items():
+            if value is not None:
+                config[key] = value
+        
+        # Set dimensions
+        # Note: hidden_dim was moved to actor_critic section, use fallback default
+        self.hidden_dim = config.get('hidden_dim', overrides.get('hidden_dim', 128))
+        self.out_dim = config.get('out_dim', overrides.get('out_dim', 64))
+        self.num_layers = config.get('num_layers', overrides.get('num_layers', 4))
             
         # Graph-level MLP → virtual node
         self.graph_mlp = nn.Sequential(
@@ -110,6 +149,37 @@ class GraphInputEncoder(nn.Module):
             dropout=0.1,
             edge_dim=self.hidden_dim  
         )
+
+        # Simplicial Embedding configuration
+        # Load from actor_critic section since that's where it's defined in config.yaml
+        actor_critic_config = config_loader.get_actor_critic_config()
+        self.sem_enabled = actor_critic_config.get('simplicial_embedding', {}).get('enabled', False)
+        self.sem_layer = None
+        if self.sem_enabled:
+            sem_groups = actor_critic_config.get('simplicial_embedding', {}).get('num_groups', 16)
+            sem_temperature = actor_critic_config.get('simplicial_embedding', {}).get('temperature', 1.0)
+            
+            # Ensure out_dim is divisible by num_groups
+            if self.out_dim % sem_groups != 0:
+                print(f"⚠️  WARNING: out_dim ({self.out_dim}) is not divisible by num_groups ({sem_groups})")
+                print(f"    Adjusting num_groups to nearest divisor...")
+                # Find nearest divisor
+                for g in range(sem_groups, 0, -1):
+                    if self.out_dim % g == 0:
+                        sem_groups = g
+                        print(f"    Using num_groups = {sem_groups}")
+                        break
+            
+            self.sem_layer = SimplicialEmbedding(
+                input_dim=self.out_dim,
+                num_groups=sem_groups,
+                temperature=sem_temperature
+            )
+            print(f"✅ Simplicial Embedding enabled in GraphInputEncoder:")
+            print(f"   - Input/Output dim: {self.out_dim}")
+            print(f"   - Num groups: {sem_groups}")
+            print(f"   - Group size: {self.out_dim // sem_groups}")
+            print(f"   - Temperature: {sem_temperature}")
 
         self.apply(self._init_weights)
 
@@ -213,11 +283,10 @@ class GraphInputEncoder(nn.Module):
 
         # Run GraphTransformer
         out = self.gnn(x, edge_index, edge_emb, batch)
-        
-        # Final safety check on output
-        if torch.isnan(out).any() or torch.isinf(out).any():
-            print(f"⚠️  WARNING: NaN/Inf detected in encoder output, replacing with zeros")
-            out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Apply Simplicial Embedding if enabled
+        if self.sem_layer is not None:
+            out = self.sem_layer(out)
 
         return out  # [num_nodes+1, out_dim]
 

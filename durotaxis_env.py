@@ -573,54 +573,29 @@ class DurotaxisEnv(gym.Env):
                 edge_index=edge_index_tensor
             )  # Shape: [num_nodes+1, out_dim]
             
-            # Check for potential information reduction
+            # ✅ SIMPLICIAL EMBEDDING HANDLES VARIABLE NODE COUNTS
+            # No pooling needed - Simplicial Embedding in encoder provides geometric structure
+            # that naturally handles variable graph sizes without information loss
             actual_nodes = encoder_out.shape[0] - 1  # -1 for graph token
             
-            if actual_nodes <= self.max_critical_nodes:
-                # Normal case: no pooling needed
-                # print(f"✅ No pooling needed: {actual_nodes} nodes ≤ {self.max_critical_nodes} max_critical_nodes")
-                encoder_flat = encoder_out.flatten().detach().cpu().numpy()
-                
-                # Use pre-allocated array (avoid new allocation)
-                self._pre_allocated_obs.fill(0.0)  # Reset to zeros
-                self._pre_allocated_obs[:len(encoder_flat)] = encoder_flat
-                return self._pre_allocated_obs.copy()  # Return copy to avoid mutation
+            # Flatten encoder output directly (no pooling)
+            encoder_flat = encoder_out.flatten().detach().cpu().numpy()
             
-            else:
-                # 🧠 SEMANTIC POOLING: Intelligently select representative nodes
-                # print(f"🧠 Applying semantic pooling: {actual_nodes} nodes > {self.max_critical_nodes} max_critical_nodes")
-                
-                graph_token = encoder_out[0:1]  # [1, out_dim] - Always preserve graph token
-                node_embeddings = encoder_out[1:]  # [actual_nodes, out_dim]
-                
-                # Extract semantic features for clustering
-                selected_indices = self._semantic_node_selection(
-                    node_embeddings, 
-                    state, 
-                    target_count=self.max_critical_nodes
-                )
-                
-                # Select representative nodes
-                selected_nodes = node_embeddings[selected_indices]
-                
-                # Combine graph token with selected nodes
-                pooled_embeddings = torch.cat([graph_token, selected_nodes], dim=0)
-                
-                # print(f"  📊 Pooling results:")
-                # print(f"    - Original nodes: {actual_nodes}")
-                # print(f"    - Selected nodes: {len(selected_indices)}")
-                # print(f"    - Selected indices: {sorted(selected_indices.tolist())}")
-                # print(f"    - Information preserved: {len(selected_indices)/actual_nodes*100:.1f}%")
-                
-                # Flatten and pad to fixed size using pre-allocated array
-                pooled_flat = pooled_embeddings.flatten().detach().cpu().numpy()
-                self._pre_allocated_obs.fill(0.0)  # Reset to zeros
-                self._pre_allocated_obs[:len(pooled_flat)] = pooled_flat
-                
-                return self._pre_allocated_obs.copy()  # Return copy to avoid mutation
+            # Dynamically handle variable-sized observations
+            if len(encoder_flat) > len(self._pre_allocated_obs):
+                # Resize pre-allocated array if needed
+                self._pre_allocated_obs = np.zeros(len(encoder_flat), dtype=np.float32)
+                self._max_obs_size = len(encoder_flat)
+            
+            # Use pre-allocated array (avoid new allocation for same-size or smaller obs)
+            self._pre_allocated_obs.fill(0.0)  # Reset to zeros
+            self._pre_allocated_obs[:len(encoder_flat)] = encoder_flat
+            return self._pre_allocated_obs[:len(encoder_flat)].copy()  # Return only the used portion
                 
         except Exception as e:
             print(f"Error getting encoder observation: {e}")
+            import traceback
+            traceback.print_exc()
             # Fallback to zero observation using pre-allocated array
             self._pre_allocated_obs.fill(0.0)
             return self._pre_allocated_obs.copy()
