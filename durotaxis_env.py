@@ -1019,7 +1019,10 @@ class DurotaxisEnv(gym.Env):
         if num_nodes < 2:
             graph_reward -= self.connectivity_penalty  # Strong penalty for losing all connectivity
         elif num_nodes > self.max_critical_nodes:
-            graph_reward -= self.growth_penalty  # Penalty for excessive growth, N > Nc
+            # Scaled penalty: grows quadratically with excess nodes to strongly discourage runaway growth
+            excess_nodes = num_nodes - self.max_critical_nodes
+            scaled_penalty = self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
+            graph_reward -= scaled_penalty
         else:
             graph_reward += self.survival_reward # Basic survival reward
 

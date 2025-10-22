@@ -76,9 +76,21 @@ class Actor(nn.Module):
         padded_features = F.pad(projected_features, (0, 576 - 512)) # [num_nodes, 576]
         image_like_features = padded_features.view(-1, 1, 24, 24) # [num_nodes, 1, 24, 24]
 
-        # Pass through ResNet body
-        resnet_out = self.resnet_body(image_like_features)
-        shared_features = resnet_out.view(num_nodes, -1) # Flatten output -> [num_nodes, 512]
+        # Pass through ResNet body in batches to avoid OOM with large graphs
+        batch_size = 256  # Process at most 256 nodes at a time
+        if num_nodes <= batch_size:
+            # Small enough, process all at once
+            resnet_out = self.resnet_body(image_like_features)
+            shared_features = resnet_out.view(num_nodes, -1)
+        else:
+            # Process in batches
+            resnet_outputs = []
+            for i in range(0, num_nodes, batch_size):
+                batch_end = min(i + batch_size, num_nodes)
+                batch_features = image_like_features[i:batch_end]
+                batch_out = self.resnet_body(batch_features)
+                resnet_outputs.append(batch_out.view(batch_end - i, -1))
+            shared_features = torch.cat(resnet_outputs, dim=0)
 
         # Pass through final MLP
         shared_features = self.action_mlp(shared_features)
