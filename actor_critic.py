@@ -68,6 +68,11 @@ class Actor(nn.Module):
         # Determine if we need CPU fallback for ResNet only
         use_cpu_fallback = (num_nodes > 200 and device.type == 'cuda')
         
+        # If using CPU fallback, temporarily move ResNet to CPU
+        if use_cpu_fallback:
+            resnet_device = next(self.resnet_body.parameters()).device
+            self.resnet_body.cpu()
+        
         graph_context = graph_token.unsqueeze(0).repeat(num_nodes, 1)
         combined_features = torch.cat([node_tokens, graph_context], dim=-1)
 
@@ -86,7 +91,7 @@ class Actor(nn.Module):
         if num_nodes <= batch_size:
             # Small enough, process all at once
             if use_cpu_fallback:
-                # Move only ResNet processing to CPU
+                # Process on CPU (ResNet already moved above)
                 image_like_features_cpu = image_like_features.cpu()
                 resnet_out = self.resnet_body(image_like_features_cpu)
                 shared_features = resnet_out.view(num_nodes, -1).to(device)
@@ -101,7 +106,7 @@ class Actor(nn.Module):
                 batch_features = image_like_features[i:batch_end]
                 
                 if use_cpu_fallback:
-                    # Move only this batch to CPU for processing
+                    # Process on CPU (ResNet already moved above)
                     batch_features_cpu = batch_features.cpu()
                     batch_out = self.resnet_body(batch_features_cpu)
                     resnet_outputs.append(batch_out.view(batch_end - i, -1).to(device))
@@ -110,6 +115,10 @@ class Actor(nn.Module):
                     resnet_outputs.append(batch_out.view(batch_end - i, -1))
             
             shared_features = torch.cat(resnet_outputs, dim=0)
+
+        # Move ResNet back to original device if we used CPU fallback
+        if use_cpu_fallback:
+            self.resnet_body.to(resnet_device)
 
         # Pass through final MLP (stays on original device)
         shared_features = self.action_mlp(shared_features)
