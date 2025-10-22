@@ -219,6 +219,11 @@ class Topology:
             self.graph.ndata['persistent_id'] = torch.cat([current_persistent_ids, new_persistent_id], dim=0)
             self._next_persistent_id += 1
             
+            # To_delete flags (initialize new node with 0)
+            current_to_delete_flags = current_node_data.get('to_delete', torch.zeros(num_nodes_before, dtype=torch.float32))
+            new_to_delete_flag = torch.tensor([0.0], dtype=torch.float32)
+            self.graph.ndata['to_delete'] = torch.cat([current_to_delete_flags, new_to_delete_flag], dim=0)
+            
             # Handle spawn parameters
             self._update_spawn_parameters(num_nodes_before, gamma, alpha, noise, theta)
             
@@ -320,6 +325,10 @@ class Topology:
         if 'persistent_id' in self.graph.ndata:
             persistent_ids = self.graph.ndata['persistent_id'].clone()
         
+        # Store to_delete flags before removal (if they exist)
+        if 'to_delete' in self.graph.ndata:
+            to_delete_flags = self.graph.ndata['to_delete'].clone()
+        
         # Store spawn parameters before removal (if they exist)
         spawn_params = {}
         for param in ['gamma', 'alpha', 'noise', 'theta']:
@@ -344,6 +353,14 @@ class Topology:
                 persistent_ids[curr_node_id+1:]
             ])
             self.graph.ndata['persistent_id'] = remaining_persistent_ids
+        
+        # Restore to_delete flags for remaining nodes (excluding deleted node)
+        if 'to_delete' in locals() and 'to_delete_flags' in locals():
+            remaining_to_delete_flags = torch.cat([
+                to_delete_flags[:curr_node_id],
+                to_delete_flags[curr_node_id+1:]
+            ])
+            self.graph.ndata['to_delete'] = remaining_to_delete_flags
         
         # Restore spawn parameters for remaining nodes (excluding deleted node)
         for param, param_data in spawn_params.items():

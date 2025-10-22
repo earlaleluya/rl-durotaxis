@@ -63,6 +63,19 @@ class Actor(nn.Module):
 
     def forward(self, node_tokens, graph_token):
         num_nodes = node_tokens.shape[0]
+        
+        # For very large graphs on GPU, move to CPU to avoid OOM
+        device = node_tokens.device
+        use_cpu_fallback = (num_nodes > 200 and device.type == 'cuda')
+        
+        if use_cpu_fallback:
+            # Move to CPU for processing
+            node_tokens = node_tokens.cpu()
+            graph_token = graph_token.cpu()
+            # Temporarily move ResNet to CPU
+            original_device = next(self.resnet_body.parameters()).device
+            self.resnet_body = self.resnet_body.cpu()
+        
         graph_context = graph_token.unsqueeze(0).repeat(num_nodes, 1)
         combined_features = torch.cat([node_tokens, graph_context], dim=-1)
 
@@ -77,7 +90,7 @@ class Actor(nn.Module):
         image_like_features = padded_features.view(-1, 1, 24, 24) # [num_nodes, 1, 24, 24]
 
         # Pass through ResNet body in batches to avoid OOM with large graphs
-        batch_size = 256  # Process at most 256 nodes at a time
+        batch_size = 64  # Small batch size for 4GB GPU
         if num_nodes <= batch_size:
             # Small enough, process all at once
             resnet_out = self.resnet_body(image_like_features)
@@ -90,6 +103,11 @@ class Actor(nn.Module):
                 batch_features = image_like_features[i:batch_end]
                 batch_out = self.resnet_body(batch_features)
                 resnet_outputs.append(batch_out.view(batch_end - i, -1))
+                
+                # Clear GPU cache between batches to prevent fragmentation
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
             shared_features = torch.cat(resnet_outputs, dim=0)
 
         # Pass through final MLP
@@ -99,6 +117,14 @@ class Actor(nn.Module):
         discrete_logits = self.discrete_head(shared_features)
         continuous_mu = self.continuous_mu_head(shared_features)
         continuous_logstd = self.continuous_logstd_head(shared_features)
+
+        # Move back to original device if we used CPU fallback
+        if use_cpu_fallback:
+            discrete_logits = discrete_logits.to(device)
+            continuous_mu = continuous_mu.to(device)
+            continuous_logstd = continuous_logstd.to(device)
+            # Move ResNet back to original device
+            self.resnet_body = self.resnet_body.to(original_device)
 
         return discrete_logits, continuous_mu, continuous_logstd
 
@@ -497,6 +523,18 @@ class HybridPolicyAgent:
         spawn_actions = {node_id: action for node_id, action in actions.items() if action == 'spawn'}
         delete_actions = {node_id: action for node_id, action in actions.items() if action == 'delete'}
         
+        # First, mark nodes for deletion (set to_delete flag)
+        if 'to_delete' in self.topology.graph.ndata and len(delete_actions) > 0:
+            # Reset all to_delete flags to 0
+            self.topology.graph.ndata['to_delete'] = torch.zeros(
+                self.topology.graph.num_nodes(), dtype=torch.float32
+            )
+            # Set to_delete=1 for nodes that should be deleted
+            for node_id in delete_actions.keys():
+                if node_id < self.topology.graph.num_nodes():
+                    self.topology.graph.ndata['to_delete'][node_id] = 1.0
+        
+        # Execute spawn actions
         for node_id in spawn_actions:
             gamma, alpha, noise, theta = spawn_params[node_id]
             try:
@@ -504,6 +542,7 @@ class HybridPolicyAgent:
             except Exception as e:
                 print(f"Failed to spawn from node {node_id}: {e}")
         
+        # Execute delete actions (now that to_delete flags are set)
         delete_node_ids = sorted(delete_actions.keys(), reverse=True)
         for node_id in delete_node_ids:
             try:
