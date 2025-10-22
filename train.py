@@ -1083,7 +1083,8 @@ class DurotaxisTrainer:
         if self.enable_attention_weighting and self.learnable_component_weights.attention_weights is not None:
             # Compute attention weights based on advantage magnitudes
             advantage_magnitudes = torch.abs(advantage_tensor).mean(dim=0)  # [num_components]
-            attention_logits = self.learnable_component_weights.attention_weights(advantage_magnitudes)
+            attention_logits = self.learnable_component_weights.attention_weights(advantage_magnitudes.unsqueeze(0))  # Add batch dim
+            attention_logits = attention_logits.squeeze(0)  # Remove batch dim -> [num_components]
             attention_weights = torch.softmax(attention_logits, dim=0)
             
             # Combine base weights with attention
