@@ -159,7 +159,7 @@ trainer:
       task_completion: 300.0               # HUGE bonus for first goal completion!
   
   # Loss weighting and optimization
-  entropy_bonus_coeff: 0.02        # INCREASED from 0.01 for more exploration bonus
+  entropy_bonus_coeff: 0.05        # INCREASED from 0.02 for more exploration bonus
   weight_momentum: 0.9
   normalize_weights_every: 10
   
@@ -365,7 +365,7 @@ environment:
   
   # Reward structure - Spawn rewards (ENHANCED for boundary-safe spawning)
   spawn_rewards:
-    spawn_success_reward: 1.0     # Reward for successful durotaxis spawning
+    spawn_success_reward: 2.5     # INCREASED from 1.0 to strongly incentivize growth
     spawn_failure_penalty: 1.0    # Penalty for failed durotaxis spawning
     
     # NEW: Boundary-aware spawn penalties
@@ -433,14 +433,14 @@ encoder:
 # HybridActorCritic Configuration
 # ============================================================================
 actor_critic:
-  hidden_dim: 128               # Hidden dimension for actor-critic networks
+  hidden_dim: 128               # Hidden dimension for final MLPs after ResNet
   num_discrete_actions: 2       # Number of discrete actions (spawn/delete)
   continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)
-  dropout_rate: 0.1             # Dropout rate for regularization
+  dropout_rate: 0.2             # Increased dropout for regularization with a larger network
   
   # Spawn parameter bounds [min, max]
   spawn_parameter_bounds:
-    gamma: [2.0, 8.0]           # Cell migration sensitivity parameter
+    gamma: [0.5, 15.0]          # WIDENED from [2.0, 8.0] for more expressive control
     alpha: [0.5, 4.0]           # Directional bias strength
     noise: [0.05, 0.5]          # Stochastic noise level
     theta: [-0.7854, 0.7854]    # Migration direction angle (-π/4 to π/4, -45° to +45°, biased toward rightward)
