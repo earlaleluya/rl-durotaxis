@@ -27,14 +27,29 @@ class Actor(nn.Module):
     The Actor network for the Hybrid Actor-Critic agent.
     It takes node and graph features and outputs action distributions.
     """
-    def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate):
+    def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate, 
+                 pretrained_weights='imagenet'):
+        """
+        Args:
+            pretrained_weights: 'imagenet', 'random', or None
+                - 'imagenet': Use ImageNet pre-trained weights
+                - 'random': Random initialization
+                - None: Same as 'random'
+        """
         super().__init__()
         
         # Initial projection from GNN output to ResNet input size
         self.feature_proj = nn.Linear(encoder_out_dim * 2, 512)
 
-        # Use a pre-trained ResNet18 as a powerful feature extractor
-        resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        # Use a ResNet18 as a powerful feature extractor
+        # Configure weights based on pretrained_weights parameter
+        if pretrained_weights == 'imagenet':
+            resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            print("  🔧 Actor using ResNet18 with ImageNet weights")
+        else:
+            resnet = resnet18(weights=None)
+            print(f"  🔧 Actor using ResNet18 with random initialization")
+        
         # We'll use the body of the ResNet, excluding the final classification layer
         self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
         
@@ -121,65 +136,78 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """
     The Critic network for the Hybrid Actor-Critic agent.
-    It takes the graph token and outputs value predictions.
+    It takes node and graph features and outputs state values for different reward components.
     """
-    def __init__(self, encoder_out_dim, hidden_dim, value_components, dropout_rate):
+    def __init__(self, encoder_out_dim, hidden_dim, value_components: List[str], dropout_rate,
+                 pretrained_weights='imagenet'):
+        """
+        Args:
+            pretrained_weights: 'imagenet', 'random', or None
+                - 'imagenet': Use ImageNet pre-trained weights
+                - 'random': Random initialization
+                - None: Same as 'random'
+        """
         super().__init__()
         self.value_components = value_components
 
         # Initial projection from GNN output to ResNet input size
         self.feature_proj = nn.Linear(encoder_out_dim, 512)
 
-        # Use a pre-trained ResNet18 as a powerful feature extractor
-        resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-        self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
+        # Use a ResNet18 as a powerful feature extractor
+        # Configure weights based on pretrained_weights parameter
+        if pretrained_weights == 'imagenet':
+            resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            print("  🔧 Critic using ResNet18 with ImageNet weights")
+        else:
+            resnet = resnet18(weights=None)
+            print(f"  🔧 Critic using ResNet18 with random initialization")
         
-        # Freeze ResNet parameters to save memory and computation
-        for param in self.resnet_body.parameters():
-            param.requires_grad = False
+        # We'll use the body of the ResNet, excluding the final classification layer
+        self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
         
         # Put ResNet in evaluation mode to use pre-trained batch norm stats
         self.resnet_body.eval()
 
-        # Replace first conv layer (needs gradients since it's adapted for our input)
+        # Adapt the first conv layer for our "image"
         self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
-        # Final MLP heads for values
+        # Final MLP heads for value prediction, taking ResNet's output
         self.value_mlp = nn.Sequential(
-            nn.Linear(512, hidden_dim),
+            nn.Linear(512, hidden_dim),  # ResNet18 output is 512
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout_rate)
         )
 
-        # Multi-component value heads
-        self.value_heads = nn.ModuleDict()
-        for component in self.value_components:
-            self.value_heads[component] = nn.Linear(hidden_dim, 1)
+        # Value heads - one per component
+        self.value_heads = nn.ModuleDict({
+            component: nn.Linear(hidden_dim, 1) for component in value_components
+        })
 
     def forward(self, graph_token):
-        # Ensure graph_token has batch dimension
-        if graph_token.dim() == 1:
-            graph_token = graph_token.unsqueeze(0)  # [64] -> [1, 64]
+        device = graph_token.device
         
-        # Project and reshape for ResNet
-        projected_features = self.feature_proj(graph_token)
-        padded_features = F.pad(projected_features, (0, 576 - 512))
-        image_like_features = padded_features.view(-1, 1, 24, 24)
+        # Project and reshape to be "image-like" for ResNet
+        projected_features = self.feature_proj(graph_token)  # [batch_size, 512]
+        
+        # Pad to 576 and reshape
+        padded_features = F.pad(projected_features.unsqueeze(0), (0, 576 - 512))  # [1, 576]
+        image_like_features = padded_features.view(-1, 1, 24, 24)  # [1, 1, 24, 24]
 
-        # Pass through ResNet and MLP
+        # Pass through ResNet body
         resnet_out = self.resnet_body(image_like_features)
-        graph_features = resnet_out.view(graph_token.shape[0], -1)
-        graph_value_features = self.value_mlp(graph_features)
+        shared_features = resnet_out.view(1, -1)  # [1, 512]
+
+        # Pass through value MLP
+        value_features = self.value_mlp(shared_features)
 
         # --- Value Heads ---
-        value_predictions = {}
-        for component in self.value_components:
-            # Keep batch dimension for consistency with training pipeline
-            pred = self.value_heads[component](graph_value_features)  # [batch, 1]
-            value_predictions[component] = pred.squeeze(-1)  # [batch] - always keep batch dim
-            
-        return value_predictions, graph_value_features
+        value_predictions = {
+            component: self.value_heads[component](value_features).squeeze(-1)
+            for component in self.value_components
+        }
+
+        return value_predictions, value_features
 
 
 class HybridActorCritic(nn.Module):
@@ -217,19 +245,67 @@ class HybridActorCritic(nn.Module):
             value_components = ['total_value']
         self.value_components = value_components
         
+        # Pretrained weights configuration
+        pretrained_weights = config.get('pretrained_weights', 'imagenet')
+        print(f"\n📦 Loading Actor-Critic with pretrained weights: {pretrained_weights}")
+        
+        # Check if WSA (Weight Sharing Attention) is enabled
+        wsa_config = config.get('wsa', {})
+        self.use_wsa = wsa_config.get('enabled', False)
+        
         # Decoupled Actor and Critic
-        self.actor = Actor(
-            encoder_out_dim=self.encoder.out_dim,
-            hidden_dim=self.hidden_dim,
-            num_discrete_actions=self.num_discrete_actions,
-            continuous_dim=self.continuous_dim,
-            dropout_rate=self.dropout_rate
-        )
+        if self.use_wsa:
+            print("\n" + "="*60)
+            print("🔄 WSA (Weight Sharing Attention) ENABLED")
+            print("="*60)
+            
+            # Import WSA-enhanced actor
+            try:
+                from pretrained_fusion import WSAEnhancedActor
+                
+                self.actor = WSAEnhancedActor(
+                    encoder_out_dim=self.encoder.out_dim,
+                    hidden_dim=self.hidden_dim,
+                    num_discrete_actions=self.num_discrete_actions,
+                    continuous_dim=self.continuous_dim,
+                    dropout_rate=self.dropout_rate,
+                    wsa_config=wsa_config,
+                    use_wsa=True
+                )
+                
+                print("✅ WSA-Enhanced Actor initialized successfully")
+                print("="*60 + "\n")
+                
+            except ImportError as e:
+                print(f"❌ Failed to import WSA module: {e}")
+                print("⚠️  Falling back to standard Actor")
+                self.use_wsa = False
+                
+                self.actor = Actor(
+                    encoder_out_dim=self.encoder.out_dim,
+                    hidden_dim=self.hidden_dim,
+                    num_discrete_actions=self.num_discrete_actions,
+                    continuous_dim=self.continuous_dim,
+                    dropout_rate=self.dropout_rate,
+                    pretrained_weights=pretrained_weights
+                )
+        else:
+            print("\n🔧 Using standard Actor (WSA disabled)")
+            self.actor = Actor(
+                encoder_out_dim=self.encoder.out_dim,
+                hidden_dim=self.hidden_dim,
+                num_discrete_actions=self.num_discrete_actions,
+                continuous_dim=self.continuous_dim,
+                dropout_rate=self.dropout_rate,
+                pretrained_weights=pretrained_weights
+            )
+        
         self.critic = Critic(
             encoder_out_dim=self.encoder.out_dim,
             hidden_dim=self.hidden_dim,
             value_components=self.value_components,
-            dropout_rate=self.dropout_rate
+            dropout_rate=self.dropout_rate,
+            pretrained_weights=pretrained_weights
         )
         
         # Parameter bounds for continuous actions from config
@@ -260,6 +336,11 @@ class HybridActorCritic(nn.Module):
             self.actor.resnet_body.eval()
         if self.critic and hasattr(self.critic, 'resnet_body'):
             self.critic.resnet_body.eval()
+        # Also handle WSA feature extractors
+        if self.use_wsa and hasattr(self.actor, 'feature_extractor'):
+            for ptm in self.actor.feature_extractor.ptms:
+                if hasattr(ptm, 'backbone'):
+                    ptm.backbone.eval()
         return self
 
     def _init_weights(self, module):

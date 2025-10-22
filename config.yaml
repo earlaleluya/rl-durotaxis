@@ -440,6 +440,11 @@ actor_critic:
   continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)
   dropout_rate: 0.2             # Increased dropout for regularization with a larger network
   
+  # Pretrained weights configuration for standard Actor/Critic (non-WSA)
+  # Options: 'imagenet', 'random', or null (same as 'random')
+  # This is used ONLY when WSA is disabled
+  pretrained_weights: 'imagenet'  # Default: ImageNet pre-trained weights
+  
   # Spawn parameter bounds [min, max]
   spawn_parameter_bounds:
     gamma: [0.5, 15.0]          # WIDENED from [2.0, 8.0] for more expressive control
@@ -460,6 +465,44 @@ actor_critic:
     enabled: true
     num_groups: 16
     temperature: 1.0
+  
+  # Weight Sharing Attention (WSA) Configuration
+  # Enable this to use multiple pre-trained models with dynamic attention
+  wsa:
+    enabled: false                # Set to true to enable WSA (for ablation studies)
+    embedding_dim: 256           # Common embedding dimension for all PTMs
+    context_dim: 128             # State encoder context dimension
+    
+    # Pre-trained models configuration
+    # Each model provides a different perspective on the graph state
+    pretrained_models:
+      # Model 1: ResNet18 pre-trained on ImageNet
+      - name: 'resnet18_imagenet'
+        model_type: 'resnet18'
+        weights: 'imagenet'      # Options: 'imagenet', 'random', null
+        freeze_backbone: true    # Freeze to save memory and use as feature extractor
+        
+      # Model 2: Graph-specific CNN (trained from scratch)
+      - name: 'graph_cnn'
+        model_type: 'graph_cnn'
+        weights: null            # Train from scratch
+        freeze_backbone: false
+        
+      # Model 3: ResNet18 with random initialization
+      - name: 'resnet18_random'
+        model_type: 'resnet18'
+        weights: 'random'        # Random initialization for diversity
+        freeze_backbone: false
+    
+    # WSA attention mechanism parameters
+    attention:
+      shared_mlp_layers: [256, 128]  # Hidden layers in shared MLP
+      temperature: 1.0           # Softmax temperature (lower = sharper attention)
+      learnable_temperature: true  # Allow model to learn temperature
+    
+    # Logging and monitoring
+    log_attention_weights: true  # Log attention weights during training
+    log_frequency: 50            # Log every N episodes
 
 # ============================================================================
 # Training Algorithm Configuration
