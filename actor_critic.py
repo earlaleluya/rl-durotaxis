@@ -63,6 +63,12 @@ class Actor(nn.Module):
 
     def forward(self, node_tokens, graph_token):
         num_nodes = node_tokens.shape[0]
+        device = node_tokens.device
+        
+        # For very large graphs on CUDA, use gradient checkpointing to save memory
+        # instead of moving to CPU (which causes device mismatch in backward pass)
+        use_checkpointing = (num_nodes > 200 and device.type == 'cuda')
+        
         graph_context = graph_token.unsqueeze(0).repeat(num_nodes, 1)
         combined_features = torch.cat([node_tokens, graph_context], dim=-1)
 
@@ -76,11 +82,32 @@ class Actor(nn.Module):
         padded_features = F.pad(projected_features, (0, 576 - 512)) # [num_nodes, 576]
         image_like_features = padded_features.view(-1, 1, 24, 24) # [num_nodes, 1, 24, 24]
 
-        # Pass through ResNet body
-        resnet_out = self.resnet_body(image_like_features)
-        shared_features = resnet_out.view(num_nodes, -1) # Flatten output -> [num_nodes, 512]
+        # Pass through ResNet body in batches to avoid OOM with large graphs
+        batch_size = 64  # Small batch size for 4GB GPU
+        if num_nodes <= batch_size:
+            # Small enough, process all at once
+            resnet_out = self.resnet_body(image_like_features)
+            shared_features = resnet_out.view(num_nodes, -1)
+        else:
+            # Process in batches to reduce peak memory usage
+            resnet_outputs = []
+            for i in range(0, num_nodes, batch_size):
+                batch_end = min(i + batch_size, num_nodes)
+                batch_features = image_like_features[i:batch_end]
+                
+                # Use gradient checkpointing for large graphs to save memory
+                if use_checkpointing and torch.is_grad_enabled():
+                    batch_out = torch.utils.checkpoint.checkpoint(
+                        self.resnet_body, batch_features, use_reentrant=False
+                    )
+                else:
+                    batch_out = self.resnet_body(batch_features)
+                
+                resnet_outputs.append(batch_out.view(batch_end - i, -1))
+            
+            shared_features = torch.cat(resnet_outputs, dim=0)
 
-        # Pass through final MLP
+        # Pass through final MLP (stays on original device)
         shared_features = self.action_mlp(shared_features)
 
         # --- Action Heads ---
@@ -107,9 +134,14 @@ class Critic(nn.Module):
         resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
         
+        # Freeze ResNet parameters to save memory and computation
+        for param in self.resnet_body.parameters():
+            param.requires_grad = False
+        
         # Put ResNet in evaluation mode to use pre-trained batch norm stats
         self.resnet_body.eval()
 
+        # Replace first conv layer (needs gradients since it's adapted for our input)
         self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
         # Final MLP heads for values
@@ -345,20 +377,23 @@ class HybridActorCritic(nn.Module):
     
     def _empty_output(self) -> Dict[str, torch.Tensor]:
         """Return empty output for graphs with no nodes."""
-        value_predictions = {component: torch.tensor(0.0) for component in self.value_components}
+        # Get device from action_bounds (a registered buffer)
+        device = self.action_bounds.device
+        
+        value_predictions = {component: torch.tensor(0.0, device=device) for component in self.value_components}
         
         return {
-            'encoder_out': torch.empty(1, self.encoder.out_dim),
-            'discrete_logits': torch.empty(0, self.num_discrete_actions),
-            'discrete_probs': torch.empty(0, self.num_discrete_actions),
-            'continuous_mu': torch.empty(0, self.continuous_dim),
-            'continuous_std': torch.empty(0, self.continuous_dim),
+            'encoder_out': torch.empty(1, self.encoder.out_dim, device=device),
+            'discrete_logits': torch.empty(0, self.num_discrete_actions, device=device),
+            'discrete_probs': torch.empty(0, self.num_discrete_actions, device=device),
+            'continuous_mu': torch.empty(0, self.continuous_dim, device=device),
+            'continuous_std': torch.empty(0, self.continuous_dim, device=device),
             'value_predictions': value_predictions,
-            'discrete_actions': torch.empty(0, dtype=torch.long),
-            'continuous_actions': torch.empty(0, self.continuous_dim),
-            'discrete_log_probs': torch.empty(0),
-            'continuous_log_probs': torch.empty(0),
-            'total_log_probs': torch.empty(0)
+            'discrete_actions': torch.empty(0, dtype=torch.long, device=device),
+            'continuous_actions': torch.empty(0, self.continuous_dim, device=device),
+            'discrete_log_probs': torch.empty(0, device=device),
+            'continuous_log_probs': torch.empty(0, device=device),
+            'total_log_probs': torch.empty(0, device=device)
         }
     
     def evaluate_actions(self, state_dict: Dict[str, torch.Tensor], 
@@ -375,12 +410,14 @@ class HybridActorCritic(nn.Module):
             output = self.forward(state_dict, deterministic=True, action_mask=action_mask)
         
         if output['discrete_logits'].shape[0] == 0:
+            # Get device from action_bounds
+            device = self.action_bounds.device
             return {
-                'discrete_log_probs': torch.empty(0),
-                'continuous_log_probs': torch.empty(0),
-                'total_log_probs': torch.empty(0),
+                'discrete_log_probs': torch.empty(0, device=device),
+                'continuous_log_probs': torch.empty(0, device=device),
+                'total_log_probs': torch.empty(0, device=device),
                 'value_predictions': output['value_predictions'],
-                'entropy': torch.tensor(0.0)
+                'entropy': torch.tensor(0.0, device=device)
             }
         
         # Re-run actor forward pass to get distributions for entropy calculation
@@ -452,6 +489,7 @@ class HybridPolicyAgent:
         self.state_extractor = state_extractor
         self.network = hybrid_network
         
+    @torch.no_grad()
     def get_actions_and_values(self, deterministic: bool = False,
                               action_mask: Optional[torch.Tensor] = None) -> Tuple[Dict[int, str], 
                                                                          Dict[int, Tuple[float, float, float, float]], 
@@ -462,7 +500,9 @@ class HybridPolicyAgent:
         state = self.state_extractor.get_state_features(include_substrate=True)
         
         if state['num_nodes'] == 0:
-            empty_values = {component: torch.tensor(0.0) for component in self.network.value_components}
+            # Get device from network's action_bounds
+            device = self.network.action_bounds.device
+            empty_values = {component: torch.tensor(0.0, device=device) for component in self.network.value_components}
             return {}, {}, empty_values
         
         output = self.network(state, deterministic=deterministic, action_mask=action_mask)
@@ -475,6 +515,7 @@ class HybridPolicyAgent:
         
         return actions, spawn_params, output['value_predictions']
     
+    @torch.no_grad()
     def act_with_policy(self, deterministic: bool = False,
                        action_mask: Optional[torch.Tensor] = None) -> Dict[int, str]:
         """
@@ -485,6 +526,18 @@ class HybridPolicyAgent:
         spawn_actions = {node_id: action for node_id, action in actions.items() if action == 'spawn'}
         delete_actions = {node_id: action for node_id, action in actions.items() if action == 'delete'}
         
+        # First, mark nodes for deletion (set to_delete flag)
+        if 'to_delete' in self.topology.graph.ndata and len(delete_actions) > 0:
+            # Reset all to_delete flags to 0
+            self.topology.graph.ndata['to_delete'] = torch.zeros(
+                self.topology.graph.num_nodes(), dtype=torch.float32
+            )
+            # Set to_delete=1 for nodes that should be deleted
+            for node_id in delete_actions.keys():
+                if node_id < self.topology.graph.num_nodes():
+                    self.topology.graph.ndata['to_delete'][node_id] = 1.0
+        
+        # Execute spawn actions
         for node_id in spawn_actions:
             gamma, alpha, noise, theta = spawn_params[node_id]
             try:
@@ -492,6 +545,7 @@ class HybridPolicyAgent:
             except Exception as e:
                 print(f"Failed to spawn from node {node_id}: {e}")
         
+        # Execute delete actions (now that to_delete flags are set)
         delete_node_ids = sorted(delete_actions.keys(), reverse=True)
         for node_id in delete_node_ids:
             try:

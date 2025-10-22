@@ -78,6 +78,7 @@ trainer:
         centroid_movement_reward: 2.5 # 2.5x centroid (group progress crucial)
         milestone_rewards: 3.0        # 3x milestone rewards (primary focus!)
         spawn_success_reward: 1.5     # 1.5x spawn (efficient expansion)
+        delete_reward: 2.5            # 2.5x delete reward (learn node management!)
         intensity_bonus: 2.0          # 2x intensity bonus (seek better substrate)
         
       # Success criteria for stage 2
@@ -108,6 +109,7 @@ trainer:
         milestone_rewards: 1.5        # Reduced (should be easy now)
         success_reward: 2.0           # 2x success reward (MAIN GOAL!)
         spawn_success_reward: 1.2     # Slightly boosted for efficiency
+        delete_reward: 1.5            # 1.5x delete reward (maintain efficiency)
         efficiency_bonus: 3.0         # 3x efficiency (optimize path)
         
       # Success criteria for stage 3  
@@ -279,7 +281,7 @@ environment:
   # Node and topology parameters - RELAXED for learning
   init_num_nodes: 5              # Start with more nodes for stability
   max_critical_nodes: 75         # Allow more nodes
-  threshold_critical_nodes: 500  # Higher threshold before termination
+  threshold_critical_nodes: 250  # Higher threshold before termination
   max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
