@@ -13,7 +13,7 @@ trainer:
   # proportionally so the curriculum covers the full training run.
   total_episodes: 200
   max_steps: 1000
-  learning_rate: 0.0001   
+  learning_rate: 0.0002   
   save_dir: "./training_results"
   
   # Resume training configuration
@@ -161,7 +161,7 @@ trainer:
       task_completion: 300.0               # HUGE bonus for first goal completion!
   
   # Loss weighting and optimization
-  entropy_bonus_coeff: 0.05        # INCREASED from 0.02 for more exploration bonus
+  entropy_bonus_coeff: 0.03        # Moderate reduction from original 0.05 for better balance
   weight_momentum: 0.9
   normalize_weights_every: 10
   

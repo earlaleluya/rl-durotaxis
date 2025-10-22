@@ -35,7 +35,7 @@ def _safe_masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor
         
     Key features:
     - If an entire row is invalid (all masked), fallback to zeros (uniform after softmax)
-    - Subtract per-row max for numerical stability
+    - Only normalize when logits are dangerously large (>20) to preserve training dynamics
     - Clean any NaN/Inf values
     """
     # Apply action mask if provided
@@ -59,11 +59,17 @@ def _safe_masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor
         masked = logits
     
     # Clean any NaN or Inf values
-    masked = torch.nan_to_num(masked, nan=0.0, posinf=0.0, neginf=-1e9)
+    masked = torch.nan_to_num(masked, nan=0.0, posinf=20.0, neginf=-20.0)
     
-    # Numerical stability: subtract per-row max to prevent overflow in exp
+    # Only apply max-subtraction if logits are dangerously large (>20)
+    # This preserves the natural scale of logits during training
     row_max = masked.max(dim=1, keepdim=True).values
-    masked = masked - torch.nan_to_num(row_max, nan=0.0)
+    needs_normalization = (row_max > 20.0) | (row_max < -20.0)
+    
+    if needs_normalization.any():
+        # Only normalize rows that need it
+        normalized = masked - torch.nan_to_num(row_max, nan=0.0)
+        masked = torch.where(needs_normalization, normalized, masked)
     
     return masked
 
