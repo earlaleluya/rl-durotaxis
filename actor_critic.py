@@ -20,6 +20,50 @@ from encoder import GraphInputEncoder
 from config_loader import ConfigLoader
 
 
+class SimplicialEmbedding(nn.Module):
+    """
+    Simplicial Embedding (SEM) Layer.
+
+    This layer constrains the latent features to lie on a product of geometric
+    simplices. It partitions the input, applies a group-wise softmax, and
+    introduces a geometric inductive bias that can stabilize training.
+
+    Args:
+        input_dim (int): The dimension of the input feature vector.
+        num_groups (int): The number of groups (L) to partition the input into.
+        temperature (float): The temperature parameter (τ) for the softmax.
+    """
+    def __init__(self, input_dim: int, num_groups: int, temperature: float = 1.0):
+        super().__init__()
+        if input_dim % num_groups != 0:
+            raise ValueError(f"input_dim ({input_dim}) must be divisible by num_groups ({num_groups})")
+        
+        self.input_dim = input_dim
+        self.num_groups = num_groups
+        self.group_size = input_dim // num_groups
+        self.temperature = temperature
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the simplicial embedding transformation.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (..., input_dim).
+
+        Returns:
+            torch.Tensor: The transformed tensor with the same shape as the input.
+        """
+        # Reshape for group-wise softmax
+        original_shape = x.shape
+        x_reshaped = x.view(-1, self.num_groups, self.group_size)
+
+        # Apply softmax with temperature to each group
+        z = F.softmax(x_reshaped / self.temperature, dim=-1)
+
+        # Reshape back to the original input shape (except for the last dim)
+        return z.view(*original_shape)
+
+
 class HybridActorCritic(nn.Module):
     """
     Hybrid Actor-Critic network for the durotaxis environment.
@@ -81,6 +125,12 @@ class HybridActorCritic(nn.Module):
         self.continuous_dim = config.get('continuous_dim', 4)
         self.dropout_rate = config.get('dropout_rate', 0.1)
         
+        # Simplicial Embedding configuration
+        sem_config = config.get('simplicial_embedding', {})
+        self.sem_enabled = sem_config.get('enabled', False)
+        sem_groups = sem_config.get('num_groups', 16)
+        sem_temperature = sem_config.get('temperature', 1.0)
+
         # Value components configuration
         value_components = config.get('value_components', ['total_value'])
         if value_components is None:
@@ -101,6 +151,14 @@ class HybridActorCritic(nn.Module):
             nn.Dropout(self.dropout_rate),
         )
         
+        # Simplicial Embedding Layer for Actor
+        if self.sem_enabled:
+            self.actor_sem_layer = SimplicialEmbedding(
+                input_dim=self.hidden_dim,
+                num_groups=sem_groups,
+                temperature=sem_temperature
+            )
+
         # === ACTOR HEADS ===
         
         # Discrete action head (spawn/delete per node)
@@ -141,6 +199,14 @@ class HybridActorCritic(nn.Module):
             nn.LayerNorm(self.hidden_dim // 2),
         )
         
+        # Simplicial Embedding Layer for Critic
+        if self.sem_enabled:
+            self.critic_sem_layer = SimplicialEmbedding(
+                input_dim=self.hidden_dim // 2,
+                num_groups=sem_groups // 2 if sem_groups > 1 else 1, # Adjust for smaller dim
+                temperature=sem_temperature
+            )
+
         # Multi-component value heads
         self.value_heads = nn.ModuleDict()
         for component in self.value_components:
@@ -258,6 +324,11 @@ class HybridActorCritic(nn.Module):
         # Combine node tokens with graph context
         combined_features = torch.cat([node_tokens, graph_context], dim=-1)  # [num_nodes, out_dim*2]
         shared_features = self.shared_node_mlp(combined_features)  # [num_nodes, hidden_dim]
+        
+        # Apply Actor Simplicial Embedding if enabled
+        if self.sem_enabled:
+            shared_features = self.actor_sem_layer(shared_features)
+
         # Safety: sanitize shared features to prevent NaN propagation
         if torch.isnan(shared_features).any() or torch.isinf(shared_features).any():
             print(f"⚠️ WARNING: NaN/Inf detected in shared_node_features, replacing with zeros")
@@ -325,6 +396,10 @@ class HybridActorCritic(nn.Module):
             # Single graph case
             graph_value_features = self.graph_value_mlp(graph_token)  # [hidden_dim//2]
             
+            # Apply Critic Simplicial Embedding if enabled
+            if self.sem_enabled:
+                graph_value_features = self.critic_sem_layer(graph_value_features)
+
             # Multi-component value predictions
             value_predictions = {}
             for component in self.value_components:
@@ -338,6 +413,10 @@ class HybridActorCritic(nn.Module):
             # This works because graph_token is already the mean of all graph embeddings
             graph_value_features = self.graph_value_mlp(graph_token)  # [hidden_dim//2]
             
+            # Apply Critic Simplicial Embedding if enabled
+            if self.sem_enabled:
+                graph_value_features = self.critic_sem_layer(graph_value_features)
+
             # Multi-component value predictions - replicate for each graph in batch
             value_predictions = {}
             for component in self.value_components:

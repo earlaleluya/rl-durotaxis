@@ -453,6 +453,11 @@ actor_critic:
     - 'delete_reward'
     - 'edge_reward'
     - 'total_node_reward'
+  
+  simplicial_embedding:
+    enabled: true
+    num_groups: 16
+    temperature: 1.0
 
 # ============================================================================
 # Training Algorithm Configuration
