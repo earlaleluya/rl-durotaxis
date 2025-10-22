@@ -22,58 +22,13 @@ from encoder import GraphInputEncoder
 from config_loader import ConfigLoader
 
 
-class SimplicialEmbedding(nn.Module):
-    """
-    Simplicial Embedding (SEM) Layer.
-
-    This layer constrains the latent features to lie on a product of geometric
-    simplices. It partitions the input, applies a group-wise softmax, and
-    introduces a geometric inductive bias that can stabilize training.
-
-    Args:
-        input_dim (int): The dimension of the input feature vector.
-        num_groups (int): The number of groups (L) to partition the input into.
-        temperature (float): The temperature parameter (τ) for the softmax.
-    """
-    def __init__(self, input_dim: int, num_groups: int, temperature: float = 1.0):
-        super().__init__()
-        if input_dim % num_groups != 0:
-            raise ValueError(f"input_dim ({input_dim}) must be divisible by num_groups ({num_groups})")
-        
-        self.input_dim = input_dim
-        self.num_groups = num_groups
-        self.group_size = input_dim // num_groups
-        self.temperature = temperature
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the simplicial embedding transformation.
-
-        Args:
-            x (torch.Tensor): The input tensor of shape (..., input_dim).
-
-        Returns:
-            torch.Tensor: The transformed tensor with the same shape as the input.
-        """
-        # Reshape for group-wise softmax
-        original_shape = x.shape
-        x_reshaped = x.view(-1, self.num_groups, self.group_size)
-
-        # Apply softmax with temperature to each group
-        z = F.softmax(x_reshaped / self.temperature, dim=-1)
-
-        # Reshape back to the original input shape (except for the last dim)
-        return z.view(*original_shape)
-
-
 class Actor(nn.Module):
     """
     The Actor network for the Hybrid Actor-Critic agent.
     It takes node and graph features and outputs action distributions.
     """
-    def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate, sem_layer):
+    def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate):
         super().__init__()
-        self.sem_layer = sem_layer
         
         # Initial projection from GNN output to ResNet input size
         self.feature_proj = nn.Linear(encoder_out_dim * 2, 512)
@@ -128,10 +83,6 @@ class Actor(nn.Module):
         # Pass through final MLP
         shared_features = self.action_mlp(shared_features)
 
-        # Apply Simplicial Embedding if enabled
-        if self.sem_layer is not None:
-            shared_features = self.sem_layer(shared_features)
-
         # --- Action Heads ---
         discrete_logits = self.discrete_head(shared_features)
         continuous_mu = self.continuous_mu_head(shared_features)
@@ -145,9 +96,8 @@ class Critic(nn.Module):
     The Critic network for the Hybrid Actor-Critic agent.
     It takes the graph token and outputs value predictions.
     """
-    def __init__(self, encoder_out_dim, hidden_dim, value_components, dropout_rate, sem_layer):
+    def __init__(self, encoder_out_dim, hidden_dim, value_components, dropout_rate):
         super().__init__()
-        self.sem_layer = sem_layer
         self.value_components = value_components
 
         # Initial projection from GNN output to ResNet input size
@@ -190,14 +140,12 @@ class Critic(nn.Module):
         graph_features = resnet_out.view(graph_token.shape[0], -1)
         graph_value_features = self.value_mlp(graph_features)
 
-        # Apply Simplicial Embedding if enabled
-        if self.sem_layer is not None:
-            graph_value_features = self.sem_layer(graph_value_features)
-
         # --- Value Heads ---
         value_predictions = {}
         for component in self.value_components:
-            value_predictions[component] = self.value_heads[component](graph_value_features).squeeze(-1)
+            # Keep batch dimension for consistency with training pipeline
+            pred = self.value_heads[component](graph_value_features)  # [batch, 1]
+            value_predictions[component] = pred.squeeze(-1)  # [batch] - always keep batch dim
             
         return value_predictions, graph_value_features
 
@@ -230,26 +178,6 @@ class HybridActorCritic(nn.Module):
         self.num_discrete_actions = config.get('num_discrete_actions', 2)
         self.continuous_dim = config.get('continuous_dim', 4)
         self.dropout_rate = config.get('dropout_rate', 0.1)
-        
-        # Simplicial Embedding configuration
-        sem_config = config.get('simplicial_embedding', {})
-        self.sem_enabled = sem_config.get('enabled', False)
-        sem_groups = sem_config.get('num_groups', 16)
-        sem_temperature = sem_config.get('temperature', 1.0)
-
-        actor_sem_layer = None
-        critic_sem_layer = None
-        if self.sem_enabled:
-            actor_sem_layer = SimplicialEmbedding(
-                input_dim=self.hidden_dim,
-                num_groups=sem_groups,
-                temperature=sem_temperature
-            )
-            critic_sem_layer = SimplicialEmbedding(
-                input_dim=self.hidden_dim,
-                num_groups=sem_groups,
-                temperature=sem_temperature
-            )
 
         # Value components configuration
         value_components = config.get('value_components', ['total_value'])
@@ -263,15 +191,13 @@ class HybridActorCritic(nn.Module):
             hidden_dim=self.hidden_dim,
             num_discrete_actions=self.num_discrete_actions,
             continuous_dim=self.continuous_dim,
-            dropout_rate=self.dropout_rate,
-            sem_layer=actor_sem_layer
+            dropout_rate=self.dropout_rate
         )
         self.critic = Critic(
             encoder_out_dim=self.encoder.out_dim,
             hidden_dim=self.hidden_dim,
             value_components=self.value_components,
-            dropout_rate=self.dropout_rate,
-            sem_layer=critic_sem_layer
+            dropout_rate=self.dropout_rate
         )
         
         # Parameter bounds for continuous actions from config
