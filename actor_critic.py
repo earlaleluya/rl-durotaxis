@@ -22,6 +22,52 @@ from encoder import GraphInputEncoder
 from config_loader import ConfigLoader
 
 
+def _safe_masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Make logits numerically stable and mask invalid actions.
+    
+    Args:
+        logits: Raw action logits [N, num_actions]
+        action_mask: Boolean mask [N, num_actions] where True = valid action
+        
+    Returns:
+        Stable masked logits safe for Categorical(logits=...)
+        
+    Key features:
+    - If an entire row is invalid (all masked), fallback to zeros (uniform after softmax)
+    - Subtract per-row max for numerical stability
+    - Clean any NaN/Inf values
+    """
+    # Apply action mask if provided
+    if action_mask is not None:
+        mask = action_mask.to(device=logits.device, dtype=torch.bool)
+        
+        # Ensure mask has same shape as logits
+        if mask.dim() == 1 and logits.dim() == 2 and mask.size(0) == logits.size(0):
+            # Broadcast mask per row over action dimension
+            mask = mask.unsqueeze(1).expand_as(logits)
+        
+        # Mask invalid actions with -inf (will have ~0 probability after softmax)
+        masked = logits.masked_fill(~mask, float('-inf'))
+        
+        # Check for rows where all actions are invalid
+        all_invalid = (~mask).all(dim=1)
+        if all_invalid.any():
+            # Fallback to uniform distribution (zeros -> equal probs after softmax)
+            masked[all_invalid] = 0.0
+    else:
+        masked = logits
+    
+    # Clean any NaN or Inf values
+    masked = torch.nan_to_num(masked, nan=0.0, posinf=0.0, neginf=-1e9)
+    
+    # Numerical stability: subtract per-row max to prevent overflow in exp
+    row_max = masked.max(dim=1, keepdim=True).values
+    masked = masked - torch.nan_to_num(row_max, nan=0.0)
+    
+    return masked
+
+
 class Actor(nn.Module):
     """
     The Actor network for the Hybrid Actor-Critic agent.
@@ -124,11 +170,21 @@ class Actor(nn.Module):
 
         # Pass through final MLP (stays on original device)
         shared_features = self.action_mlp(shared_features)
+        
+        # Check for NaN in shared features
+        if torch.isnan(shared_features).any():
+            print("⚠️  WARNING: NaN detected in Actor shared_features!")
+            shared_features = torch.nan_to_num(shared_features, nan=0.0)
 
         # --- Action Heads ---
         discrete_logits = self.discrete_head(shared_features)
         continuous_mu = self.continuous_mu_head(shared_features)
         continuous_logstd = self.continuous_logstd_head(shared_features)
+        
+        # Clamp outputs for numerical stability
+        discrete_logits = torch.clamp(discrete_logits, -20.0, 20.0)
+        continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
+        continuous_logstd = torch.clamp(continuous_logstd, -10.0, 5.0)
 
         return discrete_logits, continuous_mu, continuous_logstd
 
@@ -388,17 +444,13 @@ class HybridActorCritic(nn.Module):
         value_predictions, graph_value_features = self.critic(graph_token)
 
         # --- Post-processing and Sanitization ---
-        if action_mask is not None:
-            discrete_logits = discrete_logits.masked_fill(~action_mask, -float('inf'))
-
-        discrete_logits = torch.clamp(discrete_logits, min=-20.0, max=20.0)
-        if torch.isnan(discrete_logits).any() or torch.isinf(discrete_logits).any():
-            discrete_logits = torch.nan_to_num(discrete_logits, nan=0.0)
+        # Clamp logits before masking to prevent extreme values
+        discrete_logits = torch.clamp(discrete_logits, min=-30.0, max=30.0)
         
-        discrete_probs = F.softmax(discrete_logits, dim=-1)
-        if torch.isnan(discrete_probs).any():
-            discrete_probs = torch.ones_like(discrete_probs) / discrete_probs.shape[-1]
+        # Apply numerically stable masking and get safe logits
+        stable_logits = _safe_masked_logits(discrete_logits, action_mask)
         
+        # Clean continuous parameters
         continuous_mu = torch.nan_to_num(continuous_mu, nan=0.0)
         continuous_logstd = torch.nan_to_num(continuous_logstd, nan=0.0)
         continuous_logstd = torch.clamp(continuous_logstd, min=-10.0, max=5.0)
@@ -409,8 +461,7 @@ class HybridActorCritic(nn.Module):
         # === OUTPUT PREPARATION ===
         output = {
             'encoder_out': encoder_out,
-            'discrete_logits': discrete_logits,
-            'discrete_probs': discrete_probs,
+            'discrete_logits': stable_logits,  # Return stabilized logits
             'continuous_mu': continuous_mu_bounded,
             'continuous_std': continuous_std,
             'value_predictions': value_predictions,
@@ -418,7 +469,8 @@ class HybridActorCritic(nn.Module):
         }
         
         if not deterministic:
-            discrete_dist = torch.distributions.Categorical(probs=discrete_probs)
+            # Use Categorical(logits=...) for numerical stability (PyTorch handles softmax internally)
+            discrete_dist = torch.distributions.Categorical(logits=stable_logits)
             discrete_actions = discrete_dist.sample()
             discrete_log_probs = discrete_dist.log_prob(discrete_actions)
             
@@ -437,7 +489,7 @@ class HybridActorCritic(nn.Module):
             })
         else:
             output.update({
-                'discrete_actions': torch.argmax(discrete_logits, dim=-1),
+                'discrete_actions': torch.argmax(stable_logits, dim=-1),
                 'continuous_actions': continuous_mu_bounded
             })
         
@@ -505,13 +557,17 @@ class HybridActorCritic(nn.Module):
         node_tokens = output['encoder_out'][1:]
         graph_token = output['encoder_out'][0]
         discrete_logits, continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
-        continuous_std = torch.exp(torch.clamp(continuous_logstd, -10, 5))
-
-        # Evaluate discrete actions
-        discrete_probs = F.softmax(discrete_logits, dim=-1)
-        discrete_probs = discrete_probs / (discrete_probs.sum(dim=-1, keepdim=True) + 1e-8)
         
-        discrete_dist = torch.distributions.Categorical(probs=discrete_probs)
+        # Clamp logits to prevent overflow/underflow
+        discrete_logits = torch.clamp(discrete_logits, min=-30.0, max=30.0)
+        continuous_logstd = torch.clamp(continuous_logstd, -10, 5)
+        continuous_std = torch.exp(continuous_logstd)
+        
+        # Apply numerically stable masking and get safe logits
+        stable_logits = _safe_masked_logits(discrete_logits, action_mask)
+        
+        # Use Categorical(logits=...) for numerical stability (PyTorch handles softmax internally)
+        discrete_dist = torch.distributions.Categorical(logits=stable_logits)
         discrete_log_probs = discrete_dist.log_prob(discrete_actions)
         discrete_entropy = discrete_dist.entropy()
         
