@@ -321,7 +321,15 @@ class DurotaxisTrainer:
         # Apply configuration
         self.total_episodes = config.get('total_episodes', 1000)
         self.max_steps = config.get('max_steps', 200)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Device configuration - read from system config or default to auto
+        system_config = self.config_loader.config.get('system', {})
+        device_setting = system_config.get('device', 'auto')
+        if device_setting == 'auto':
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device_setting)
+        
         self.save_dir = config.get('save_dir', "./training_results")
         self.entropy_bonus_coeff = config.get('entropy_bonus_coeff', 0.05)  # Increased for stronger regularization
         self.moving_avg_window = config.get('moving_avg_window', 20)
@@ -872,7 +880,7 @@ class DurotaxisTrainer:
         if not valid_states:
             return {
                 'node_features': torch.empty(0, states[0]['node_features'].shape[-1], device=self.device),
-                'graph_features': torch.stack([s['graph_features'] for s in states]),
+                'graph_features': torch.stack([s['graph_features'] for s in states]).to(self.device),
                 'edge_attr': torch.empty(0, states[0].get('edge_attr', torch.empty(0, 3)).shape[-1], device=self.device),
                 'edge_index': torch.empty(2, 0, dtype=torch.long, device=self.device),
                 'batch': torch.empty(0, dtype=torch.long, device=self.device),
@@ -881,7 +889,7 @@ class DurotaxisTrainer:
                 'node_counts': [0] * len(states)
             }
         
-        # Collect features
+        # Collect features (keep on CPU during collection for efficiency)
         all_node_features = []
         all_edge_features = []
         all_edge_indices = []
@@ -895,7 +903,7 @@ class DurotaxisTrainer:
             node_counts.append(num_nodes)
             
             if num_nodes > 0:
-                # Node features
+                # Node features (keep on CPU for now)
                 node_feats = state['node_features']
                 all_node_features.append(node_feats)
                 
@@ -910,19 +918,7 @@ class DurotaxisTrainer:
                     # Convert edge_index from tuple to tensor if needed
                     if isinstance(edge_index, tuple):
                         src, dst = edge_index
-                        # Ensure src/dst tensors are on the trainer device
-                        if isinstance(src, torch.Tensor):
-                            src = src.to(self.device)
-                        if isinstance(dst, torch.Tensor):
-                            dst = dst.to(self.device)
-                        edge_index = torch.stack([src, dst], dim=0).to(self.device)
-                    else:
-                        # If already a tensor, move to device
-                        edge_index = edge_index.to(self.device)
-
-                    # Ensure edge_attr is on the correct device
-                    if isinstance(edge_attr, torch.Tensor):
-                        edge_attr = edge_attr.to(self.device)
+                        edge_index = torch.stack([src, dst], dim=0)
                     
                     if edge_index.shape[1] > 0:  # Has edges
                         # Adjust edge indices for batching
@@ -932,25 +928,25 @@ class DurotaxisTrainer:
                 
                 node_offset += num_nodes
         
-        # Concatenate all features
+        # Concatenate all features on CPU, then transfer to GPU once
         if all_node_features:
-            batched_node_features = torch.cat(all_node_features, dim=0)
+            batched_node_features = torch.cat(all_node_features, dim=0).to(self.device)
             batched_batch = torch.tensor(batch_indices, dtype=torch.long, device=self.device)
         else:
             batched_node_features = torch.empty(0, states[0]['node_features'].shape[-1], device=self.device)
             batched_batch = torch.empty(0, dtype=torch.long, device=self.device)
         
         if all_edge_features and all_edge_indices:
-            batched_edge_features = torch.cat(all_edge_features, dim=0)
-            batched_edge_index = torch.cat(all_edge_indices, dim=1)
+            batched_edge_features = torch.cat(all_edge_features, dim=0).to(self.device)
+            batched_edge_index = torch.cat(all_edge_indices, dim=1).to(self.device)
         else:
             # Handle case with no edges
             edge_dim = states[0].get('edge_attr', torch.empty(0, 3)).shape[-1]
             batched_edge_features = torch.empty(0, edge_dim, device=self.device)
             batched_edge_index = torch.empty(2, 0, dtype=torch.long, device=self.device)
         
-        # Graph-level features (one per graph in batch)
-        graph_features = torch.stack([s['graph_features'] for s in states])
+        # Graph-level features (one per graph in batch) - transfer once
+        graph_features = torch.stack([s['graph_features'] for s in states]).to(self.device)
         
         return {
             'node_features': batched_node_features,

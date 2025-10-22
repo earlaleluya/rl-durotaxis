@@ -63,18 +63,10 @@ class Actor(nn.Module):
 
     def forward(self, node_tokens, graph_token):
         num_nodes = node_tokens.shape[0]
-        
-        # For very large graphs on GPU, move to CPU to avoid OOM
         device = node_tokens.device
-        use_cpu_fallback = (num_nodes > 200 and device.type == 'cuda')
         
-        if use_cpu_fallback:
-            # Move to CPU for processing
-            node_tokens = node_tokens.cpu()
-            graph_token = graph_token.cpu()
-            # Temporarily move ResNet to CPU
-            original_device = next(self.resnet_body.parameters()).device
-            self.resnet_body = self.resnet_body.cpu()
+        # Determine if we need CPU fallback for ResNet only
+        use_cpu_fallback = (num_nodes > 200 and device.type == 'cuda')
         
         graph_context = graph_token.unsqueeze(0).repeat(num_nodes, 1)
         combined_features = torch.cat([node_tokens, graph_context], dim=-1)
@@ -93,38 +85,39 @@ class Actor(nn.Module):
         batch_size = 64  # Small batch size for 4GB GPU
         if num_nodes <= batch_size:
             # Small enough, process all at once
-            resnet_out = self.resnet_body(image_like_features)
-            shared_features = resnet_out.view(num_nodes, -1)
+            if use_cpu_fallback:
+                # Move only ResNet processing to CPU
+                image_like_features_cpu = image_like_features.cpu()
+                resnet_out = self.resnet_body(image_like_features_cpu)
+                shared_features = resnet_out.view(num_nodes, -1).to(device)
+            else:
+                resnet_out = self.resnet_body(image_like_features)
+                shared_features = resnet_out.view(num_nodes, -1)
         else:
             # Process in batches
             resnet_outputs = []
             for i in range(0, num_nodes, batch_size):
                 batch_end = min(i + batch_size, num_nodes)
                 batch_features = image_like_features[i:batch_end]
-                batch_out = self.resnet_body(batch_features)
-                resnet_outputs.append(batch_out.view(batch_end - i, -1))
                 
-                # Clear GPU cache between batches to prevent fragmentation
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if use_cpu_fallback:
+                    # Move only this batch to CPU for processing
+                    batch_features_cpu = batch_features.cpu()
+                    batch_out = self.resnet_body(batch_features_cpu)
+                    resnet_outputs.append(batch_out.view(batch_end - i, -1).to(device))
+                else:
+                    batch_out = self.resnet_body(batch_features)
+                    resnet_outputs.append(batch_out.view(batch_end - i, -1))
             
             shared_features = torch.cat(resnet_outputs, dim=0)
 
-        # Pass through final MLP
+        # Pass through final MLP (stays on original device)
         shared_features = self.action_mlp(shared_features)
 
         # --- Action Heads ---
         discrete_logits = self.discrete_head(shared_features)
         continuous_mu = self.continuous_mu_head(shared_features)
         continuous_logstd = self.continuous_logstd_head(shared_features)
-
-        # Move back to original device if we used CPU fallback
-        if use_cpu_fallback:
-            discrete_logits = discrete_logits.to(device)
-            continuous_mu = continuous_mu.to(device)
-            continuous_logstd = continuous_logstd.to(device)
-            # Move ResNet back to original device
-            self.resnet_body = self.resnet_body.to(original_device)
 
         return discrete_logits, continuous_mu, continuous_logstd
 
@@ -145,9 +138,14 @@ class Critic(nn.Module):
         resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
         
+        # Freeze ResNet parameters to save memory and computation
+        for param in self.resnet_body.parameters():
+            param.requires_grad = False
+        
         # Put ResNet in evaluation mode to use pre-trained batch norm stats
         self.resnet_body.eval()
 
+        # Replace first conv layer (needs gradients since it's adapted for our input)
         self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
         # Final MLP heads for values
@@ -383,20 +381,23 @@ class HybridActorCritic(nn.Module):
     
     def _empty_output(self) -> Dict[str, torch.Tensor]:
         """Return empty output for graphs with no nodes."""
-        value_predictions = {component: torch.tensor(0.0) for component in self.value_components}
+        # Get device from action_bounds (a registered buffer)
+        device = self.action_bounds.device
+        
+        value_predictions = {component: torch.tensor(0.0, device=device) for component in self.value_components}
         
         return {
-            'encoder_out': torch.empty(1, self.encoder.out_dim),
-            'discrete_logits': torch.empty(0, self.num_discrete_actions),
-            'discrete_probs': torch.empty(0, self.num_discrete_actions),
-            'continuous_mu': torch.empty(0, self.continuous_dim),
-            'continuous_std': torch.empty(0, self.continuous_dim),
+            'encoder_out': torch.empty(1, self.encoder.out_dim, device=device),
+            'discrete_logits': torch.empty(0, self.num_discrete_actions, device=device),
+            'discrete_probs': torch.empty(0, self.num_discrete_actions, device=device),
+            'continuous_mu': torch.empty(0, self.continuous_dim, device=device),
+            'continuous_std': torch.empty(0, self.continuous_dim, device=device),
             'value_predictions': value_predictions,
-            'discrete_actions': torch.empty(0, dtype=torch.long),
-            'continuous_actions': torch.empty(0, self.continuous_dim),
-            'discrete_log_probs': torch.empty(0),
-            'continuous_log_probs': torch.empty(0),
-            'total_log_probs': torch.empty(0)
+            'discrete_actions': torch.empty(0, dtype=torch.long, device=device),
+            'continuous_actions': torch.empty(0, self.continuous_dim, device=device),
+            'discrete_log_probs': torch.empty(0, device=device),
+            'continuous_log_probs': torch.empty(0, device=device),
+            'total_log_probs': torch.empty(0, device=device)
         }
     
     def evaluate_actions(self, state_dict: Dict[str, torch.Tensor], 
@@ -413,12 +414,14 @@ class HybridActorCritic(nn.Module):
             output = self.forward(state_dict, deterministic=True, action_mask=action_mask)
         
         if output['discrete_logits'].shape[0] == 0:
+            # Get device from action_bounds
+            device = self.action_bounds.device
             return {
-                'discrete_log_probs': torch.empty(0),
-                'continuous_log_probs': torch.empty(0),
-                'total_log_probs': torch.empty(0),
+                'discrete_log_probs': torch.empty(0, device=device),
+                'continuous_log_probs': torch.empty(0, device=device),
+                'total_log_probs': torch.empty(0, device=device),
                 'value_predictions': output['value_predictions'],
-                'entropy': torch.tensor(0.0)
+                'entropy': torch.tensor(0.0, device=device)
             }
         
         # Re-run actor forward pass to get distributions for entropy calculation
@@ -490,6 +493,7 @@ class HybridPolicyAgent:
         self.state_extractor = state_extractor
         self.network = hybrid_network
         
+    @torch.no_grad()
     def get_actions_and_values(self, deterministic: bool = False,
                               action_mask: Optional[torch.Tensor] = None) -> Tuple[Dict[int, str], 
                                                                          Dict[int, Tuple[float, float, float, float]], 
@@ -500,7 +504,9 @@ class HybridPolicyAgent:
         state = self.state_extractor.get_state_features(include_substrate=True)
         
         if state['num_nodes'] == 0:
-            empty_values = {component: torch.tensor(0.0) for component in self.network.value_components}
+            # Get device from network's action_bounds
+            device = self.network.action_bounds.device
+            empty_values = {component: torch.tensor(0.0, device=device) for component in self.network.value_components}
             return {}, {}, empty_values
         
         output = self.network(state, deterministic=deterministic, action_mask=action_mask)
@@ -513,6 +519,7 @@ class HybridPolicyAgent:
         
         return actions, spawn_params, output['value_predictions']
     
+    @torch.no_grad()
     def act_with_policy(self, deterministic: bool = False,
                        action_mask: Optional[torch.Tensor] = None) -> Dict[int, str]:
         """
