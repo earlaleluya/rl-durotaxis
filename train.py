@@ -2393,18 +2393,29 @@ class DurotaxisTrainer:
             len(old_log_probs_dict['discrete']) > 0 and 
             len(eval_output['discrete_log_probs']) > 0):
             
-            # Compute ratio for discrete actions
-            old_discrete_log_prob = old_log_probs_dict['discrete'].sum()
-            new_discrete_log_prob = eval_output['discrete_log_probs'].sum()
+            # Compute ratio element-wise (per timestep) - NUMERICALLY STABLE
+            # This is the correct PPO implementation
+            old_discrete_log_probs = old_log_probs_dict['discrete']
+            new_discrete_log_probs = eval_output['discrete_log_probs']
             
-            ratio_discrete = torch.exp(new_discrete_log_prob - old_discrete_log_prob)
+            # Element-wise difference (per timestep)
+            log_prob_diff = new_discrete_log_probs - old_discrete_log_probs
+            
+            # Clamp to prevent exp overflow (per timestep)
+            log_prob_diff = torch.clamp(log_prob_diff, -20.0, 20.0)
+            
+            # Element-wise ratio (per timestep)
+            ratio_discrete = torch.exp(log_prob_diff)
+            
+            # Element-wise clipping (per timestep)
             clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO discrete policy loss (before scaling)
-            discrete_loss_raw = -torch.min(
-                ratio_discrete * advantage,
-                clipped_ratio_discrete * advantage
-            )
+            # PPO surrogate objectives (per timestep)
+            surr1 = ratio_discrete * advantage
+            surr2 = clipped_ratio_discrete * advantage
+            
+            # Take mean over all timesteps - this is where aggregation happens
+            discrete_loss_raw = -torch.min(surr1, surr2).mean()
         
         # === CONTINUOUS POLICY LOSS ===
         continuous_loss_raw = torch.tensor(0.0, device=self.device)
@@ -2413,18 +2424,29 @@ class DurotaxisTrainer:
             len(old_log_probs_dict['continuous']) > 0 and 
             len(eval_output['continuous_log_probs']) > 0):
             
-            # Compute ratio for continuous actions
-            old_continuous_log_prob = old_log_probs_dict['continuous'].sum()
-            new_continuous_log_prob = eval_output['continuous_log_probs'].sum()
+            # Compute ratio element-wise (per timestep) - NUMERICALLY STABLE
+            # This is the correct PPO implementation
+            old_continuous_log_probs = old_log_probs_dict['continuous']
+            new_continuous_log_probs = eval_output['continuous_log_probs']
             
-            ratio_continuous = torch.exp(new_continuous_log_prob - old_continuous_log_prob)
+            # Element-wise difference (per timestep)
+            log_prob_diff = new_continuous_log_probs - old_continuous_log_probs
+            
+            # Clamp to prevent exp overflow (per timestep)
+            log_prob_diff = torch.clamp(log_prob_diff, -20.0, 20.0)
+            
+            # Element-wise ratio (per timestep)
+            ratio_continuous = torch.exp(log_prob_diff)
+            
+            # Element-wise clipping (per timestep)
             clipped_ratio_continuous = torch.clamp(ratio_continuous, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO continuous policy loss (before scaling)
-            continuous_loss_raw = -torch.min(
-                ratio_continuous * advantage,
-                clipped_ratio_continuous * advantage
-            )
+            # PPO surrogate objectives (per timestep)
+            surr1 = ratio_continuous * advantage
+            surr2 = clipped_ratio_continuous * advantage
+            
+            # Take mean over all timesteps - this is where aggregation happens
+            continuous_loss_raw = -torch.min(surr1, surr2).mean()
         
         # === ADAPTIVE GRADIENT SCALING ===
         # Compute adaptive weights based on gradient magnitudes
