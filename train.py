@@ -2386,6 +2386,10 @@ class DurotaxisTrainer:
         # Extract base weights and clipping
         clip_eps = self.policy_loss_weights['clip_epsilon']
         
+        # Convert advantage to tensor if it's a scalar, ensuring it can broadcast
+        if not isinstance(advantage, torch.Tensor):
+            advantage = torch.tensor(advantage, device=self.device)
+        
         # === DISCRETE POLICY LOSS ===
         discrete_loss_raw = torch.tensor(0.0, device=self.device)
         if ('discrete' in old_log_probs_dict and 
@@ -2393,29 +2397,26 @@ class DurotaxisTrainer:
             len(old_log_probs_dict['discrete']) > 0 and 
             len(eval_output['discrete_log_probs']) > 0):
             
-            # Compute ratio element-wise (per timestep) - NUMERICALLY STABLE
-            # This is the correct PPO implementation
-            old_discrete_log_probs = old_log_probs_dict['discrete']
-            new_discrete_log_probs = eval_output['discrete_log_probs']
+            # For hybrid action spaces with varying graph sizes, we need to aggregate first
+            # This is because the number of nodes (and thus log_probs) can change between
+            # action collection and re-evaluation. We use .mean() for numerical stability.
+            old_discrete_log_prob = old_log_probs_dict['discrete'].mean()
+            new_discrete_log_prob = eval_output['discrete_log_probs'].mean()
             
-            # Element-wise difference (per timestep)
-            log_prob_diff = new_discrete_log_probs - old_discrete_log_probs
+            # Clamp log prob difference to prevent exp overflow
+            log_prob_diff = torch.clamp(new_discrete_log_prob - old_discrete_log_prob, -20.0, 20.0)
             
-            # Clamp to prevent exp overflow (per timestep)
-            log_prob_diff = torch.clamp(log_prob_diff, -20.0, 20.0)
-            
-            # Element-wise ratio (per timestep)
+            # Compute ratio
             ratio_discrete = torch.exp(log_prob_diff)
             
-            # Element-wise clipping (per timestep)
+            # PPO clipping
             clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO surrogate objectives (per timestep)
+            # PPO surrogate objective
             surr1 = ratio_discrete * advantage
             surr2 = clipped_ratio_discrete * advantage
             
-            # Take mean over all timesteps - this is where aggregation happens
-            discrete_loss_raw = -torch.min(surr1, surr2).mean()
+            discrete_loss_raw = -torch.min(surr1, surr2)
         
         # === CONTINUOUS POLICY LOSS ===
         continuous_loss_raw = torch.tensor(0.0, device=self.device)
@@ -2424,29 +2425,26 @@ class DurotaxisTrainer:
             len(old_log_probs_dict['continuous']) > 0 and 
             len(eval_output['continuous_log_probs']) > 0):
             
-            # Compute ratio element-wise (per timestep) - NUMERICALLY STABLE
-            # This is the correct PPO implementation
-            old_continuous_log_probs = old_log_probs_dict['continuous']
-            new_continuous_log_probs = eval_output['continuous_log_probs']
+            # For hybrid action spaces with varying graph sizes, we need to aggregate first
+            # This is because the number of nodes (and thus log_probs) can change between
+            # action collection and re-evaluation. We use .mean() for numerical stability.
+            old_continuous_log_prob = old_log_probs_dict['continuous'].mean()
+            new_continuous_log_prob = eval_output['continuous_log_probs'].mean()
             
-            # Element-wise difference (per timestep)
-            log_prob_diff = new_continuous_log_probs - old_continuous_log_probs
+            # Clamp log prob difference to prevent exp overflow
+            log_prob_diff = torch.clamp(new_continuous_log_prob - old_continuous_log_prob, -20.0, 20.0)
             
-            # Clamp to prevent exp overflow (per timestep)
-            log_prob_diff = torch.clamp(log_prob_diff, -20.0, 20.0)
-            
-            # Element-wise ratio (per timestep)
+            # Compute ratio
             ratio_continuous = torch.exp(log_prob_diff)
             
-            # Element-wise clipping (per timestep)
+            # PPO clipping
             clipped_ratio_continuous = torch.clamp(ratio_continuous, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO surrogate objectives (per timestep)
+            # PPO surrogate objective
             surr1 = ratio_continuous * advantage
             surr2 = clipped_ratio_continuous * advantage
             
-            # Take mean over all timesteps - this is where aggregation happens
-            continuous_loss_raw = -torch.min(surr1, surr2).mean()
+            continuous_loss_raw = -torch.min(surr1, surr2)
         
         # === ADAPTIVE GRADIENT SCALING ===
         # Compute adaptive weights based on gradient magnitudes
