@@ -151,11 +151,11 @@ class Topology:
         substrate_shape = self.substrate.signal_matrix.shape if hasattr(self.substrate, 'signal_matrix') else (0, 0)
         
         for i in range(num_nodes):
-            pos = positions[i].numpy()
+            pos = positions[i].cpu().numpy()  # Move to CPU for numpy operation
             intensity = self.substrate.get_intensity(pos)
             intensities.append(intensity)
         
-        substrate_features = torch.tensor(intensities, dtype=torch.float32).unsqueeze(1)
+        substrate_features = torch.tensor(intensities, dtype=torch.float32, device=device).unsqueeze(1)
         return substrate_features    
 
 
@@ -193,7 +193,8 @@ class Topology:
                     y = height - margin_y
 
             # Get device from existing positions tensor to ensure device consistency
-            device = self.graph.ndata['pos'].device if self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            # spawn() is only called when curr_node_id exists, so pos tensor always has elements
+            device = self.graph.ndata['pos'].device
             new_node_coord = torch.tensor([x, y], dtype=torch.float32, device=device)  
             
             # Store current graph state before modification
@@ -208,8 +209,8 @@ class Topology:
             self.graph.add_nodes(1)
             
             # Manually set the node features to avoid dimension mismatches
+            # Use the device we already determined above (from self.graph.ndata['pos'])
             # Position data
-            device = current_node_data['pos'].device if current_node_data['pos'].numel() > 0 else torch.device('cpu')
             self.graph.ndata['pos'] = torch.cat([current_node_data['pos'], new_node_coord.unsqueeze(0)], dim=0)
             
             # New node flags
