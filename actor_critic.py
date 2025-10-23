@@ -131,9 +131,11 @@ class Actor(nn.Module):
 
         # Optional learnable bias to gently encourage spawning early in training
         # Shape [2]: [spawn_bias, delete_bias]
-        # Register as buffer first, then convert to parameter to ensure proper device handling
-        self.register_buffer('_discrete_bias_init', torch.tensor([float(spawn_bias_init), 0.0], dtype=torch.float32))
-        self.discrete_bias = nn.Parameter(self._discrete_bias_init.clone(), requires_grad=True)
+        # Create as parameter directly - PyTorch will handle device placement when model is moved
+        self.discrete_bias = nn.Parameter(
+            torch.tensor([float(spawn_bias_init), 0.0], dtype=torch.float32), 
+            requires_grad=True
+        )
 
     def forward(self, node_tokens, graph_token):
         num_nodes = node_tokens.shape[0]

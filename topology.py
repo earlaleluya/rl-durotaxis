@@ -167,8 +167,8 @@ class Topology:
         """
         try:
             r = self._hill_equation(curr_node_id, gamma, alpha, noise)
-            # Get current node position
-            curr_pos = self.graph.ndata['pos'][curr_node_id].numpy()
+            # Get current node position (detach and move to CPU for numpy operation)
+            curr_pos = self.graph.ndata['pos'][curr_node_id].detach().cpu().numpy()
             # Compute new node position
             x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
 
