@@ -156,7 +156,8 @@ class TrajectoryBuffer:
                     processed_values.append(v)
 
             # Convert values to tensors for easier computation
-            values_tensor = torch.stack(processed_values) if processed_values else torch.tensor([])
+            # Ensure device consistency by using self.device
+            values_tensor = torch.stack(processed_values) if processed_values else torch.tensor([], device=self.device)
             final_value = None
             if isinstance(final_values, dict):
                 if 'total_value' in final_values:
@@ -164,9 +165,9 @@ class TrajectoryBuffer:
                 elif 'total_reward' in final_values:
                     final_value = final_values['total_reward']
                 else:
-                    final_value = torch.tensor(0.0)
+                    final_value = torch.tensor(0.0, device=self.device)
             else:
-                final_value = final_values if final_values is not None else torch.tensor(0.0)
+                final_value = final_values if final_values is not None else torch.tensor(0.0, device=self.device)
 
             # Compute GAE advantages and returns
             returns = []
@@ -176,7 +177,7 @@ class TrajectoryBuffer:
             # Work backwards through the episode
             for t in reversed(range(len(rewards))):
                 if t == len(rewards) - 1:
-                    next_value = final_value if not terminated else torch.tensor(0.0)
+                    next_value = final_value if not terminated else torch.tensor(0.0, device=self.device)
                 else:
                     next_value = values_tensor[t + 1]
 
@@ -689,7 +690,8 @@ class DurotaxisTrainer:
             class LearnableWeights(nn.Module):
                 def __init__(self, num_components, enable_attention):
                     super().__init__()
-                    self.base_weights = nn.Parameter(torch.ones(num_components))
+                    # Use explicit float32 dtype to ensure device consistency
+                    self.base_weights = nn.Parameter(torch.ones(num_components, dtype=torch.float32))
                     if enable_attention:
                         self.attention_weights = nn.Linear(num_components, num_components)
                     else:
@@ -701,7 +703,8 @@ class DurotaxisTrainer:
             class FixedWeights(nn.Module):
                 def __init__(self, initial_weights):
                     super().__init__()
-                    self.base_weights = nn.Parameter(torch.tensor(initial_weights), requires_grad=False)
+                    # Convert to tensor with dtype to ensure proper device handling
+                    self.base_weights = nn.Parameter(torch.tensor(initial_weights, dtype=torch.float32), requires_grad=False)
                     self.attention_weights = None
                     
             initial_weights = [self.component_weights[comp] for comp in self.component_names]
@@ -980,12 +983,12 @@ class DurotaxisTrainer:
         if not batched_output or sum(node_counts) == 0:
             # Handle empty batch case
             empty_output = {
-                'discrete_actions': torch.empty(0, dtype=torch.long),
-                'continuous_actions': torch.empty(0, 4),
-                'discrete_log_probs': torch.empty(0),
-                'continuous_log_probs': torch.empty(0),
-                'total_log_probs': torch.empty(0),
-                'value_predictions': {k: torch.tensor(0.0) for k in self.component_names}
+                'discrete_actions': torch.empty(0, dtype=torch.long, device=self.device),
+                'continuous_actions': torch.empty(0, 4, device=self.device),
+                'discrete_log_probs': torch.empty(0, device=self.device),
+                'continuous_log_probs': torch.empty(0, device=self.device),
+                'total_log_probs': torch.empty(0, device=self.device),
+                'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
             }
             return [empty_output] * len(node_counts)
         
