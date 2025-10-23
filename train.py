@@ -15,6 +15,7 @@ import sys
 import os
 import json
 import subprocess
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2609,9 +2610,30 @@ class DurotaxisTrainer:
         # Update learnable component weights based on policy performance
         self.update_learnable_weights(advantages, avg_total_policy_loss)
         
+        # Check for NaN in loss before backward
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"⚠️  WARNING: Invalid loss detected (NaN or Inf): {total_loss.item()}")
+            print(f"   Policy loss: {avg_total_policy_loss.item()}, Value loss: {total_value_loss.item()}")
+            print(f"   Entropy loss: {avg_entropy_loss.item()}, Entropy bonus: {entropy_bonus.item()}")
+            return losses  # Skip this update
+        
         # Backward pass
         self.optimizer.zero_grad()
         total_loss.backward()
+        
+        # Check for NaN in gradients
+        has_nan_grad = False
+        for name, param in self.network.named_parameters():
+            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                print(f"⚠️  WARNING: NaN/Inf gradient in {name}")
+                has_nan_grad = True
+                # Zero out the bad gradients
+                param.grad.zero_()
+        
+        if has_nan_grad:
+            print("   Skipping optimizer step due to NaN/Inf gradients")
+            return losses
+        
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
         self.optimizer.step()
         
@@ -2837,9 +2859,30 @@ class DurotaxisTrainer:
         # Update learnable component weights based on policy performance
         self.update_learnable_weights(advantages, avg_total_policy_loss)
         
+        # Check for NaN in loss before backward
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"⚠️  WARNING: Invalid loss detected (NaN or Inf): {total_loss.item()}")
+            print(f"   Policy loss: {avg_total_policy_loss.item()}, Value loss: {total_value_loss.item()}")
+            print(f"   Entropy loss: {avg_entropy_loss.item()}, Entropy bonus: {entropy_bonus.item()}")
+            return losses  # Skip this update
+        
         # Backward pass
         self.optimizer.zero_grad()
         total_loss.backward()
+        
+        # Check for NaN in gradients
+        has_nan_grad = False
+        for name, param in self.network.named_parameters():
+            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                print(f"⚠️  WARNING: NaN/Inf gradient in {name}")
+                has_nan_grad = True
+                # Zero out the bad gradients
+                param.grad.zero_()
+        
+        if has_nan_grad:
+            print("   Skipping optimizer step due to NaN/Inf gradients")
+            return losses
+        
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
         self.optimizer.step()
         

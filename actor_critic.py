@@ -22,19 +22,86 @@ from encoder import GraphInputEncoder
 from config_loader import ConfigLoader
 
 
+def _safe_masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Make logits numerically stable and mask invalid actions.
+    
+    Args:
+        logits: Raw action logits [N, num_actions]
+        action_mask: Boolean mask [N, num_actions] where True = valid action
+        
+    Returns:
+        Stable masked logits safe for Categorical(logits=...)
+        
+    Key features:
+    - If an entire row is invalid (all masked), fallback to zeros (uniform after softmax)
+    - Only normalize when logits are dangerously large (>20) to preserve training dynamics
+    - Clean any NaN/Inf values
+    """
+    # Apply action mask if provided
+    if action_mask is not None:
+        mask = action_mask.to(device=logits.device, dtype=torch.bool)
+        
+        # Ensure mask has same shape as logits
+        if mask.dim() == 1 and logits.dim() == 2 and mask.size(0) == logits.size(0):
+            # Broadcast mask per row over action dimension
+            mask = mask.unsqueeze(1).expand_as(logits)
+        
+        # Mask invalid actions with -inf (will have ~0 probability after softmax)
+        masked = logits.masked_fill(~mask, float('-inf'))
+        
+        # Check for rows where all actions are invalid
+        all_invalid = (~mask).all(dim=1)
+        if all_invalid.any():
+            # Fallback to uniform distribution (zeros -> equal probs after softmax)
+            masked[all_invalid] = 0.0
+    else:
+        masked = logits
+    
+    # Clean any NaN or Inf values
+    masked = torch.nan_to_num(masked, nan=0.0, posinf=20.0, neginf=-20.0)
+    
+    # Only apply max-subtraction if logits are dangerously large (>20)
+    # This preserves the natural scale of logits during training
+    row_max = masked.max(dim=1, keepdim=True).values
+    needs_normalization = (row_max > 20.0) | (row_max < -20.0)
+    
+    if needs_normalization.any():
+        # Only normalize rows that need it
+        normalized = masked - torch.nan_to_num(row_max, nan=0.0)
+        masked = torch.where(needs_normalization, normalized, masked)
+    
+    return masked
+
+
 class Actor(nn.Module):
     """
     The Actor network for the Hybrid Actor-Critic agent.
     It takes node and graph features and outputs action distributions.
     """
-    def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate):
+    def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate, 
+                 pretrained_weights='imagenet'):
+        """
+        Args:
+            pretrained_weights: 'imagenet', 'random', or None
+                - 'imagenet': Use ImageNet pre-trained weights
+                - 'random': Random initialization
+                - None: Same as 'random'
+        """
         super().__init__()
         
         # Initial projection from GNN output to ResNet input size
         self.feature_proj = nn.Linear(encoder_out_dim * 2, 512)
 
-        # Use a pre-trained ResNet18 as a powerful feature extractor
-        resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        # Use a ResNet18 as a powerful feature extractor
+        # Configure weights based on pretrained_weights parameter
+        if pretrained_weights == 'imagenet':
+            resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            print("  🔧 Actor using ResNet18 with ImageNet weights")
+        else:
+            resnet = resnet18(weights=None)
+            print(f"  🔧 Actor using ResNet18 with random initialization")
+        
         # We'll use the body of the ResNet, excluding the final classification layer
         self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
         
@@ -109,11 +176,21 @@ class Actor(nn.Module):
 
         # Pass through final MLP (stays on original device)
         shared_features = self.action_mlp(shared_features)
+        
+        # Check for NaN in shared features
+        if torch.isnan(shared_features).any():
+            print("⚠️  WARNING: NaN detected in Actor shared_features!")
+            shared_features = torch.nan_to_num(shared_features, nan=0.0)
 
         # --- Action Heads ---
         discrete_logits = self.discrete_head(shared_features)
         continuous_mu = self.continuous_mu_head(shared_features)
         continuous_logstd = self.continuous_logstd_head(shared_features)
+        
+        # Clamp outputs for numerical stability
+        discrete_logits = torch.clamp(discrete_logits, -20.0, 20.0)
+        continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
+        continuous_logstd = torch.clamp(continuous_logstd, -10.0, 5.0)
 
         return discrete_logits, continuous_mu, continuous_logstd
 
@@ -121,65 +198,78 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """
     The Critic network for the Hybrid Actor-Critic agent.
-    It takes the graph token and outputs value predictions.
+    It takes node and graph features and outputs state values for different reward components.
     """
-    def __init__(self, encoder_out_dim, hidden_dim, value_components, dropout_rate):
+    def __init__(self, encoder_out_dim, hidden_dim, value_components: List[str], dropout_rate,
+                 pretrained_weights='imagenet'):
+        """
+        Args:
+            pretrained_weights: 'imagenet', 'random', or None
+                - 'imagenet': Use ImageNet pre-trained weights
+                - 'random': Random initialization
+                - None: Same as 'random'
+        """
         super().__init__()
         self.value_components = value_components
 
         # Initial projection from GNN output to ResNet input size
         self.feature_proj = nn.Linear(encoder_out_dim, 512)
 
-        # Use a pre-trained ResNet18 as a powerful feature extractor
-        resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-        self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
+        # Use a ResNet18 as a powerful feature extractor
+        # Configure weights based on pretrained_weights parameter
+        if pretrained_weights == 'imagenet':
+            resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            print("  🔧 Critic using ResNet18 with ImageNet weights")
+        else:
+            resnet = resnet18(weights=None)
+            print(f"  🔧 Critic using ResNet18 with random initialization")
         
-        # Freeze ResNet parameters to save memory and computation
-        for param in self.resnet_body.parameters():
-            param.requires_grad = False
+        # We'll use the body of the ResNet, excluding the final classification layer
+        self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
         
         # Put ResNet in evaluation mode to use pre-trained batch norm stats
         self.resnet_body.eval()
 
-        # Replace first conv layer (needs gradients since it's adapted for our input)
+        # Adapt the first conv layer for our "image"
         self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
-        # Final MLP heads for values
+        # Final MLP heads for value prediction, taking ResNet's output
         self.value_mlp = nn.Sequential(
-            nn.Linear(512, hidden_dim),
+            nn.Linear(512, hidden_dim),  # ResNet18 output is 512
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout_rate)
         )
 
-        # Multi-component value heads
-        self.value_heads = nn.ModuleDict()
-        for component in self.value_components:
-            self.value_heads[component] = nn.Linear(hidden_dim, 1)
+        # Value heads - one per component
+        self.value_heads = nn.ModuleDict({
+            component: nn.Linear(hidden_dim, 1) for component in value_components
+        })
 
     def forward(self, graph_token):
-        # Ensure graph_token has batch dimension
-        if graph_token.dim() == 1:
-            graph_token = graph_token.unsqueeze(0)  # [64] -> [1, 64]
+        device = graph_token.device
         
-        # Project and reshape for ResNet
-        projected_features = self.feature_proj(graph_token)
-        padded_features = F.pad(projected_features, (0, 576 - 512))
-        image_like_features = padded_features.view(-1, 1, 24, 24)
+        # Project and reshape to be "image-like" for ResNet
+        projected_features = self.feature_proj(graph_token)  # [batch_size, 512]
+        
+        # Pad to 576 and reshape
+        padded_features = F.pad(projected_features.unsqueeze(0), (0, 576 - 512))  # [1, 576]
+        image_like_features = padded_features.view(-1, 1, 24, 24)  # [1, 1, 24, 24]
 
-        # Pass through ResNet and MLP
+        # Pass through ResNet body
         resnet_out = self.resnet_body(image_like_features)
-        graph_features = resnet_out.view(graph_token.shape[0], -1)
-        graph_value_features = self.value_mlp(graph_features)
+        shared_features = resnet_out.view(1, -1)  # [1, 512]
+
+        # Pass through value MLP
+        value_features = self.value_mlp(shared_features)
 
         # --- Value Heads ---
-        value_predictions = {}
-        for component in self.value_components:
-            # Keep batch dimension for consistency with training pipeline
-            pred = self.value_heads[component](graph_value_features)  # [batch, 1]
-            value_predictions[component] = pred.squeeze(-1)  # [batch] - always keep batch dim
-            
-        return value_predictions, graph_value_features
+        value_predictions = {
+            component: self.value_heads[component](value_features).squeeze(-1)
+            for component in self.value_components
+        }
+
+        return value_predictions, value_features
 
 
 class HybridActorCritic(nn.Module):
@@ -217,19 +307,67 @@ class HybridActorCritic(nn.Module):
             value_components = ['total_value']
         self.value_components = value_components
         
+        # Pretrained weights configuration
+        pretrained_weights = config.get('pretrained_weights', 'imagenet')
+        print(f"\n📦 Loading Actor-Critic with pretrained weights: {pretrained_weights}")
+        
+        # Check if WSA (Weight Sharing Attention) is enabled
+        wsa_config = config.get('wsa', {})
+        self.use_wsa = wsa_config.get('enabled', False)
+        
         # Decoupled Actor and Critic
-        self.actor = Actor(
-            encoder_out_dim=self.encoder.out_dim,
-            hidden_dim=self.hidden_dim,
-            num_discrete_actions=self.num_discrete_actions,
-            continuous_dim=self.continuous_dim,
-            dropout_rate=self.dropout_rate
-        )
+        if self.use_wsa:
+            print("\n" + "="*60)
+            print("🔄 WSA (Weight Sharing Attention) ENABLED")
+            print("="*60)
+            
+            # Import WSA-enhanced actor
+            try:
+                from pretrained_fusion import WSAEnhancedActor
+                
+                self.actor = WSAEnhancedActor(
+                    encoder_out_dim=self.encoder.out_dim,
+                    hidden_dim=self.hidden_dim,
+                    num_discrete_actions=self.num_discrete_actions,
+                    continuous_dim=self.continuous_dim,
+                    dropout_rate=self.dropout_rate,
+                    wsa_config=wsa_config,
+                    use_wsa=True
+                )
+                
+                print("✅ WSA-Enhanced Actor initialized successfully")
+                print("="*60 + "\n")
+                
+            except ImportError as e:
+                print(f"❌ Failed to import WSA module: {e}")
+                print("⚠️  Falling back to standard Actor")
+                self.use_wsa = False
+                
+                self.actor = Actor(
+                    encoder_out_dim=self.encoder.out_dim,
+                    hidden_dim=self.hidden_dim,
+                    num_discrete_actions=self.num_discrete_actions,
+                    continuous_dim=self.continuous_dim,
+                    dropout_rate=self.dropout_rate,
+                    pretrained_weights=pretrained_weights
+                )
+        else:
+            print("\n🔧 Using standard Actor (WSA disabled)")
+            self.actor = Actor(
+                encoder_out_dim=self.encoder.out_dim,
+                hidden_dim=self.hidden_dim,
+                num_discrete_actions=self.num_discrete_actions,
+                continuous_dim=self.continuous_dim,
+                dropout_rate=self.dropout_rate,
+                pretrained_weights=pretrained_weights
+            )
+        
         self.critic = Critic(
             encoder_out_dim=self.encoder.out_dim,
             hidden_dim=self.hidden_dim,
             value_components=self.value_components,
-            dropout_rate=self.dropout_rate
+            dropout_rate=self.dropout_rate,
+            pretrained_weights=pretrained_weights
         )
         
         # Parameter bounds for continuous actions from config
@@ -260,6 +398,11 @@ class HybridActorCritic(nn.Module):
             self.actor.resnet_body.eval()
         if self.critic and hasattr(self.critic, 'resnet_body'):
             self.critic.resnet_body.eval()
+        # Also handle WSA feature extractors
+        if self.use_wsa and hasattr(self.actor, 'feature_extractor'):
+            for ptm in self.actor.feature_extractor.ptms:
+                if hasattr(ptm, 'backbone'):
+                    ptm.backbone.eval()
         return self
 
     def _init_weights(self, module):
@@ -307,17 +450,13 @@ class HybridActorCritic(nn.Module):
         value_predictions, graph_value_features = self.critic(graph_token)
 
         # --- Post-processing and Sanitization ---
-        if action_mask is not None:
-            discrete_logits = discrete_logits.masked_fill(~action_mask, -float('inf'))
-
-        discrete_logits = torch.clamp(discrete_logits, min=-20.0, max=20.0)
-        if torch.isnan(discrete_logits).any() or torch.isinf(discrete_logits).any():
-            discrete_logits = torch.nan_to_num(discrete_logits, nan=0.0)
+        # Clamp logits before masking to prevent extreme values
+        discrete_logits = torch.clamp(discrete_logits, min=-30.0, max=30.0)
         
-        discrete_probs = F.softmax(discrete_logits, dim=-1)
-        if torch.isnan(discrete_probs).any():
-            discrete_probs = torch.ones_like(discrete_probs) / discrete_probs.shape[-1]
+        # Apply numerically stable masking and get safe logits
+        stable_logits = _safe_masked_logits(discrete_logits, action_mask)
         
+        # Clean continuous parameters
         continuous_mu = torch.nan_to_num(continuous_mu, nan=0.0)
         continuous_logstd = torch.nan_to_num(continuous_logstd, nan=0.0)
         continuous_logstd = torch.clamp(continuous_logstd, min=-10.0, max=5.0)
@@ -328,8 +467,7 @@ class HybridActorCritic(nn.Module):
         # === OUTPUT PREPARATION ===
         output = {
             'encoder_out': encoder_out,
-            'discrete_logits': discrete_logits,
-            'discrete_probs': discrete_probs,
+            'discrete_logits': stable_logits,  # Return stabilized logits
             'continuous_mu': continuous_mu_bounded,
             'continuous_std': continuous_std,
             'value_predictions': value_predictions,
@@ -337,7 +475,8 @@ class HybridActorCritic(nn.Module):
         }
         
         if not deterministic:
-            discrete_dist = torch.distributions.Categorical(probs=discrete_probs)
+            # Use Categorical(logits=...) for numerical stability (PyTorch handles softmax internally)
+            discrete_dist = torch.distributions.Categorical(logits=stable_logits)
             discrete_actions = discrete_dist.sample()
             discrete_log_probs = discrete_dist.log_prob(discrete_actions)
             
@@ -356,7 +495,7 @@ class HybridActorCritic(nn.Module):
             })
         else:
             output.update({
-                'discrete_actions': torch.argmax(discrete_logits, dim=-1),
+                'discrete_actions': torch.argmax(stable_logits, dim=-1),
                 'continuous_actions': continuous_mu_bounded
             })
         
@@ -424,13 +563,17 @@ class HybridActorCritic(nn.Module):
         node_tokens = output['encoder_out'][1:]
         graph_token = output['encoder_out'][0]
         discrete_logits, continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
-        continuous_std = torch.exp(torch.clamp(continuous_logstd, -10, 5))
-
-        # Evaluate discrete actions
-        discrete_probs = F.softmax(discrete_logits, dim=-1)
-        discrete_probs = discrete_probs / (discrete_probs.sum(dim=-1, keepdim=True) + 1e-8)
         
-        discrete_dist = torch.distributions.Categorical(probs=discrete_probs)
+        # Clamp logits to prevent overflow/underflow
+        discrete_logits = torch.clamp(discrete_logits, min=-30.0, max=30.0)
+        continuous_logstd = torch.clamp(continuous_logstd, -10, 5)
+        continuous_std = torch.exp(continuous_logstd)
+        
+        # Apply numerically stable masking and get safe logits
+        stable_logits = _safe_masked_logits(discrete_logits, action_mask)
+        
+        # Use Categorical(logits=...) for numerical stability (PyTorch handles softmax internally)
+        discrete_dist = torch.distributions.Categorical(logits=stable_logits)
         discrete_log_probs = discrete_dist.log_prob(discrete_actions)
         discrete_entropy = discrete_dist.entropy()
         
