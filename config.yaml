@@ -11,7 +11,7 @@ trainer:
   # automatically scale curriculum stage durations to this value. If you change
   # this number (for example to 10000), the curriculum stages will be resized
   # proportionally so the curriculum covers the full training run.
-  total_episodes: 200
+  total_episodes: 1000
   max_steps: 1000
   learning_rate: 0.0002   
   save_dir: "./training_results"
@@ -439,6 +439,7 @@ actor_critic:
   num_discrete_actions: 2       # Number of discrete actions (spawn/delete)
   continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)
   dropout_rate: 0.2             # Increased dropout for regularization with a larger network
+  spawn_bias_init: 0.2          # Small positive bias towards 'spawn' to encourage growth early on
   
   # Pretrained weights configuration for standard Actor/Critic (non-WSA)
   # Options: 'imagenet', 'random', or null (same as 'random')

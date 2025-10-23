@@ -141,20 +141,21 @@ class Topology:
             return torch.empty(0, 1, dtype=torch.float32)
         
         positions = self.graph.ndata['pos']
+        device = positions.device
         num_nodes = positions.shape[0]
         
         if num_nodes == 0:
-            return torch.empty(0, 1, dtype=torch.float32)
+            return torch.empty(0, 1, dtype=torch.float32, device=device)
         
         intensities = []
         substrate_shape = self.substrate.signal_matrix.shape if hasattr(self.substrate, 'signal_matrix') else (0, 0)
         
         for i in range(num_nodes):
-            pos = positions[i].numpy()
+            pos = positions[i].cpu().numpy()  # Move to CPU for numpy operation
             intensity = self.substrate.get_intensity(pos)
             intensities.append(intensity)
         
-        substrate_features = torch.tensor(intensities, dtype=torch.float32).unsqueeze(1)
+        substrate_features = torch.tensor(intensities, dtype=torch.float32, device=device).unsqueeze(1)
         return substrate_features    
 
 
@@ -166,8 +167,8 @@ class Topology:
         """
         try:
             r = self._hill_equation(curr_node_id, gamma, alpha, noise)
-            # Get current node position
-            curr_pos = self.graph.ndata['pos'][curr_node_id].numpy()
+            # Get current node position (detach and move to CPU for numpy operation)
+            curr_pos = self.graph.ndata['pos'][curr_node_id].detach().cpu().numpy()
             # Compute new node position
             x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
 
@@ -191,7 +192,10 @@ class Topology:
                 elif y > height - margin_y:
                     y = height - margin_y
 
-            new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
+            # Get device from existing positions tensor to ensure device consistency
+            # spawn() is only called when curr_node_id exists, so pos tensor always has elements
+            device = self.graph.ndata['pos'].device
+            new_node_coord = torch.tensor([x, y], dtype=torch.float32, device=device)  
             
             # Store current graph state before modification
             num_nodes_before = self.graph.num_nodes()
@@ -205,23 +209,24 @@ class Topology:
             self.graph.add_nodes(1)
             
             # Manually set the node features to avoid dimension mismatches
+            # Use the device we already determined above (from self.graph.ndata['pos'])
             # Position data
             self.graph.ndata['pos'] = torch.cat([current_node_data['pos'], new_node_coord.unsqueeze(0)], dim=0)
             
             # New node flags
-            current_new_node_flags = current_node_data.get('new_node', torch.zeros(num_nodes_before, dtype=torch.float32))
-            new_node_flag = torch.tensor([1.0], dtype=torch.float32)
+            current_new_node_flags = current_node_data.get('new_node', torch.zeros(num_nodes_before, dtype=torch.float32, device=device))
+            new_node_flag = torch.tensor([1.0], dtype=torch.float32, device=device)
             self.graph.ndata['new_node'] = torch.cat([current_new_node_flags, new_node_flag], dim=0)
             
             # Persistent IDs
-            current_persistent_ids = current_node_data.get('persistent_id', torch.arange(num_nodes_before, dtype=torch.long))
-            new_persistent_id = torch.tensor([self._next_persistent_id], dtype=torch.long)
+            current_persistent_ids = current_node_data.get('persistent_id', torch.arange(num_nodes_before, dtype=torch.long, device=device))
+            new_persistent_id = torch.tensor([self._next_persistent_id], dtype=torch.long, device=device)
             self.graph.ndata['persistent_id'] = torch.cat([current_persistent_ids, new_persistent_id], dim=0)
             self._next_persistent_id += 1
             
             # To_delete flags (initialize new node with 0)
-            current_to_delete_flags = current_node_data.get('to_delete', torch.zeros(num_nodes_before, dtype=torch.float32))
-            new_to_delete_flag = torch.tensor([0.0], dtype=torch.float32)
+            current_to_delete_flags = current_node_data.get('to_delete', torch.zeros(num_nodes_before, dtype=torch.float32, device=device))
+            new_to_delete_flag = torch.tensor([0.0], dtype=torch.float32, device=device)
             self.graph.ndata['to_delete'] = torch.cat([current_to_delete_flags, new_to_delete_flag], dim=0)
             
             # Handle spawn parameters
@@ -248,11 +253,13 @@ class Topology:
         # Initialize spawn parameter arrays if they don't exist
         if 'gamma' not in self.graph.ndata:
             current_num_nodes = self.graph.num_nodes()
+            # Get device from positions
+            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
             # Initialize spawn parameters to zeros for safety (avoid NaN propagation)
-            self.graph.ndata['gamma'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
-            self.graph.ndata['alpha'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
-            self.graph.ndata['noise'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
-            self.graph.ndata['theta'] = torch.zeros((current_num_nodes,), dtype=torch.float32)
+            self.graph.ndata['gamma'] = torch.zeros((current_num_nodes,), dtype=torch.float32, device=device)
+            self.graph.ndata['alpha'] = torch.zeros((current_num_nodes,), dtype=torch.float32, device=device)
+            self.graph.ndata['noise'] = torch.zeros((current_num_nodes,), dtype=torch.float32, device=device)
+            self.graph.ndata['theta'] = torch.zeros((current_num_nodes,), dtype=torch.float32, device=device)
         
         # Set the spawn parameters for the new node (at index num_nodes_before)
         new_node_idx = num_nodes_before
@@ -544,6 +551,7 @@ class Topology:
             self._next_persistent_id += 1
         
         # Set node features
+        # Use CPU tensors - they will be moved to device when passed through training pipeline
         self.graph.ndata['pos'] = torch.tensor(positions, dtype=torch.float32)
         self.graph.ndata['persistent_id'] = torch.tensor(persistent_ids, dtype=torch.long)
         self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)

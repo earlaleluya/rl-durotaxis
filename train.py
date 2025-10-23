@@ -31,7 +31,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 class TrajectoryBuffer:
     """Buffer to store multiple episodes of trajectories for batch training"""
     
-    def __init__(self):
+    def __init__(self, device=None):
+        self.device = device if device is not None else torch.device('cpu')
         self.episodes = []
         self.current_episode = {
             'states': [],
@@ -156,7 +157,8 @@ class TrajectoryBuffer:
                     processed_values.append(v)
 
             # Convert values to tensors for easier computation
-            values_tensor = torch.stack(processed_values) if processed_values else torch.tensor([])
+            # Ensure device consistency by using self.device
+            values_tensor = torch.stack(processed_values) if processed_values else torch.tensor([], device=self.device)
             final_value = None
             if isinstance(final_values, dict):
                 if 'total_value' in final_values:
@@ -164,9 +166,9 @@ class TrajectoryBuffer:
                 elif 'total_reward' in final_values:
                     final_value = final_values['total_reward']
                 else:
-                    final_value = torch.tensor(0.0)
+                    final_value = torch.tensor(0.0, device=self.device)
             else:
-                final_value = final_values if final_values is not None else torch.tensor(0.0)
+                final_value = final_values if final_values is not None else torch.tensor(0.0, device=self.device)
 
             # Compute GAE advantages and returns
             returns = []
@@ -176,7 +178,7 @@ class TrajectoryBuffer:
             # Work backwards through the episode
             for t in reversed(range(len(rewards))):
                 if t == len(rewards) - 1:
-                    next_value = final_value if not terminated else torch.tensor(0.0)
+                    next_value = final_value if not terminated else torch.tensor(0.0, device=self.device)
                 else:
                     next_value = values_tensor[t + 1]
 
@@ -191,6 +193,17 @@ class TrajectoryBuffer:
                 gae = delta + gamma * gae_lambda * gae
                 advantages.insert(0, gae)
                 returns.insert(0, gae + values_tensor[t])
+
+            # Convert to tensors for normalization
+            if len(advantages) > 0:
+                adv_tensor = torch.stack(advantages)
+                # Advantage normalization (standard PPO trick)
+                adv_mean = adv_tensor.mean()
+                adv_std = adv_tensor.std(unbiased=False)
+                adv_std = adv_std if adv_std > 1e-8 else torch.tensor(1.0, device=adv_tensor.device)
+                adv_norm = (adv_tensor - adv_mean) / adv_std
+                # Write back normalized advantages keeping list structure
+                advantages = [adv_norm[i] for i in range(adv_norm.shape[0])]
 
             # Store computed values
             episode['returns'] = returns
@@ -484,7 +497,7 @@ class DurotaxisTrainer:
         self.exploration_success_steps = success_config.get('exploration_success_steps', 15)
         
         # Initialize trajectory buffer for batch training
-        self.trajectory_buffer = TrajectoryBuffer()
+        self.trajectory_buffer = TrajectoryBuffer(device=self.device)
         
         # Current entropy coefficient (will be adapted during training)
         self.current_entropy_coeff = self.entropy_coeff_start
@@ -678,7 +691,8 @@ class DurotaxisTrainer:
             class LearnableWeights(nn.Module):
                 def __init__(self, num_components, enable_attention):
                     super().__init__()
-                    self.base_weights = nn.Parameter(torch.ones(num_components))
+                    # Use explicit float32 dtype to ensure device consistency
+                    self.base_weights = nn.Parameter(torch.ones(num_components, dtype=torch.float32))
                     if enable_attention:
                         self.attention_weights = nn.Linear(num_components, num_components)
                     else:
@@ -690,7 +704,8 @@ class DurotaxisTrainer:
             class FixedWeights(nn.Module):
                 def __init__(self, initial_weights):
                     super().__init__()
-                    self.base_weights = nn.Parameter(torch.tensor(initial_weights), requires_grad=False)
+                    # Convert to tensor with dtype to ensure proper device handling
+                    self.base_weights = nn.Parameter(torch.tensor(initial_weights, dtype=torch.float32), requires_grad=False)
                     self.attention_weights = None
                     
             initial_weights = [self.component_weights[comp] for comp in self.component_names]
@@ -723,6 +738,9 @@ class DurotaxisTrainer:
             high_degree = degrees >= 4
             mask[high_degree, 0] = False  # No spawning from high-degree nodes
         
+        # Diagnostics: if too many rows are fully invalid, log once
+        if torch.all(~mask, dim=1).float().mean() > 0.2:
+            print("⚠️  WARNING: Over 20% of nodes have no valid actions. Check mask logic.")
         return mask
     
     def update_component_stats(self, rewards: List[Dict]):
@@ -966,12 +984,12 @@ class DurotaxisTrainer:
         if not batched_output or sum(node_counts) == 0:
             # Handle empty batch case
             empty_output = {
-                'discrete_actions': torch.empty(0, dtype=torch.long),
-                'continuous_actions': torch.empty(0, 4),
-                'discrete_log_probs': torch.empty(0),
-                'continuous_log_probs': torch.empty(0),
-                'total_log_probs': torch.empty(0),
-                'value_predictions': {k: torch.tensor(0.0) for k in self.component_names}
+                'discrete_actions': torch.empty(0, dtype=torch.long, device=self.device),
+                'continuous_actions': torch.empty(0, 4, device=self.device),
+                'discrete_log_probs': torch.empty(0, device=self.device),
+                'continuous_log_probs': torch.empty(0, device=self.device),
+                'total_log_probs': torch.empty(0, device=self.device),
+                'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
             }
             return [empty_output] * len(node_counts)
         

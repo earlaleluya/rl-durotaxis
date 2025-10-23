@@ -131,7 +131,9 @@ class TopologyState:
             new_node_flags = self.graph.ndata['new_node'].unsqueeze(1)
         else:
             # Default to all zeros if new_node flag not initialized
-            new_node_flags = torch.zeros(num_nodes, 1, dtype=torch.float32)
+            # Infer device from positions
+            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            new_node_flags = torch.zeros(num_nodes, 1, dtype=torch.float32, device=device)
         features.append(new_node_flags)
         
         return torch.cat(features, dim=1)
@@ -148,7 +150,9 @@ class TopologyState:
             - Normalized direction vector [dx, dy]
         """
         if self.graph.num_edges() == 0:
-            return torch.empty(0, 3, dtype=torch.float32)
+            # Infer device from positions if available
+            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            return torch.empty(0, 3, dtype=torch.float32, device=device)
         
         # Get edge endpoints
         src, dst = self.graph.edges()
@@ -186,10 +190,13 @@ class TopologyState:
         
         features = []
         
+        # Infer device from existing positions tensor for device consistency
+        device = positions.device if positions.numel() > 0 else torch.device('cpu')
+        
         # 1. Basic graph statistics
-        num_nodes = torch.tensor([self.graph.num_nodes()], dtype=torch.float32)
-        num_edges = torch.tensor([self.graph.num_edges()], dtype=torch.float32)
-        density = num_edges / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else torch.tensor([0.0])
+        num_nodes = torch.tensor([self.graph.num_nodes()], dtype=torch.float32, device=device)
+        num_edges = torch.tensor([self.graph.num_edges()], dtype=torch.float32, device=device)
+        density = num_edges / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else torch.tensor([0.0], device=device)
         
         features.extend([num_nodes, num_edges, density])
         
@@ -204,11 +211,11 @@ class TopologyState:
             bbox_area = torch.prod(bbox_size) if len(bbox_size) > 1 else bbox_size[0]  # scalar
             bbox_area = bbox_area.unsqueeze(0) if bbox_area.dim() == 0 else bbox_area  # [1]
         else:
-            centroid = torch.zeros(2)
-            bbox_min = torch.zeros(2)
-            bbox_max = torch.zeros(2)
-            bbox_size = torch.zeros(2)
-            bbox_area = torch.zeros(1)
+            centroid = torch.zeros(2, device=device)
+            bbox_min = torch.zeros(2, device=device)
+            bbox_max = torch.zeros(2, device=device)
+            bbox_size = torch.zeros(2, device=device)
+            bbox_area = torch.zeros(1, device=device)
         
         # Add spatial features
         features.append(centroid)     # [2]
@@ -220,12 +227,12 @@ class TopologyState:
         # 3. Convex hull area
         try:
             if num_nodes >= 3:
-                hull = ConvexHull(positions.numpy())
-                hull_area = torch.tensor([hull.volume], dtype=torch.float32)  # [1]
+                hull = ConvexHull(positions.cpu().numpy())  # Convert to CPU for scipy
+                hull_area = torch.tensor([hull.volume], dtype=torch.float32, device=device)  # [1]
             else:
-                hull_area = torch.tensor([0.0])  # [1]
+                hull_area = torch.tensor([0.0], device=device)  # [1]
         except:
-            hull_area = torch.tensor([0.0])  # [1]
+            hull_area = torch.tensor([0.0], device=device)  # [1]
         
         features.append(hull_area)
         
@@ -234,7 +241,7 @@ class TopologyState:
             degrees = self._get_node_degrees()
             avg_degree = torch.mean(degrees).unsqueeze(0)  # [1]
         else:
-            avg_degree = torch.tensor([0.0])  # [1]
+            avg_degree = torch.tensor([0.0], device=device)  # [1]
         
         features.append(avg_degree)
         
@@ -243,7 +250,8 @@ class TopologyState:
     def _get_node_degrees(self):
         """Get node degree features."""
         if self.graph.num_nodes() == 0:
-            return torch.empty(0, 2, dtype=torch.float32)
+            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            return torch.empty(0, 2, dtype=torch.float32, device=device)
         
         in_degrees = self.graph.in_degrees().float().unsqueeze(1)
         out_degrees = self.graph.out_degrees().float().unsqueeze(1)
@@ -253,7 +261,8 @@ class TopologyState:
         """Get basic centrality measures."""
         num_nodes = self.graph.num_nodes()
         if num_nodes == 0:
-            return torch.empty(0, 1, dtype=torch.float32)
+            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            return torch.empty(0, 1, dtype=torch.float32, device=device)
         
         positions = self.graph.ndata['pos']
         
@@ -283,9 +292,12 @@ class TopologyState:
         """Get binary flags indicating if nodes are on the convex hull boundary."""
         num_nodes = self.graph.num_nodes()
         if num_nodes == 0:
-            return torch.empty(0, 1, dtype=torch.float32)
+            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            return torch.empty(0, 1, dtype=torch.float32, device=device)
         
-        boundary_flags = torch.zeros(num_nodes, 1, dtype=torch.float32)
+        positions = self.graph.ndata['pos']
+        device = positions.device
+        boundary_flags = torch.zeros(num_nodes, 1, dtype=torch.float32, device=device)
         
         try:
             outmost_indices = self.topology.get_outmost_nodes()

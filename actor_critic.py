@@ -34,42 +34,43 @@ def _safe_masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor
         Stable masked logits safe for Categorical(logits=...)
         
     Key features:
-    - If an entire row is invalid (all masked), fallback to zeros (uniform after softmax)
-    - Only normalize when logits are dangerously large (>20) to preserve training dynamics
-    - Clean any NaN/Inf values
+    - Aggressive NaN/Inf cleaning at entry
+    - Standard max-subtraction after masking for softmax stability
+    - Handles all-invalid rows (fallback to uniform distribution)
+    - Final safety clamping before return
     """
-    # Apply action mask if provided
+    # 1. Clean any NaN or Inf values immediately at entry
+    masked = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+    
+    # 2. Apply action mask if provided (fill invalid actions with -inf)
     if action_mask is not None:
-        mask = action_mask.to(device=logits.device, dtype=torch.bool)
+        mask = action_mask.to(device=masked.device, dtype=torch.bool)
         
-        # Ensure mask has same shape as logits
-        if mask.dim() == 1 and logits.dim() == 2 and mask.size(0) == logits.size(0):
-            # Broadcast mask per row over action dimension
-            mask = mask.unsqueeze(1).expand_as(logits)
+        # Ensure mask has same shape as logits (handle broadcasting)
+        if mask.dim() == 1 and masked.dim() == 2:
+            mask = mask.unsqueeze(1).expand_as(masked)
         
         # Mask invalid actions with -inf (will have ~0 probability after softmax)
-        masked = logits.masked_fill(~mask, float('-inf'))
+        masked = masked.masked_fill(~mask, float('-inf'))
         
-        # Check for rows where all actions are invalid
-        all_invalid = (~mask).all(dim=1)
-        if all_invalid.any():
-            # Fallback to uniform distribution (zeros -> equal probs after softmax)
-            masked[all_invalid] = 0.0
-    else:
-        masked = logits
-    
-    # Clean any NaN or Inf values
-    masked = torch.nan_to_num(masked, nan=0.0, posinf=20.0, neginf=-20.0)
-    
-    # Only apply max-subtraction if logits are dangerously large (>20)
-    # This preserves the natural scale of logits during training
+    # 3. Check for rows where all actions are invalid (all -inf)
+    all_invalid = torch.isinf(masked).all(dim=1)
+    if all_invalid.any():
+        # Fallback to uniform distribution (zeros -> equal probs after softmax)
+        masked[all_invalid] = 0.0
+        
+    # 4. Apply max-subtraction for numerical stability
+    # This is the standard approach to prevent overflow in softmax's exp()
+    # Keeps the largest logit at 0, preventing exp(large_number) = inf
     row_max = masked.max(dim=1, keepdim=True).values
-    needs_normalization = (row_max > 20.0) | (row_max < -20.0)
     
-    if needs_normalization.any():
-        # Only normalize rows that need it
-        normalized = masked - torch.nan_to_num(row_max, nan=0.0)
-        masked = torch.where(needs_normalization, normalized, masked)
+    # Normalize: subtract the max logit from all logits
+    # For all_invalid rows where max=0.0, other entries are also 0.0, so subtraction is safe
+    masked = masked - torch.nan_to_num(row_max, nan=0.0)
+    
+    # 5. Final clamp to prevent any unexpected extreme values before use
+    # After max-subtraction, all values should be <= 0
+    masked = torch.clamp(masked, -30.0, 0.0)
     
     return masked
 
@@ -80,7 +81,7 @@ class Actor(nn.Module):
     It takes node and graph features and outputs action distributions.
     """
     def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate, 
-                 pretrained_weights='imagenet'):
+                 pretrained_weights='imagenet', spawn_bias_init: float = 0.0):
         """
         Args:
             pretrained_weights: 'imagenet', 'random', or None
@@ -127,6 +128,14 @@ class Actor(nn.Module):
         # Continuous action heads
         self.continuous_mu_head = nn.Linear(hidden_dim, continuous_dim)
         self.continuous_logstd_head = nn.Linear(hidden_dim, continuous_dim)
+
+        # Optional learnable bias to gently encourage spawning early in training
+        # Shape [2]: [spawn_bias, delete_bias]
+        # Create as parameter directly - PyTorch will handle device placement when model is moved
+        self.discrete_bias = nn.Parameter(
+            torch.tensor([float(spawn_bias_init), 0.0], dtype=torch.float32), 
+            requires_grad=True
+        )
 
     def forward(self, node_tokens, graph_token):
         num_nodes = node_tokens.shape[0]
@@ -177,20 +186,28 @@ class Actor(nn.Module):
         # Pass through final MLP (stays on original device)
         shared_features = self.action_mlp(shared_features)
         
-        # Check for NaN in shared features
-        if torch.isnan(shared_features).any():
-            print("⚠️  WARNING: NaN detected in Actor shared_features!")
-            shared_features = torch.nan_to_num(shared_features, nan=0.0)
+        # Aggressive NaN/Inf check on shared features (critical failure point)
+        if torch.isnan(shared_features).any() or torch.isinf(shared_features).any():
+            print("⚠️  WARNING: NaN/Inf detected in Actor shared_features! Sanitizing...")
+            shared_features = torch.nan_to_num(shared_features, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # --- Action Heads ---
         discrete_logits = self.discrete_head(shared_features)
+        # Apply optional spawn bias to encourage growth; broadcast to all nodes
+        if self.discrete_bias is not None:
+            discrete_logits = discrete_logits + self.discrete_bias.unsqueeze(0).expand_as(discrete_logits)
         continuous_mu = self.continuous_mu_head(shared_features)
         continuous_logstd = self.continuous_logstd_head(shared_features)
         
-        # Clamp outputs for numerical stability
-        discrete_logits = torch.clamp(discrete_logits, -20.0, 20.0)
+        # Tighter clamping for numerical stability (prevent exp overflow in distributions)
+        discrete_logits = torch.clamp(discrete_logits, -30.0, 30.0)  # Tightened from -20/20
         continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
         continuous_logstd = torch.clamp(continuous_logstd, -10.0, 5.0)
+        
+        # Final NaN check before returning (defensive programming)
+        discrete_logits = torch.nan_to_num(discrete_logits, nan=0.0)
+        continuous_mu = torch.nan_to_num(continuous_mu, nan=0.0)
+        continuous_logstd = torch.nan_to_num(continuous_logstd, nan=0.0)
 
         return discrete_logits, continuous_mu, continuous_logstd
 
@@ -314,7 +331,10 @@ class HybridActorCritic(nn.Module):
         # Check if WSA (Weight Sharing Attention) is enabled
         wsa_config = config.get('wsa', {})
         self.use_wsa = wsa_config.get('enabled', False)
-        
+
+        # Spawn bias configuration (optional, low-risk exploration boost)
+        self.spawn_bias_init = float(config.get('spawn_bias_init', 0.0))
+
         # Decoupled Actor and Critic
         if self.use_wsa:
             print("\n" + "="*60)
@@ -349,7 +369,8 @@ class HybridActorCritic(nn.Module):
                     num_discrete_actions=self.num_discrete_actions,
                     continuous_dim=self.continuous_dim,
                     dropout_rate=self.dropout_rate,
-                    pretrained_weights=pretrained_weights
+                    pretrained_weights=pretrained_weights,
+                    spawn_bias_init=self.spawn_bias_init
                 )
         else:
             print("\n🔧 Using standard Actor (WSA disabled)")
@@ -359,7 +380,8 @@ class HybridActorCritic(nn.Module):
                 num_discrete_actions=self.num_discrete_actions,
                 continuous_dim=self.continuous_dim,
                 dropout_rate=self.dropout_rate,
-                pretrained_weights=pretrained_weights
+                pretrained_weights=pretrained_weights,
+                spawn_bias_init=self.spawn_bias_init
             )
         
         self.critic = Critic(
@@ -378,12 +400,14 @@ class HybridActorCritic(nn.Module):
             'theta': [-math.pi, math.pi]
         })
         
-        self.register_buffer('action_bounds', torch.tensor([
+        # Create action_bounds with explicit float32 dtype for device consistency
+        bounds_list = [
             spawn_bounds.get('gamma', [0.1, 10.0]),
             spawn_bounds.get('alpha', [0.1, 5.0]),
             spawn_bounds.get('noise', [0.0, 2.0]),
             spawn_bounds.get('theta', [-math.pi, math.pi])
-        ]))
+        ]
+        self.register_buffer('action_bounds', torch.tensor(bounds_list, dtype=torch.float32))
         
         self.apply(self._init_weights)
     
@@ -564,10 +588,14 @@ class HybridActorCritic(nn.Module):
         graph_token = output['encoder_out'][0]
         discrete_logits, continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
         
-        # Clamp logits to prevent overflow/underflow
+        # Clamp logits to prevent overflow/underflow (tighter bounds)
         discrete_logits = torch.clamp(discrete_logits, min=-30.0, max=30.0)
-        continuous_logstd = torch.clamp(continuous_logstd, -10, 5)
+        continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
+        continuous_logstd = torch.clamp(continuous_logstd, -10.0, 5.0)
         continuous_std = torch.exp(continuous_logstd)
+        
+        # Ensure std is not too small (avoid division by zero or extreme log-probs)
+        continuous_std = torch.clamp(continuous_std, min=1e-6, max=10.0)
         
         # Apply numerically stable masking and get safe logits
         stable_logits = _safe_masked_logits(discrete_logits, action_mask)
@@ -577,14 +605,23 @@ class HybridActorCritic(nn.Module):
         discrete_log_probs = discrete_dist.log_prob(discrete_actions)
         discrete_entropy = discrete_dist.entropy()
         
-        # Evaluate continuous actions
-        # Note: We need to invert the bounding function to get the raw action for log_prob
-        # This is complex, so for now we approximate by using the unbounded mu.
-        # A more accurate implementation would store the raw actions.
+        # Evaluate continuous actions with safety checks
+        # Note: This is an approximation, as continuous_actions are bounded.
+        # A proper implementation would include the log-derivative of the bounding function.
         continuous_dist = torch.distributions.Normal(continuous_mu, continuous_std)
-        # This is an approximation, as continuous_actions are bounded.
-        continuous_log_probs = continuous_dist.log_prob(continuous_actions).sum(dim=-1)
+        
+        # Clamp continuous_actions to reasonable range before log_prob
+        continuous_actions_clamped = torch.clamp(continuous_actions, -10.0, 10.0)
+        continuous_log_probs = continuous_dist.log_prob(continuous_actions_clamped).sum(dim=-1)
         continuous_entropy = continuous_dist.entropy().sum(dim=-1)
+        
+        # Safety: Clamp log_probs to prevent extreme values
+        discrete_log_probs = torch.clamp(discrete_log_probs, -20.0, 20.0)
+        continuous_log_probs = torch.clamp(continuous_log_probs, -20.0, 20.0)
+        
+        # Final NaN check
+        discrete_log_probs = torch.nan_to_num(discrete_log_probs, nan=0.0)
+        continuous_log_probs = torch.nan_to_num(continuous_log_probs, nan=0.0)
         
         total_log_probs = discrete_log_probs + continuous_log_probs
         total_entropy = discrete_entropy + continuous_entropy

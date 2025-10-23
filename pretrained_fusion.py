@@ -76,7 +76,7 @@ class WeightSharingAttention(nn.Module):
         )
         
         # Optional: Learnable temperature for softmax sharpness
-        self.temperature = nn.Parameter(torch.ones(1))
+        self.temperature = nn.Parameter(torch.ones(1, dtype=torch.float32))
     
     def forward(self, context: torch.Tensor, embeddings: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
