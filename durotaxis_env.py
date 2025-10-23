@@ -500,7 +500,7 @@ class DurotaxisEnv(gym.Env):
         # Sample edges for hash (avoid hashing entire large edge set)
         if edge_data.shape[1] > 100:
             # For large graphs, sample key edges
-            indices = torch.linspace(0, edge_data.shape[1]-1, 20, dtype=torch.long)
+            indices = torch.linspace(0, edge_data.shape[1]-1, 20, dtype=torch.long, device=edge_data.device)
             sample = edge_data[:, indices].flatten()
         else:
             # For small graphs, use all edges
@@ -709,7 +709,8 @@ class DurotaxisEnv(gym.Env):
             if node_features.shape[0] != num_nodes:
                 # Fallback to uniform sampling if feature mismatch
                 print(f"    ⚠️ Feature mismatch, using uniform sampling")
-                indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long)
+                device = node_features.device
+                indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long, device=device)
                 return indices
             
             # Convert to numpy for clustering
@@ -806,12 +807,15 @@ class DurotaxisEnv(gym.Env):
             # Sort indices for consistent ordering
             selected_indices = sorted(selected_indices)
             
-            return torch.tensor(selected_indices, dtype=torch.long)
+            # Infer device from node_features
+            device = node_features.device if hasattr(node_features, 'device') else torch.device('cpu')
+            return torch.tensor(selected_indices, dtype=torch.long, device=device)
             
         except Exception as e:
             print(f"    ❌ Semantic selection failed: {e}")
             # Fallback to uniform sampling
-            indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long)
+            device = node_features.device if hasattr(node_features, 'device') else torch.device('cpu')
+            indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long, device=device)
             print(f"    🔄 Fallback to uniform sampling: {target_count} nodes")
             return indices
 
@@ -1268,11 +1272,14 @@ class DurotaxisEnv(gym.Env):
             return
 
         try:
+            positions = self.topology.graph.ndata['pos']
+            device = positions.device
+            
             prev_graph_features = prev_state.get('graph_features')
             if isinstance(prev_graph_features, torch.Tensor):
                 target_centroid = prev_graph_features[3:5].detach().cpu()
             else:
-                target_centroid = torch.tensor(prev_graph_features[3:5], dtype=torch.float32)
+                target_centroid = torch.tensor(prev_graph_features[3:5], dtype=torch.float32, device=device)
         except Exception as exc:
             print(f"⚠️  Empty graph recovery repositioning failed: {exc}")
             return
@@ -1292,7 +1299,8 @@ class DurotaxisEnv(gym.Env):
             adjusted_positions = adjusted_positions + noise
         else:
             # Multiple nodes: arrange in a circle around target centroid to ensure diversity
-            angles = torch.linspace(0, 2 * np.pi, num_nodes + 1)[:-1]  # Evenly spaced angles
+            device = positions.device
+            angles = torch.linspace(0, 2 * np.pi, num_nodes + 1, device=device)[:-1]  # Evenly spaced angles
             radius = base_noise * 2.0  # Radius of circle
             
             adjusted_positions = torch.zeros_like(positions)
@@ -1787,7 +1795,9 @@ class DurotaxisEnv(gym.Env):
         """
         if hasattr(self.topology, 'graph') and 'new_node' in self.topology.graph.ndata:
             num_nodes = self.topology.graph.num_nodes()
-            self.topology.graph.ndata['new_node'] = torch.zeros(num_nodes, dtype=torch.float32)
+            # Infer device from existing graph data
+            device = self.topology.graph.ndata['pos'].device if 'pos' in self.topology.graph.ndata else torch.device('cpu')
+            self.topology.graph.ndata['new_node'] = torch.zeros(num_nodes, dtype=torch.float32, device=device)
 
     def _check_terminated(self, state):
         """

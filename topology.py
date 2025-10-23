@@ -192,7 +192,9 @@ class Topology:
                 elif y > height - margin_y:
                     y = height - margin_y
 
-            new_node_coord = torch.tensor([x, y], dtype=torch.float32)  
+            # Get device from existing positions tensor to ensure device consistency
+            device = self.graph.ndata['pos'].device if self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            new_node_coord = torch.tensor([x, y], dtype=torch.float32, device=device)  
             
             # Store current graph state before modification
             num_nodes_before = self.graph.num_nodes()
@@ -548,6 +550,7 @@ class Topology:
             self._next_persistent_id += 1
         
         # Set node features
+        # Use CPU tensors - they will be moved to device when passed through training pipeline
         self.graph.ndata['pos'] = torch.tensor(positions, dtype=torch.float32)
         self.graph.ndata['persistent_id'] = torch.tensor(persistent_ids, dtype=torch.long)
         self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
