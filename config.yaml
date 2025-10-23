@@ -439,6 +439,7 @@ actor_critic:
   num_discrete_actions: 2       # Number of discrete actions (spawn/delete)
   continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)
   dropout_rate: 0.2             # Increased dropout for regularization with a larger network
+  spawn_bias_init: 0.2          # Small positive bias towards 'spawn' to encourage growth early on
   
   # Pretrained weights configuration for standard Actor/Critic (non-WSA)
   # Options: 'imagenet', 'random', or null (same as 'random')

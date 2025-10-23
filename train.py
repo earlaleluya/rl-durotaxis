@@ -192,6 +192,17 @@ class TrajectoryBuffer:
                 advantages.insert(0, gae)
                 returns.insert(0, gae + values_tensor[t])
 
+            # Convert to tensors for normalization
+            if len(advantages) > 0:
+                adv_tensor = torch.stack(advantages)
+                # Advantage normalization (standard PPO trick)
+                adv_mean = adv_tensor.mean()
+                adv_std = adv_tensor.std(unbiased=False)
+                adv_std = adv_std if adv_std > 1e-8 else torch.tensor(1.0, device=adv_tensor.device)
+                adv_norm = (adv_tensor - adv_mean) / adv_std
+                # Write back normalized advantages keeping list structure
+                advantages = [adv_norm[i] for i in range(adv_norm.shape[0])]
+
             # Store computed values
             episode['returns'] = returns
             episode['advantages'] = advantages
@@ -723,6 +734,9 @@ class DurotaxisTrainer:
             high_degree = degrees >= 4
             mask[high_degree, 0] = False  # No spawning from high-degree nodes
         
+        # Diagnostics: if too many rows are fully invalid, log once
+        if torch.all(~mask, dim=1).float().mean() > 0.2:
+            print("⚠️  WARNING: Over 20% of nodes have no valid actions. Check mask logic.")
         return mask
     
     def update_component_stats(self, rewards: List[Dict]):

@@ -80,7 +80,7 @@ class Actor(nn.Module):
     It takes node and graph features and outputs action distributions.
     """
     def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate, 
-                 pretrained_weights='imagenet'):
+                 pretrained_weights='imagenet', spawn_bias_init: float = 0.0):
         """
         Args:
             pretrained_weights: 'imagenet', 'random', or None
@@ -127,6 +127,11 @@ class Actor(nn.Module):
         # Continuous action heads
         self.continuous_mu_head = nn.Linear(hidden_dim, continuous_dim)
         self.continuous_logstd_head = nn.Linear(hidden_dim, continuous_dim)
+
+        # Optional learnable bias to gently encourage spawning early in training
+        # Shape [2]: [spawn_bias, delete_bias]
+        bias_tensor = torch.tensor([float(spawn_bias_init), 0.0], dtype=torch.float32)
+        self.discrete_bias = nn.Parameter(bias_tensor, requires_grad=True)
 
     def forward(self, node_tokens, graph_token):
         num_nodes = node_tokens.shape[0]
@@ -184,6 +189,9 @@ class Actor(nn.Module):
 
         # --- Action Heads ---
         discrete_logits = self.discrete_head(shared_features)
+        # Apply optional spawn bias to encourage growth; broadcast to all nodes
+        if self.discrete_bias is not None:
+            discrete_logits = discrete_logits + self.discrete_bias.unsqueeze(0).expand_as(discrete_logits)
         continuous_mu = self.continuous_mu_head(shared_features)
         continuous_logstd = self.continuous_logstd_head(shared_features)
         
@@ -314,7 +322,10 @@ class HybridActorCritic(nn.Module):
         # Check if WSA (Weight Sharing Attention) is enabled
         wsa_config = config.get('wsa', {})
         self.use_wsa = wsa_config.get('enabled', False)
-        
+
+        # Spawn bias configuration (optional, low-risk exploration boost)
+        self.spawn_bias_init = float(config.get('spawn_bias_init', 0.0))
+
         # Decoupled Actor and Critic
         if self.use_wsa:
             print("\n" + "="*60)
@@ -349,7 +360,8 @@ class HybridActorCritic(nn.Module):
                     num_discrete_actions=self.num_discrete_actions,
                     continuous_dim=self.continuous_dim,
                     dropout_rate=self.dropout_rate,
-                    pretrained_weights=pretrained_weights
+                    pretrained_weights=pretrained_weights,
+                    spawn_bias_init=self.spawn_bias_init
                 )
         else:
             print("\n🔧 Using standard Actor (WSA disabled)")
@@ -359,7 +371,8 @@ class HybridActorCritic(nn.Module):
                 num_discrete_actions=self.num_discrete_actions,
                 continuous_dim=self.continuous_dim,
                 dropout_rate=self.dropout_rate,
-                pretrained_weights=pretrained_weights
+                pretrained_weights=pretrained_weights,
+                spawn_bias_init=self.spawn_bias_init
             )
         
         self.critic = Critic(
