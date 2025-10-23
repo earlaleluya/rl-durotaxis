@@ -31,7 +31,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 class TrajectoryBuffer:
     """Buffer to store multiple episodes of trajectories for batch training"""
     
-    def __init__(self):
+    def __init__(self, device=None):
+        self.device = device if device is not None else torch.device('cpu')
         self.episodes = []
         self.current_episode = {
             'states': [],
@@ -496,7 +497,7 @@ class DurotaxisTrainer:
         self.exploration_success_steps = success_config.get('exploration_success_steps', 15)
         
         # Initialize trajectory buffer for batch training
-        self.trajectory_buffer = TrajectoryBuffer()
+        self.trajectory_buffer = TrajectoryBuffer(device=self.device)
         
         # Current entropy coefficient (will be adapted during training)
         self.current_entropy_coeff = self.entropy_coeff_start
