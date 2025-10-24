@@ -398,6 +398,13 @@ class DurotaxisTrainer:
         # PPO KL divergence early stopping (prevents policy from moving too far)
         self.target_kl = algorithm_config.get('target_kl', 0.03)  # Stop PPO epochs if KL > this
         self.enable_kl_early_stop = algorithm_config.get('enable_kl_early_stop', True)
+
+        # NEW: Two-stage curriculum settings
+        two_stage_config = algorithm_config.get('two_stage_curriculum', {})
+        self.training_stage = two_stage_config.get('stage', 1)
+        self.stage_1_fixed_spawn_params = two_stage_config.get('stage_1_fixed_spawn_params', {
+            'gamma': 5.0, 'alpha': 1.0, 'noise': 0.1, 'theta': 0.0
+        })
         
         # Adaptive weighting parameters
         self.weight_update_momentum = config.get('weight_momentum', 0.9)
@@ -685,6 +692,11 @@ class DurotaxisTrainer:
             print(f"   └─ Log substrate values: {'yes' if self.log_substrate_values else 'no'}")
             print(f"   └─ Compression: {'enabled' if self.compress_logs else 'disabled'}")
             print(f"   └─ Max file size: {self.max_log_file_size_mb} MB")
+        
+        if self.training_stage == 1:
+            print(f"   ⭐️ Training Mode: Stage 1 (Discrete Actions Only)")
+        else:
+            print(f"   ⭐️ Training Mode: Stage 2 (Fine-tuning Continuous Actions)")
     
     def _initialize_learnable_weights(self):
         """Initialize the enhanced learnable component weighting system"""
@@ -1544,17 +1556,6 @@ class DurotaxisTrainer:
                 'node_count_history': list(self.current_episode_node_counts) if hasattr(self, 'current_episode_node_counts') else []
             }
             
-            # Extract substrate information
-            if hasattr(self.env, 'substrate') and hasattr(self.env.substrate, 'substrate_kind'):
-                substrate_params = getattr(self, 'current_substrate_params', {})
-                detailed_data['substrate_info'] = {
-                    'type': substrate_params.get('kind', 'unknown'),
-                    'parameters': {
-                        'm': substrate_params.get('m', 0.0),
-                        'b': substrate_params.get('b', 0.0)
-                    }
-                }
-            
             # Extract detailed node information
             if num_nodes > 0:
                 # Get node data from the graph
@@ -2219,7 +2220,20 @@ class DurotaxisTrainer:
                 for node_id, action_type in topology_actions.items():
                     try:
                         if action_type == 'spawn':
-                            params = self.network.get_spawn_parameters(output, node_id)
+                            # STAGE 1: Use fixed spawn parameters (discrete actions only)
+                            # STAGE 2: Use network's learned continuous parameters
+                            if self.training_stage == 1:
+                                # Use fixed default parameters from config
+                                params = [
+                                    self.stage_1_fixed_spawn_params['gamma'],
+                                    self.stage_1_fixed_spawn_params['alpha'],
+                                    self.stage_1_fixed_spawn_params['noise'],
+                                    self.stage_1_fixed_spawn_params['theta']
+                                ]
+                            else:
+                                # Use network's continuous output
+                                params = self.network.get_spawn_parameters(output, node_id)
+                            
                             # Track spawn parameters for statistics
                             self.current_episode_spawn_params['gamma'].append(params[0])
                             self.current_episode_spawn_params['alpha'].append(params[1])
@@ -2441,7 +2455,9 @@ class DurotaxisTrainer:
         ratio_continuous = torch.tensor(1.0, device=self.device)
         clip_fraction_continuous = torch.tensor(0.0, device=self.device)
         
-        if ('continuous' in old_log_probs_dict and 
+        # STAGE 1: Skip continuous loss computation (discrete actions only)
+        # STAGE 2: Compute full continuous loss for fine-tuning
+        if self.training_stage == 2 and ('continuous' in old_log_probs_dict and 
             'continuous_log_probs' in eval_output and 
             len(old_log_probs_dict['continuous']) > 0 and 
             len(eval_output['continuous_log_probs']) > 0):

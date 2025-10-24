@@ -518,6 +518,20 @@ algorithm:
   clip_epsilon: 0.1             # PPO clipping parameter
   value_loss_coeff: 0.5         # Increased from 0.5 for better value estimation
   
+  # NEW: Two-Stage Training Curriculum
+  # Stage 1: Discrete-only training (spawn/delete). Ignores continuous parameters.
+  # Stage 2: Fine-tuning. Learns continuous spawn parameters.
+  two_stage_curriculum:
+    stage: 1  # Set to 1 for discrete-only, 2 for fine-tuning
+    
+    # Fixed spawn parameters used during Stage 1.
+    # These are reasonable defaults that encourage stable growth.
+    stage_1_fixed_spawn_params:
+      gamma: 5.0
+      alpha: 1.0
+      noise: 0.1
+      theta: 0.0
+  
   # Optimization parameters
   max_grad_norm: 0.5            # Increased from 0.5 for less aggressive clipping
 
