@@ -348,6 +348,9 @@ class DurotaxisTrainer:
         self.entropy_bonus_coeff = config.get('entropy_bonus_coeff', 0.05)  # Increased for stronger regularization
         self.moving_avg_window = config.get('moving_avg_window', 20)
         self.log_every = config.get('log_every', 50)
+        # Logging verbosity - read from top-level logging section
+        logging_cfg = self.config_loader.config.get('logging', {})
+        self.verbose = logging_cfg.get('verbose', True)
         self.progress_print_every = config.get('progress_print_every', 5)
         self.checkpoint_every = config.get('checkpoint_every', None)
         self.substrate_type = config.get('substrate_type', 'random')
