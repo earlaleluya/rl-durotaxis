@@ -1,0 +1,15 @@
+Appended episode 9 to detailed_nodes_all_episodes.json (5 steps)
+   └─ Total episodes in file: 10
+   └─ Episode summary: 279 total nodes tracked, avg 55.8 nodes/step, range 5-154 nodes
+Episode    9: R=-78.019 (Smooth= 55.91) | MB=26.0 | Steps=  5 | Success=False | Loss= 0.0000
+/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/utils/checkpoint.py:1399: FutureWarning: `torch.cpu.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cpu', args...)` instead.
+  with device_autocast_ctx, torch.cpu.amp.autocast(**cpu_autocast_kwargs), recompute_context:  # type: ignore[attr-defined]
+Traceback (most recent call last):
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 4009, in <module>
+    main()
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 4005, in main
+    trainer.train()
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 3152, in train
+    if self.verbose:
+       ^^^^^^^^^^^^
+AttributeError: 'DurotaxisTrainer' object has no attribute 'verbose'
