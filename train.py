@@ -437,6 +437,8 @@ class DurotaxisTrainer:
         self.min_entropy_threshold = entropy_config.get('min_entropy_threshold', 0.15) # Higher threshold
         
         # Batch training configuration
+        self.rollout_collection_mode = config.get('rollout_collection_mode', 'episodes')
+        self.rollout_steps = config.get('rollout_steps', 2048)
         self.rollout_batch_size = config.get('rollout_batch_size', 10)
         self.update_epochs = config.get('update_epochs', 4)
         self.minibatch_size = config.get('minibatch_size', 64)
@@ -3016,6 +3018,48 @@ class DurotaxisTrainer:
         
         return losses
     
+    def _collect_and_process_episode(self, episode_count: int) -> Tuple:
+        """Helper function to collect an episode and add it to the buffer."""
+        self.trajectory_buffer.start_episode()
+        
+        states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode(episode_count)
+        
+        if not rewards:
+            return [], [], [], [], [], None, False, False
+        
+        for i in range(len(states)):
+            self.trajectory_buffer.add_step(
+                states[i], actions[i], rewards[i], values[i], log_probs[i], values[i]
+            )
+        
+        self.trajectory_buffer.finish_episode(final_values, terminated, success)
+        
+        self.update_component_stats(rewards)
+        
+        episode_total_reward = sum(r.get('total_reward', 0.0) for r in rewards)
+        self.episode_rewards['total_reward'].append(episode_total_reward)
+        for component in self.component_names:
+            component_reward = sum(r.get(component, 0.0) for r in rewards)
+            self.episode_rewards[component].append(component_reward)
+        
+        window = self.moving_avg_window
+        robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
+        self.smoothed_rewards.append(robust_ma)
+        
+        self.scheduler.step()
+        self.save_spawn_statistics(episode_count)
+        self.save_reward_statistics(episode_count)
+        
+        if self.enable_detailed_logging and self.detailed_node_logs:
+            self.save_detailed_node_logs(episode_count)
+            
+        latest_loss = self.losses['total_loss'][-1] if self.losses['total_loss'] else 0.0
+        smoothed_reward = self.smoothed_rewards[-1] if self.smoothed_rewards else episode_total_reward
+        milestone_bonus = sum(r.get('milestone_bonus', 0.0) for r in rewards)
+        print(f"Episode {episode_count:4d}: R={episode_total_reward:7.3f} (Smooth={smoothed_reward:6.2f}) | MB={milestone_bonus:4.1f} | Steps={len(states):3d} | Success={success} | Loss={latest_loss:7.4f}")
+
+        return states, actions, rewards, values, log_probs, final_values, terminated, success
+    
     def train(self):
         """Main training loop with batch updates"""
         # Run directory already created in __init__, just confirm it exists
@@ -3023,7 +3067,11 @@ class DurotaxisTrainer:
         if self.start_episode > 0:
             print(f"🔄 Resuming from episode {self.start_episode}")
         print(f"📁 Saving to: {self.run_dir}")
-        print(f"📊 Batch Training: {self.rollout_batch_size} episodes per batch, {self.update_epochs} update epochs, {self.minibatch_size} minibatch size")
+        if self.rollout_collection_mode == 'steps':
+            print(f"📊 Batch Mode: Collecting ~{self.rollout_steps} steps per batch.")
+        else:
+            print(f"📊 Batch Mode: Collecting {self.rollout_batch_size} episodes per batch.")
+        print(f"   Update Details: {self.update_epochs} update epochs, {self.minibatch_size} minibatch size")
         print(f"📊 Progress format: Batch | R: Current (MA: MovingAvg, Best: Best) | Loss | Entropy | LR: Learning Rate | Episodes | Success Rate | Focus: Component(Weight)")
         
         episode_count = self.start_episode
@@ -3037,80 +3085,39 @@ class DurotaxisTrainer:
             batch_episode_rewards = []
             batch_successes = []
             
-            # Collect rollout_batch_size episodes
-            for batch_episode in range(self.rollout_batch_size):
-                if episode_count >= self.total_episodes:
-                    break
+            # --- Step-based or Episode-based collection logic ---
+            if self.rollout_collection_mode == 'steps':
+                # Collect episodes until we have enough steps
+                total_steps_in_batch = 0
+                while total_steps_in_batch < self.rollout_steps:
+                    if episode_count >= self.total_episodes:
+                        break
                     
-                # Start new episode in buffer
-                self.trajectory_buffer.start_episode()
-                
-                # Collect episode using existing method
-                states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode(episode_count)
-                
-                if not rewards:
-                    continue
-                
-                # Add episode data to buffer
-                for i in range(len(states)):
-                    self.trajectory_buffer.add_step(
-                        states[i], actions[i], rewards[i], values[i], log_probs[i], values[i]  # old_values = values for first collection
-                    )
-                
-                # Finish episode in buffer
-                self.trajectory_buffer.finish_episode(final_values, terminated, success)
-                
-                # Update component statistics for adaptive scaling
-                self.update_component_stats(rewards)
-                
-                # Track episode rewards and success
-                episode_total_reward = sum(r.get('total_reward', 0.0) for r in rewards)
-                batch_episode_rewards.append(episode_total_reward)
-                batch_successes.append(success)
-                
-                # Update episode tracking
-                self.episode_rewards['total_reward'].append(episode_total_reward)
-                for component in self.component_names:
-                    component_reward = sum(r.get(component, 0.0) for r in rewards)
-                    self.episode_rewards[component].append(component_reward)
-                
-                # Enhanced reward smoothing with multiple methods
-                window = self.moving_avg_window if hasattr(self, 'moving_avg_window') else 20
-                simple_ma = moving_average(self.episode_rewards['total_reward'], window)
-                robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
-                ema = exponential_moving_average(self.episode_rewards['total_reward'])
-                
-                # Use robust moving average as primary smoothed metric
-                self.smoothed_rewards.append(robust_ma)
-                
-                # Track smoothed rewards for milestone_bonus component too
-                if 'milestone_bonus' in self.episode_rewards:
-                    milestone_smoothed = robust_moving_average(self.episode_rewards['milestone_bonus'], window//2)
-                else:
-                    milestone_rewards = [sum(r.get('milestone_bonus', 0.0) for r in rewards)]
-                    self.episode_rewards['milestone_bonus'] = self.episode_rewards.get('milestone_bonus', []) + milestone_rewards
-                    milestone_smoothed = milestone_rewards[0]
-                
-                # Update learning rate schedule
-                self.scheduler.step()
-                
-                # Compute and save spawn parameter statistics
-                self.save_spawn_statistics(episode_count)
-                
-                # Compute and save reward component statistics
-                self.save_reward_statistics(episode_count)
-                
-                # Save detailed node logs for this episode
-                if self.enable_detailed_logging and self.detailed_node_logs:
-                    self.save_detailed_node_logs(episode_count)
-                
-                # Enhanced episode progress print with smoothed metrics
-                latest_loss = self.losses['total_loss'][-1] if self.losses['total_loss'] else 0.0
-                smoothed_reward = self.smoothed_rewards[-1] if self.smoothed_rewards else episode_total_reward
-                milestone_bonus = sum(r.get('milestone_bonus', 0.0) for r in rewards)
-                print(f"Episode {episode_count:4d}: R={episode_total_reward:7.3f} (Smooth={smoothed_reward:6.2f}) | MB={milestone_bonus:4.1f} | Steps={len(states):3d} | Success={success} | Loss={latest_loss:7.4f}")
-                
-                episode_count += 1
+                    # Collect one full episode
+                    states, _, rewards, _, _, _, _, success = self._collect_and_process_episode(episode_count)
+                    if not states:
+                        episode_count += 1
+                        continue
+                    
+                    total_steps_in_batch += len(states)
+                    batch_episode_rewards.append(sum(r.get('total_reward', 0.0) for r in rewards))
+                    batch_successes.append(success)
+                    episode_count += 1
+            else:
+                # Original episode-based collection
+                for batch_episode in range(self.rollout_batch_size):
+                    if episode_count >= self.total_episodes:
+                        break
+                    
+                    # Collect one full episode
+                    states, _, rewards, _, _, _, _, success = self._collect_and_process_episode(episode_count)
+                    if not states:
+                        episode_count += 1
+                        continue
+
+                    batch_episode_rewards.append(sum(r.get('total_reward', 0.0) for r in rewards))
+                    batch_successes.append(success)
+                    episode_count += 1
             
             # ==========================================
             # PHASE 2: COMPUTE RETURNS AND ADVANTAGES

@@ -166,9 +166,11 @@ trainer:
   normalize_weights_every: 10
   
   # Batch training configuration
-  rollout_batch_size: 10      # Number of episodes to collect before updating
-  update_epochs: 4            # Number of update epochs per batch
-  minibatch_size: 64          # Size of minibatches during updates
+  rollout_collection_mode: "steps"  # "steps" or "episodes". "steps" is recommended for stable training.
+  rollout_steps: 2048               # Target number of steps to collect per batch (if mode is "steps")
+  rollout_batch_size: 10            # Number of episodes to collect per batch (if mode is "episodes")
+  update_epochs: 4                  # Number of update epochs per batch
+  minibatch_size: 64                # Size of minibatches during updates
   
   # Value clipping configuration
   enable_value_clipping: true # Enable PPO-style value clipping for stable training
