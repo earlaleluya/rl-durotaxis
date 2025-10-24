@@ -348,6 +348,9 @@ class DurotaxisTrainer:
         self.entropy_bonus_coeff = config.get('entropy_bonus_coeff', 0.05)  # Increased for stronger regularization
         self.moving_avg_window = config.get('moving_avg_window', 20)
         self.log_every = config.get('log_every', 50)
+        # Logging verbosity - read from top-level logging section
+        logging_cfg = self.config_loader.config.get('logging', {})
+        self.verbose = logging_cfg.get('verbose', True)
         self.progress_print_every = config.get('progress_print_every', 5)
         self.checkpoint_every = config.get('checkpoint_every', None)
         self.substrate_type = config.get('substrate_type', 'random')
@@ -391,6 +394,10 @@ class DurotaxisTrainer:
         # Load clip_epsilon from algorithm section
         algorithm_config = self.config_loader.get_algorithm_config()
         self.policy_loss_weights['clip_epsilon'] = algorithm_config.get('clip_epsilon', 0.2)
+        
+        # PPO KL divergence early stopping (prevents policy from moving too far)
+        self.target_kl = algorithm_config.get('target_kl', 0.03)  # Stop PPO epochs if KL > this
+        self.enable_kl_early_stop = algorithm_config.get('enable_kl_early_stop', True)
         
         # Adaptive weighting parameters
         self.weight_update_momentum = config.get('weight_momentum', 0.9)
@@ -2392,6 +2399,10 @@ class DurotaxisTrainer:
         
         # === DISCRETE POLICY LOSS ===
         discrete_loss_raw = torch.tensor(0.0, device=self.device)
+        approx_kl_discrete = torch.tensor(0.0, device=self.device)
+        ratio_discrete = torch.tensor(1.0, device=self.device)
+        clip_fraction_discrete = torch.tensor(0.0, device=self.device)
+        
         if ('discrete' in old_log_probs_dict and 
             'discrete_log_probs' in eval_output and 
             len(old_log_probs_dict['discrete']) > 0 and 
@@ -2403,6 +2414,9 @@ class DurotaxisTrainer:
             old_discrete_log_prob = old_log_probs_dict['discrete'].mean()
             new_discrete_log_prob = eval_output['discrete_log_probs'].mean()
             
+            # Approximate KL divergence: KL ≈ E[log π_old - log π_new] (device-agnostic)
+            approx_kl_discrete = (old_discrete_log_prob - new_discrete_log_prob).clamp_min(0.0)
+            
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_discrete_log_prob - old_discrete_log_prob, -20.0, 20.0)
             
@@ -2412,6 +2426,9 @@ class DurotaxisTrainer:
             # PPO clipping
             clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
             
+            # Clip fraction: fraction of ratios that were clipped (device-agnostic)
+            clip_fraction_discrete = ((ratio_discrete - clipped_ratio_discrete).abs() > 1e-6).float()
+            
             # PPO surrogate objective
             surr1 = ratio_discrete * advantage
             surr2 = clipped_ratio_discrete * advantage
@@ -2420,6 +2437,10 @@ class DurotaxisTrainer:
         
         # === CONTINUOUS POLICY LOSS ===
         continuous_loss_raw = torch.tensor(0.0, device=self.device)
+        approx_kl_continuous = torch.tensor(0.0, device=self.device)
+        ratio_continuous = torch.tensor(1.0, device=self.device)
+        clip_fraction_continuous = torch.tensor(0.0, device=self.device)
+        
         if ('continuous' in old_log_probs_dict and 
             'continuous_log_probs' in eval_output and 
             len(old_log_probs_dict['continuous']) > 0 and 
@@ -2431,6 +2452,9 @@ class DurotaxisTrainer:
             old_continuous_log_prob = old_log_probs_dict['continuous'].mean()
             new_continuous_log_prob = eval_output['continuous_log_probs'].mean()
             
+            # Approximate KL divergence: KL ≈ E[log π_old - log π_new] (device-agnostic)
+            approx_kl_continuous = (old_continuous_log_prob - new_continuous_log_prob).clamp_min(0.0)
+            
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_continuous_log_prob - old_continuous_log_prob, -20.0, 20.0)
             
@@ -2439,6 +2463,9 @@ class DurotaxisTrainer:
             
             # PPO clipping
             clipped_ratio_continuous = torch.clamp(ratio_continuous, 1 - clip_eps, 1 + clip_eps)
+            
+            # Clip fraction: fraction of ratios that were clipped (device-agnostic)
+            clip_fraction_continuous = ((ratio_continuous - clipped_ratio_continuous).abs() > 1e-6).float()
             
             # PPO surrogate objective
             surr1 = ratio_continuous * advantage
@@ -2482,7 +2509,14 @@ class DurotaxisTrainer:
             'continuous_weight_used': adaptive_continuous_weight,
             'discrete_grad_norm': getattr(self, 'discrete_grad_norm_ema', 0.0),
             'continuous_grad_norm': getattr(self, 'continuous_grad_norm_ema', 0.0),
-            'gradient_scaling_active': self.enable_gradient_scaling and self.gradient_step_count >= self.gradient_warmup_steps
+            'gradient_scaling_active': self.enable_gradient_scaling and self.gradient_step_count >= self.gradient_warmup_steps,
+            # PPO health metrics (device-agnostic)
+            'approx_kl_discrete': approx_kl_discrete,
+            'approx_kl_continuous': approx_kl_continuous,
+            'ratio_discrete': ratio_discrete,
+            'ratio_continuous': ratio_continuous,
+            'clip_fraction_discrete': clip_fraction_discrete,
+            'clip_fraction_continuous': clip_fraction_continuous,
         }
     
     def update_policy(self, states: List[Dict], actions: List[Dict], 
@@ -2864,6 +2898,22 @@ class DurotaxisTrainer:
             # Show weight usage
             losses['discrete_weight'] = hybrid_policy_losses[0]['discrete_weight_used']
             losses['continuous_weight'] = hybrid_policy_losses[0]['continuous_weight_used']
+            
+            # === AGGREGATE PPO HEALTH METRICS ===
+            # Average KL, ratios, and clip fractions across batch (device-agnostic)
+            avg_kl_discrete = torch.stack([h['approx_kl_discrete'] for h in hybrid_policy_losses]).mean()
+            avg_kl_continuous = torch.stack([h['approx_kl_continuous'] for h in hybrid_policy_losses]).mean()
+            avg_ratio_discrete = torch.stack([h['ratio_discrete'] for h in hybrid_policy_losses]).mean()
+            avg_ratio_continuous = torch.stack([h['ratio_continuous'] for h in hybrid_policy_losses]).mean()
+            avg_clip_frac_discrete = torch.stack([h['clip_fraction_discrete'] for h in hybrid_policy_losses]).mean()
+            avg_clip_frac_continuous = torch.stack([h['clip_fraction_continuous'] for h in hybrid_policy_losses]).mean()
+            
+            losses['approx_kl_discrete'] = avg_kl_discrete.item()
+            losses['approx_kl_continuous'] = avg_kl_continuous.item()
+            losses['ratio_discrete'] = avg_ratio_discrete.item()
+            losses['ratio_continuous'] = avg_ratio_continuous.item()
+            losses['clip_fraction_discrete'] = avg_clip_frac_discrete.item()
+            losses['clip_fraction_continuous'] = avg_clip_frac_continuous.item()
         else:
             avg_total_policy_loss = torch.tensor(0.0, device=self.device)
             avg_entropy_loss = torch.tensor(0.0, device=self.device)
@@ -2880,6 +2930,30 @@ class DurotaxisTrainer:
         losses['total_value_loss'] = total_value_loss.item()
         losses['value_clipping_enabled'] = self.enable_value_clipping
         losses['value_clip_epsilon'] = self.value_clip_epsilon
+        
+        # === EXPLAINED VARIANCE (PPO health metric) ===
+        # Measures how well the value function predicts returns (device-agnostic)
+        # 1.0 = perfect prediction, 0.0 = no better than mean, negative = worse than mean
+        try:
+            all_returns = []
+            all_values = []
+            for component in returns.keys():
+                if component in returns and component in old_values:
+                    all_returns.append(returns[component])
+                    all_values.append(old_values[component])
+            
+            if all_returns and all_values:
+                returns_tensor = torch.cat(all_returns)
+                values_tensor = torch.cat(all_values)
+                
+                # Compute explained variance on same device
+                var_returns = torch.var(returns_tensor)
+                explained_var = 1.0 - torch.var(returns_tensor - values_tensor) / (var_returns + 1e-8)
+                losses['explained_variance'] = explained_var.item()
+            else:
+                losses['explained_variance'] = 0.0
+        except Exception:
+            losses['explained_variance'] = 0.0
         
         # === ENTROPY BONUS FOR EXPLORATION ===
         # Encourage exploration to prevent premature convergence
@@ -3039,6 +3113,7 @@ class DurotaxisTrainer:
                 
                 # Perform multiple update epochs on the collected batch
                 total_losses = {}
+                early_stopped = False
                 
                 for epoch in range(self.update_epochs):
                     # Create random minibatches from buffer
@@ -3068,11 +3143,46 @@ class DurotaxisTrainer:
                         if loss_name not in total_losses:
                             total_losses[loss_name] = []
                         total_losses[loss_name].append(np.mean(loss_values))
+                    
+                    # === KL EARLY STOPPING ===
+                    # Check if policy has moved too far (prevents instability)
+                    if self.enable_kl_early_stop and epoch < self.update_epochs - 1:
+                        avg_kl_discrete = np.mean(epoch_losses.get('approx_kl_discrete', [0.0]))
+                        avg_kl_continuous = np.mean(epoch_losses.get('approx_kl_continuous', [0.0]))
+                        avg_kl_total = avg_kl_discrete + avg_kl_continuous
+                        
+                        if avg_kl_total > self.target_kl:
+                            if self.verbose:
+                                print(f"   ⚠️  Early stopping at epoch {epoch+1}/{self.update_epochs} (KL={avg_kl_total:.4f} > {self.target_kl:.4f})")
+                            early_stopped = True
+                            break
                 
                 # Average losses across all epochs
                 final_losses = {}
                 for loss_name, loss_values in total_losses.items():
                     final_losses[loss_name] = np.mean(loss_values)
+                
+                # === LOG PPO HEALTH METRICS ===
+                if self.verbose and final_losses:
+                    # Extract PPO health signals
+                    approx_kl = final_losses.get('approx_kl_discrete', 0.0) + final_losses.get('approx_kl_continuous', 0.0)
+                    clip_frac_discrete = final_losses.get('clip_fraction_discrete', 0.0)
+                    clip_frac_continuous = final_losses.get('clip_fraction_continuous', 0.0)
+                    ratio_discrete = final_losses.get('ratio_discrete', 1.0)
+                    ratio_continuous = final_losses.get('ratio_continuous', 1.0)
+                    value_loss = final_losses.get('total_value_loss', 0.0)
+                    policy_loss = final_losses.get('total_policy_loss', 0.0)
+                    entropy = final_losses.get('entropy_bonus', 0.0)
+                    explained_var = final_losses.get('explained_variance', 0.0)
+                    
+                    print(f"   📊 PPO Health Metrics:")
+                    print(f"      KL: {approx_kl:.4f} (target: {self.target_kl:.4f}) {'⚠️ HIGH' if approx_kl > self.target_kl else '✓'}")
+                    print(f"      Clip Frac: D={clip_frac_discrete:.3f} C={clip_frac_continuous:.3f}")
+                    print(f"      Ratio: D={ratio_discrete:.3f} C={ratio_continuous:.3f}")
+                    print(f"      Loss: Policy={policy_loss:.4f} Value={value_loss:.4f} Entropy={entropy:.4f}")
+                    print(f"      Explained Var: {explained_var:.3f} {'✓' if explained_var > 0.5 else '⚠️ LOW'}")
+                    if early_stopped:
+                        print(f"      ⚠️  Training stopped early due to high KL divergence")
                 
                 # Track losses
                 for loss_name, loss_value in final_losses.items():
