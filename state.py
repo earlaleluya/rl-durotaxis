@@ -265,6 +265,7 @@ class TopologyState:
             return torch.empty(0, 1, dtype=torch.float32, device=device)
         
         positions = self.graph.ndata['pos']
+        device = positions.device  # Get device from positions tensor
         
         # Simple centrality: inverse of average distance to all other nodes
         centralities = []
@@ -286,7 +287,7 @@ class TopologyState:
                 
                 centralities.append(centrality.item() if isinstance(centrality, torch.Tensor) else centrality)
         
-        return torch.tensor(centralities, dtype=torch.float32).unsqueeze(1)
+        return torch.tensor(centralities, dtype=torch.float32, device=device).unsqueeze(1)
 
     def _get_boundary_flags(self):
         """Get binary flags indicating if nodes are on the convex hull boundary."""

@@ -2386,6 +2386,10 @@ class DurotaxisTrainer:
         # Extract base weights and clipping
         clip_eps = self.policy_loss_weights['clip_epsilon']
         
+        # Convert advantage to tensor if it's a scalar, ensuring it can broadcast
+        if not isinstance(advantage, torch.Tensor):
+            advantage = torch.tensor(advantage, device=self.device)
+        
         # === DISCRETE POLICY LOSS ===
         discrete_loss_raw = torch.tensor(0.0, device=self.device)
         if ('discrete' in old_log_probs_dict and 
@@ -2393,18 +2397,26 @@ class DurotaxisTrainer:
             len(old_log_probs_dict['discrete']) > 0 and 
             len(eval_output['discrete_log_probs']) > 0):
             
-            # Compute ratio for discrete actions
-            old_discrete_log_prob = old_log_probs_dict['discrete'].sum()
-            new_discrete_log_prob = eval_output['discrete_log_probs'].sum()
+            # For hybrid action spaces with varying graph sizes, we need to aggregate first
+            # This is because the number of nodes (and thus log_probs) can change between
+            # action collection and re-evaluation. We use .mean() for numerical stability.
+            old_discrete_log_prob = old_log_probs_dict['discrete'].mean()
+            new_discrete_log_prob = eval_output['discrete_log_probs'].mean()
             
-            ratio_discrete = torch.exp(new_discrete_log_prob - old_discrete_log_prob)
+            # Clamp log prob difference to prevent exp overflow
+            log_prob_diff = torch.clamp(new_discrete_log_prob - old_discrete_log_prob, -20.0, 20.0)
+            
+            # Compute ratio
+            ratio_discrete = torch.exp(log_prob_diff)
+            
+            # PPO clipping
             clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO discrete policy loss (before scaling)
-            discrete_loss_raw = -torch.min(
-                ratio_discrete * advantage,
-                clipped_ratio_discrete * advantage
-            )
+            # PPO surrogate objective
+            surr1 = ratio_discrete * advantage
+            surr2 = clipped_ratio_discrete * advantage
+            
+            discrete_loss_raw = -torch.min(surr1, surr2)
         
         # === CONTINUOUS POLICY LOSS ===
         continuous_loss_raw = torch.tensor(0.0, device=self.device)
@@ -2413,18 +2425,26 @@ class DurotaxisTrainer:
             len(old_log_probs_dict['continuous']) > 0 and 
             len(eval_output['continuous_log_probs']) > 0):
             
-            # Compute ratio for continuous actions
-            old_continuous_log_prob = old_log_probs_dict['continuous'].sum()
-            new_continuous_log_prob = eval_output['continuous_log_probs'].sum()
+            # For hybrid action spaces with varying graph sizes, we need to aggregate first
+            # This is because the number of nodes (and thus log_probs) can change between
+            # action collection and re-evaluation. We use .mean() for numerical stability.
+            old_continuous_log_prob = old_log_probs_dict['continuous'].mean()
+            new_continuous_log_prob = eval_output['continuous_log_probs'].mean()
             
-            ratio_continuous = torch.exp(new_continuous_log_prob - old_continuous_log_prob)
+            # Clamp log prob difference to prevent exp overflow
+            log_prob_diff = torch.clamp(new_continuous_log_prob - old_continuous_log_prob, -20.0, 20.0)
+            
+            # Compute ratio
+            ratio_continuous = torch.exp(log_prob_diff)
+            
+            # PPO clipping
             clipped_ratio_continuous = torch.clamp(ratio_continuous, 1 - clip_eps, 1 + clip_eps)
             
-            # PPO continuous policy loss (before scaling)
-            continuous_loss_raw = -torch.min(
-                ratio_continuous * advantage,
-                clipped_ratio_continuous * advantage
-            )
+            # PPO surrogate objective
+            surr1 = ratio_continuous * advantage
+            surr2 = clipped_ratio_continuous * advantage
+            
+            continuous_loss_raw = -torch.min(surr1, surr2)
         
         # === ADAPTIVE GRADIENT SCALING ===
         # Compute adaptive weights based on gradient magnitudes
