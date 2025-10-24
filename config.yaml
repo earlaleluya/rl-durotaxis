@@ -46,9 +46,9 @@ trainer:
       
       # Stage 1: Emphasize survival and basic movement
       reward_multipliers:
-        survival_reward: 3.0          # 3x survival bonus (learn to stay alive)
-        movement_reward: 2.0          # 2x movement reward (learn direction)
-        centroid_movement_reward: 2.0 # 2x centroid reward (collective movement)
+        survival_reward: 2.0          # 2x survival bonus (important but not dominant)
+        movement_reward: 3.0          # 3x movement reward (PRIMARY GOAL: move right!)
+        centroid_movement_reward: 3.0 # 3x centroid reward (collective rightward movement!)
         boundary_penalty: 5.0         # 5x boundary penalty (avoid catastrophe)
         milestone_rewards: 2.0        # 2x milestone rewards (celebrate progress)
         
@@ -324,7 +324,7 @@ environment:
   # Reward structure - Graph rewards (OPTIMIZED for migration success)
   graph_rewards:
     connectivity_penalty: 5.0     # Moderate penalty for losing connectivity
-    growth_penalty: 5.0           # Moderate penalty for excessive growth
+    growth_penalty: 1.0           # FURTHER REDUCED: Allow more exploration through node spawning
     survival_reward: 0.1          # Reward for each step survived
     action_reward: 0.01           # Small reward for taking actions
     centroid_movement_reward: 2.0 # NEW: Strong reward for collective rightward movement
@@ -332,7 +332,7 @@ environment:
   # Reward structure - Node rewards (OPTIMIZED for migration)
   node_rewards:
     movement_reward: 2.0          # HUGE rightward movement incentive
-    leftward_penalty: 1.0         # NEW: Penalty for leftward movement
+    leftward_penalty: 2.0         # INCREASED: Symmetrical penalty for leftward movement
     intensity_penalty: 0.5        # REDUCED 75%: Very gentle for exploration
     intensity_bonus: 1.5          # INCREASED 15x: Strong bonus for good positions
     substrate_reward: 0.3         # Increased substrate interaction reward
