@@ -394,6 +394,11 @@ class DurotaxisEnv(gym.Env):
         self.topology_history = []
         self.dequeued_topology = None  # Store the most recently dequeued topology
         
+        # NEW: Advanced node feature tracking for intelligent deletion
+        self._node_age = {}  # Tracks age of each node by persistent_id
+        self._node_stagnation = {}  # Tracks stagnation counter for each node
+        self._stagnation_threshold = 5.0  # Distance threshold to be considered "stagnant"
+        
         # Node-level reward tracking
         self.prev_node_positions = []  # Store previous node positions for movement rewards
         self.last_reward_breakdown = None  # Store detailed reward information
@@ -866,7 +871,11 @@ class DurotaxisEnv(gym.Env):
         self.current_step += 1
         
         # Store previous state for reward calculation
-        prev_state = self.state_extractor.get_state_features(include_substrate=True)
+        prev_state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
         prev_num_nodes = prev_state['num_nodes']
         
         # Enqueue previous topology to history (maintain max capacity of delta_time)
@@ -904,7 +913,18 @@ class DurotaxisEnv(gym.Env):
                 executed_actions = {}
         
         # Get new state after actions
-        new_state = self.state_extractor.get_state_features(include_substrate=True)
+        new_state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
+
+        # NEW: Update and inject advanced node features (age, stagnation)
+        self._update_and_inject_node_features(new_state)
+
+        # NEW: Heuristically mark nodes for deletion based on lab rules
+        # This provides intelligent guidance to the agent about what to prune
+        self._heuristically_mark_nodes_for_deletion()
 
         # Attempt graceful recovery if topology collapsed to zero nodes AFTER actions
         empty_graph_recovered_post = False
@@ -1044,6 +1064,10 @@ class DurotaxisEnv(gym.Env):
         # === DELETE REWARD: Proper deletion compliance ===
         delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
         graph_reward += delete_reward
+        
+        # === DELETION EFFICIENCY REWARD: Tidiness bonus for smart pruning ===
+        efficiency_reward = self._calculate_deletion_efficiency_reward(prev_state, new_state)
+        graph_reward += efficiency_reward
         
         # === EDGE REWARD: Directional bias toward rightward movement ===
         edge_reward = self._calculate_edge_reward(prev_state, new_state, actions)
@@ -1215,6 +1239,7 @@ class DurotaxisEnv(gym.Env):
             'graph_reward': graph_reward,
             'spawn_reward': spawn_reward,
             'delete_reward': delete_reward,
+            'deletion_efficiency_reward': efficiency_reward if 'efficiency_reward' in locals() else 0.0,
             'edge_reward': edge_reward,
             'centroid_reward': centroid_reward if 'centroid_reward' in locals() else 0.0,
             'milestone_reward': milestone_reward,
@@ -1264,7 +1289,11 @@ class DurotaxisEnv(gym.Env):
         if hasattr(self, 'state_extractor'):
             self.state_extractor.set_topology(self.topology)
 
-        return self.state_extractor.get_state_features(include_substrate=True)
+        return self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
 
     def _reposition_recovered_nodes(self, prev_state):
         """Shift recovered nodes near the previous centroid to preserve spatial continuity."""
@@ -1559,6 +1588,63 @@ class DurotaxisEnv(gym.Env):
                     # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
         
         return delete_reward
+    
+    def _calculate_deletion_efficiency_reward(self, prev_state, new_state):
+        """
+        Reward the agent for deleting old, stagnant, or strategically unimportant nodes.
+        
+        This "tidiness" reward encourages the agent to prune its network efficiently,
+        particularly targeting nodes that are:
+        - Old (existed for many steps without contributing)
+        - Stagnant (not moving/exploring)
+        - On low-quality substrate (marked by the heuristic system)
+        
+        Args:
+            prev_state: Previous state dict
+            new_state: Current state dict
+            
+        Returns:
+            float: Efficiency reward for smart deletions
+        """
+        if prev_state['num_nodes'] == 0 or 'persistent_id' not in prev_state['topology'].graph.ndata:
+            return 0.0
+
+        efficiency_reward = 0.0
+        
+        prev_pids = set(prev_state['topology'].graph.ndata['persistent_id'].cpu().numpy())
+        current_pids = set(new_state['topology'].graph.ndata['persistent_id'].cpu().numpy()) if new_state['num_nodes'] > 0 else set()
+        
+        deleted_pids = prev_pids - current_pids
+
+        if not deleted_pids:
+            return 0.0
+
+        # Define reward multipliers (tuned for balanced learning)
+        AGE_REWARD_MULTIPLIER = 0.05      # Reward for deleting old nodes
+        STAGNATION_REWARD_MULTIPLIER = 0.1  # Reward for deleting stagnant nodes
+        
+        for pid in deleted_pids:
+            reward = 0.0
+            
+            # Reward for deleting old nodes (>50 steps old)
+            if pid in self._node_age and self._node_age[pid] > 50:
+                age_bonus = (self._node_age[pid] - 50) * AGE_REWARD_MULTIPLIER
+                reward += age_bonus
+
+            # Reward for deleting stagnant nodes (>20 steps without movement)
+            if pid in self._node_stagnation and self._node_stagnation[pid]['count'] > 20:
+                stagnation_bonus = (self._node_stagnation[pid]['count'] - 20) * STAGNATION_REWARD_MULTIPLIER
+                reward += stagnation_bonus
+            
+            if reward > 0:
+                # Optional: Debug logging (uncomment for debugging)
+                # print(f"🧹 Tidiness reward! Deleted node {pid} "
+                #       f"(Age: {self._node_age.get(pid, 0)}, "
+                #       f"Stagnant: {self._node_stagnation.get(pid, {}).get('count', 0)}). "
+                #       f"Reward: +{reward:.2f}")
+                efficiency_reward += reward
+                
+        return efficiency_reward
 
     def _calculate_edge_reward(self, prev_state, new_state, actions):
         """
@@ -1966,6 +2052,138 @@ class DurotaxisEnv(gym.Env):
         if self.last_reward_breakdown:
             return self.last_reward_breakdown.get('edge_reward', 0.0)
         return 0.0
+    
+    def _update_and_inject_node_features(self, state):
+        """
+        Update age and stagnation for each node.
+        
+        This tracking provides the environment with information needed to make
+        intelligent deletion decisions based on node lifetime and activity.
+        """
+        if state['num_nodes'] == 0:
+            self._node_age.clear()
+            self._node_stagnation.clear()
+            return
+
+        current_pids = set()
+        if 'persistent_id' in self.topology.graph.ndata:
+            pids = self.topology.graph.ndata['persistent_id'].cpu().numpy()
+            positions = self.topology.graph.ndata['pos'].cpu().numpy()
+
+            for i, pid in enumerate(pids):
+                current_pids.add(pid)
+                pos = positions[i]
+
+                # Update age
+                self._node_age[pid] = self._node_age.get(pid, 0) + 1
+
+                # Update stagnation
+                if pid in self._node_stagnation:
+                    prev_pos = self._node_stagnation[pid]['pos']
+                    distance = np.linalg.norm(pos - prev_pos)
+                    if distance < self._stagnation_threshold:
+                        self._node_stagnation[pid]['count'] += 1
+                    else:
+                        self._node_stagnation[pid] = {'pos': pos, 'count': 0}
+                else:
+                    self._node_stagnation[pid] = {'pos': pos, 'count': 0}
+        
+        # Clean up trackers for deleted nodes
+        deleted_pids = set(self._node_age.keys()) - current_pids
+        for pid in deleted_pids:
+            if pid in self._node_age:
+                del self._node_age[pid]
+            if pid in self._node_stagnation:
+                del self._node_stagnation[pid]
+    
+    def _heuristically_mark_nodes_for_deletion(self):
+        """
+        Mark nodes for deletion based on the two rules from physical experiments.
+        
+        Rule 1: Only apply deletion logic if num_nodes > max_critical_nodes
+        Rule 2: Mark the rightmost nodes whose intensity at t-delta_time was
+                below the current average intensity
+        
+        This implements the domain-specific deletion strategy observed in lab
+        experiments, where the organism prunes inefficient parts of its network.
+        """
+        # Rule 1: Only apply deletion logic if the number of nodes exceeds the critical threshold
+        if self.topology.graph.num_nodes() <= self.max_critical_nodes:
+            return
+
+        # Ensure we have a past topology to compare against
+        if self.dequeued_topology is None:
+            return
+        
+        # Check if dequeued topology has the required data
+        if not isinstance(self.dequeued_topology, dict):
+            return
+        
+        if 'persistent_id' not in self.dequeued_topology or 'node_features' not in self.dequeued_topology:
+            return
+
+        # Rule 2: Identify nodes whose intensity at t-delta_time was less than current average
+        
+        # Get current graph info
+        current_state = self.state_extractor.get_state_features(
+            include_substrate=False,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
+        if current_state['num_nodes'] == 0:
+            return
+            
+        current_intensities = current_state['node_features'][:, 2].cpu().numpy()
+        current_avg_intensity = np.mean(current_intensities)
+        
+        # Get previous graph info from the dequeued topology
+        prev_pids = self.dequeued_topology['persistent_id'].cpu().numpy()
+        prev_intensities = self.dequeued_topology['node_features'][:, 2].cpu().numpy()
+
+        # Find candidate nodes: those with previous intensity below current average
+        candidate_pids = []
+        for i, pid in enumerate(prev_pids):
+            if prev_intensities[i] < current_avg_intensity:
+                candidate_pids.append(pid)
+
+        if not candidate_pids:
+            return
+
+        # Find these candidates in the current graph and mark the rightmost ones
+        current_pids_list = current_state['persistent_id'].cpu().numpy().tolist()
+        nodes_to_mark = []
+        
+        for pid in candidate_pids:
+            try:
+                # Find the index of the candidate node in the current graph
+                current_idx = current_pids_list.index(pid)
+                pos_x = current_state['node_features'][current_idx, 0].item()
+                nodes_to_mark.append((current_idx, pos_x, pid))
+            except ValueError:
+                # Node no longer exists, skip
+                continue
+        
+        if not nodes_to_mark:
+            return
+
+        # Sort candidates by their x-position (rightmost first)
+        nodes_to_mark.sort(key=lambda x: x[1], reverse=True)
+        
+        # Mark the top N rightmost candidates for deletion
+        # Strategy: Mark 10-20% of excess nodes to encourage gradual, controlled pruning
+        excess_nodes = self.topology.graph.num_nodes() - self.max_critical_nodes
+        num_to_mark = max(1, min(int(excess_nodes * 0.15), len(nodes_to_mark)))
+        
+        nodes_marked_count = 0
+        for i in range(num_to_mark):
+            node_idx_to_mark, pos_x, pid = nodes_to_mark[i]
+            self._set_node_to_delete_flag(node_idx_to_mark, 1.0)
+            nodes_marked_count += 1
+        
+        # Optional: Debug logging (uncomment for debugging)
+        # if nodes_marked_count > 0:
+        #     print(f"🚩 Marked {nodes_marked_count} rightmost low-intensity nodes for deletion "
+        #           f"(excess: {excess_nodes}, total: {self.topology.graph.num_nodes()})")
 
     def apply_curriculum_config(self, curriculum_config: dict):
         """Apply curriculum learning configuration to the environment."""
@@ -2057,6 +2275,10 @@ class DurotaxisEnv(gym.Env):
         self.prev_node_positions = []
         self.last_reward_breakdown = None
         
+        # NEW: Reset advanced feature trackers
+        self._node_age.clear()
+        self._node_stagnation.clear()
+        
         # Reset milestone tracking for new episode
         self._milestones_reached = set()
 
@@ -2070,7 +2292,11 @@ class DurotaxisEnv(gym.Env):
         
         # Verify initial centroid is in safe center zone
         if self.init_num_nodes > 0:
-            initial_state = self.state_extractor.get_state_features(include_substrate=True)
+            initial_state = self.state_extractor.get_state_features(
+                include_substrate=True,
+                node_age=self._node_age,
+                node_stagnation=self._node_stagnation
+            )
             if initial_state['num_nodes'] > 0:
                 initial_centroid_y = initial_state['graph_features'][4].item()  # Centroid Y
                 substrate_height = self.substrate.height
@@ -2089,7 +2315,11 @@ class DurotaxisEnv(gym.Env):
         self._initialize_policy()
         
         # Get initial observation using state features
-        state = self.state_extractor.get_state_features(include_substrate=True)
+        state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
         
         # Get observation from GraphInputEncoder output
         observation = self._get_encoder_observation(state)
@@ -2107,7 +2337,11 @@ class DurotaxisEnv(gym.Env):
         """Render the current state of the environment using enable_visualization setting."""
         # Always show visualization if enabled, based on enable_visualization setting
         # This ensures visualization works consistently across different usage patterns
-        state = self.state_extractor.get_state_features(include_substrate=True)
+        state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
         
         # Debug: Track render calls
         # print(f"DEBUG: render() called - Episode {self.current_episode}, Step {self.current_step}")

@@ -57,7 +57,7 @@ class GraphInputEncoder(nn.Module):
     
     This encoder processes graph-structured data representing cellular topology with:
     - Graph-level features (14 dimensions): Global properties [num_nodes, num_edges, density, centroid_x, centroid_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y, bbow_width, bbox_height, bbox_area, hull_area, avg_degree]
-    - Node-level features (9 dimensions): Per-cell properties [node_x, node_y, substrate_intensity, in_degree, out_degree, centrality, centroid_distance, is_boundary, new_node_flag]  
+    - Node-level features (11 dimensions): Per-cell properties [node_x, node_y, substrate_intensity, in_degree, out_degree, centrality, centroid_distance, is_boundary, new_node_flag, age, stagnation]  
     - Edge-level features (3 dimensions): Connection properties [distances, direction_norm_x, direction_norm_y]
     
     Architecture:
@@ -76,7 +76,7 @@ class GraphInputEncoder(nn.Module):
         
     Input Shapes:
         graph_features: [14] - Global graph properties
-        node_features: [num_nodes, 9] - Per-node cell properties  
+        node_features: [num_nodes, 11] - Per-node cell properties  
         edge_features: [num_edges, 3] - Per-edge connection properties
         edge_index: [2, num_edges] - Graph connectivity in COO format
         batch: [num_nodes] (optional) - Batch assignment for multiple graphs
@@ -87,7 +87,7 @@ class GraphInputEncoder(nn.Module):
     Example:
         >>> encoder = GraphInputEncoder(hidden_dim=128, out_dim=64, num_layers=3)
         >>> graph_feat = torch.randn(14)
-        >>> node_feat = torch.randn(5, 9)  # 5 nodes, 9 features
+        >>> node_feat = torch.randn(5, 11)  # 5 nodes, 11 features
         >>> edge_feat = torch.randn(6, 3)  # 6 edges
         >>> edge_idx = torch.randint(0, 5, (2, 6))
         >>> out = encoder(graph_feat, node_feat, edge_feat, edge_idx)
@@ -130,7 +130,7 @@ class GraphInputEncoder(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim)
         )
         # Node projection
-        self.node_proj = nn.Linear(9, self.hidden_dim)
+        self.node_proj = nn.Linear(11, self.hidden_dim)
         # Edge projection
         self.edge_mlp = nn.Sequential(
             nn.Linear(3, self.hidden_dim),

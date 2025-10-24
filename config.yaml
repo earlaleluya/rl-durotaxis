@@ -263,11 +263,11 @@ trainer:
   entropy_regularization:
     enable_adaptive_entropy: true     # Enable adaptive entropy scheduling
     entropy_coeff_start: 0.8          # GREATLY INCREASED from 0.5 for maximum exploration
-    entropy_coeff_end: 0.05           # INCREASED from 0.02 to maintain exploration longer
-    entropy_decay_episodes: 180       # Increased for even slower decay
+    entropy_coeff_end: 0.15           # FURTHER INCREASED to maintain MORE exploration
+    entropy_decay_episodes: 500       # MUCH SLOWER decay (was 180) - explore for longer!
     discrete_entropy_weight: 3.0      # INCREASED from 2.0 for more discrete exploration
     continuous_entropy_weight: 2.0    # INCREASED from 1.5 for more continuous exploration
-    min_entropy_threshold: 0.2        # INCREASED from 0.1 to prevent early collapse
+    min_entropy_threshold: 0.3        # FURTHER INCREASED to prevent exploration collapse
 
 # ============================================================================
 # DurotaxisEnv Configuration
@@ -283,7 +283,7 @@ environment:
   # Node and topology parameters - RELAXED for learning
   init_num_nodes: 5              # Start with more nodes for stability
   max_critical_nodes: 75         # Allow more nodes
-  threshold_critical_nodes: 250  # Higher threshold before termination
+  threshold_critical_nodes: 500  # GREATLY INCREASED: Allow agent to explore without premature termination
   max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
@@ -326,16 +326,16 @@ environment:
   # Reward structure - Graph rewards (OPTIMIZED for migration success)
   graph_rewards:
     connectivity_penalty: 5.0     # Moderate penalty for losing connectivity
-    growth_penalty: 1.0           # FURTHER REDUCED: Allow more exploration through node spawning
+    growth_penalty: 3.0           # INCREASED: Penalize excessive node spawning more strongly
     survival_reward: 0.1          # Reward for each step survived
     action_reward: 0.01           # Small reward for taking actions
-    centroid_movement_reward: 2.0 # NEW: Strong reward for collective rightward movement
+    centroid_movement_reward: 5.0 # MASSIVELY INCREASED: Strongest possible incentive for rightward movement!
   
   # Reward structure - Node rewards (OPTIMIZED for migration)
   node_rewards:
-    movement_reward: 2.0          # HUGE rightward movement incentive
-    leftward_penalty: 2.0         # INCREASED: Symmetrical penalty for leftward movement
-    intensity_penalty: 0.5        # REDUCED 75%: Very gentle for exploration
+    movement_reward: 3.0          # FURTHER INCREASED: Maximum rightward movement incentive
+    leftward_penalty: 3.0         # FURTHER INCREASED: Strong deterrent for leftward movement
+    intensity_penalty: 0.3        # FURTHER REDUCED: Minimal penalty for exploration
     intensity_bonus: 1.5          # INCREASED 15x: Strong bonus for good positions
     substrate_reward: 0.3         # Increased substrate interaction reward
   
@@ -413,17 +413,17 @@ environment:
   # NEW: Progressive milestone rewards for reaching distance thresholds
   milestone_rewards:
     enabled: true
-    distance_25_percent: 25.0     # Reward for reaching 25% of substrate width
-    distance_50_percent: 50.0     # Reward for reaching 50% of substrate width
-    distance_75_percent: 100.0    # Reward for reaching 75% of substrate width
-    distance_90_percent: 200.0    # Huge reward for almost reaching goal
+    distance_25_percent: 50.0     # DOUBLED: Strong reward for 25% milestone
+    distance_50_percent: 150.0    # TRIPLED: Massive reward for 50% milestone
+    distance_75_percent: 300.0    # TRIPLED: Huge reward for 75% milestone
+    distance_90_percent: 500.0    # INCREASED: Enormous reward for almost reaching goal
   
   # NEW: Time-based survival rewards (encourage longevity)
   survival_reward_config:
     enabled: true
-    base_reward: 0.02            # Reward per step for staying alive
+    base_reward: 0.01            # REDUCED: Don't make survival too comfortable
     bonus_threshold: 100         # After 100 steps, give bonus
-    bonus_reward: 0.05           # Additional reward after threshold
+    bonus_reward: 0.02           # REDUCED: Additional reward after threshold
     max_step_factor: 0.8         # Scale rewards up to 80% of max_steps
 
 # ============================================================================
