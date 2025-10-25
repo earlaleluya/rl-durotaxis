@@ -77,8 +77,15 @@ class TopologyState:
         # Get edge connectivity for GNN
         src, dst = self.graph.edges()
         
-        # Get persistent IDs for node tracking
+        # Get persistent IDs for node tracking (clone to preserve state)
         persistent_ids = self.graph.ndata.get('persistent_id', None)
+        if persistent_ids is not None:
+            persistent_ids = persistent_ids.clone()
+        
+        # Get to_delete flags (clone to preserve state for reward calculation)
+        to_delete_flags = self.graph.ndata.get('to_delete', None)
+        if to_delete_flags is not None:
+            to_delete_flags = to_delete_flags.clone()
         
         state = {
             'topology': self.topology,                   
@@ -86,7 +93,8 @@ class TopologyState:
             'node_features': node_features,              # Shape: [num_nodes, node_feature_dim]
             'edge_attr': edge_features,                  # Shape: [num_edges, edge_feature_dim]
             'edge_index': (src, dst),                    # Edge connectivity
-            'persistent_id': persistent_ids,             # Node persistent IDs for tracking
+            'persistent_id': persistent_ids,             # Node persistent IDs for tracking (cloned)
+            'to_delete': to_delete_flags,                # to_delete flags for reward calculation (cloned)
             'num_nodes': self.graph.num_nodes(),
             'num_edges': self.graph.num_edges()
         }

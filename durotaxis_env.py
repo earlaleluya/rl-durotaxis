@@ -272,7 +272,8 @@ class DurotaxisEnv(gym.Env):
         
         self.delete_reward = config.get('delete_reward', {
             'proper_deletion': 2.0,
-            'persistence_penalty': 2.0
+            'persistence_penalty': 2.0,
+            'improper_deletion_penalty': 2.0
         })
         
         self.position_rewards = config.get('position_rewards', {
@@ -293,6 +294,7 @@ class DurotaxisEnv(gym.Env):
         # Unpack reward component values for direct access
         self.delete_proper_reward = self.delete_reward['proper_deletion']
         self.delete_persistence_penalty = self.delete_reward['persistence_penalty']
+        self.delete_improper_penalty = self.delete_reward.get('improper_deletion_penalty', 2.0)
         
         self.edge_rightward_bonus = self.edge_reward['rightward_bonus']
         self.edge_leftward_penalty = self.edge_reward['leftward_penalty']
@@ -1535,7 +1537,8 @@ class DurotaxisEnv(gym.Env):
         
         Logic:
         - If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
-        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward
+        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence)
+        - If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper)
         
         Args:
             prev_state: Previous state dict containing topology
@@ -1543,49 +1546,50 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken this step
             
         Returns:
-            float: Delete reward (positive for proper deletions, negative for persistence)
+            float: Delete reward (positive for proper deletions, negative for persistence/improper deletions)
         """
         delete_reward = 0.0
         
-        # Need previous topology to check to_delete flags
-        if 'topology' not in prev_state or prev_state['topology'] is None:
+        # Need previous state with persistent_id and to_delete data  
+        if 'persistent_id' not in prev_state or prev_state['persistent_id'] is None:
             return 0.0
-            
-        prev_topology = prev_state['topology']
         
-        # Check if previous topology had any nodes
-        if prev_topology.graph.num_nodes() == 0:
+        if 'to_delete' not in prev_state or prev_state['to_delete'] is None:
             return 0.0
             
-        # Check if previous topology had to_delete flags
-        if 'to_delete' not in prev_topology.graph.ndata:
+        if prev_state['num_nodes'] == 0:
             return 0.0
-            
-        # Get previous topology data
-        prev_to_delete_flags = prev_topology.graph.ndata['to_delete']
-        prev_persistent_ids = prev_topology.graph.ndata['persistent_id']
         
-        # Current topology data
-        current_topology = new_state['topology']
-        if current_topology.graph.num_nodes() > 0:
-            current_persistent_ids = current_topology.graph.ndata['persistent_id'].tolist()
+        # Use the cloned data from prev_state (captured at the time of state extraction)
+        prev_to_delete_flags = prev_state['to_delete']
+        prev_persistent_ids = prev_state['persistent_id']
+        
+        # Get current persistent IDs
+        if new_state['num_nodes'] > 0 and 'persistent_id' in new_state:
+            current_persistent_ids = set(new_state['persistent_id'].cpu().tolist())
         else:
-            current_persistent_ids = []
+            current_persistent_ids = set()
         
-        # Check each node from previous topology
+        # Check each node from previous state
         for i, to_delete_flag in enumerate(prev_to_delete_flags):
+            prev_persistent_id = prev_persistent_ids[i].item()
+            node_was_deleted = prev_persistent_id not in current_persistent_ids
+            
             if to_delete_flag.item() > 0.5:  # Node was marked for deletion
-                prev_persistent_id = prev_persistent_ids[i].item()
-                
-                # Check if this persistent ID still exists in current topology
-                if prev_persistent_id in current_persistent_ids:
-                    # Node was marked for deletion but still exists - penalty
-                    delete_reward -= self.delete_persistence_penalty
-                    # print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
-                else:
+                if node_was_deleted:
                     # Node was marked for deletion and was actually deleted - reward
                     delete_reward += self.delete_proper_reward
                     # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
+                else:
+                    # Node was marked for deletion but still exists - penalty
+                    delete_reward -= self.delete_persistence_penalty
+                    # print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
+            else:  # Node was NOT marked for deletion (to_delete=0)
+                if node_was_deleted:
+                    # Node was NOT marked but was deleted anyway - penalty
+                    delete_reward -= self.delete_improper_penalty
+                    # print(f"🔴 Improper delete penalty! Node PID:{prev_persistent_id} was deleted without marking (-{self.delete_improper_penalty})")
+                # else: node not marked and still exists - neutral (expected behavior)
         
         return delete_reward
     

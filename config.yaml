@@ -381,6 +381,7 @@ environment:
   delete_reward:
     proper_deletion: 2.0          # Reward for proper node deletion
     persistence_penalty: 2.0      # Penalty for inappropriate persistence
+    improper_deletion_penalty: 2.0  # Penalty for deleting nodes not marked for deletion
   
   # Reward structure - Position rewards (ENHANCED for boundary avoidance)
   position_rewards:
