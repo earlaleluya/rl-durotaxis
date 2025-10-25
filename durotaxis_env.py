@@ -889,10 +889,19 @@ class DurotaxisEnv(gym.Env):
         )
         prev_num_nodes = prev_state['num_nodes']
         
-        # Enqueue previous topology to history (maintain max capacity of delta_time)
-        self.topology_history.append(prev_state['topology'])
+        # Store a snapshot of topology for history tracking (not stored in state to avoid aliasing)
+        # We store just the persistent_ids and positions for history purposes
+        topology_snapshot = {
+            'persistent_ids': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0),
+            'num_nodes': prev_state['num_nodes'],
+            'num_edges': prev_state['num_edges'],
+            'centroid_x': prev_state['centroid_x']
+        }
+        
+        # Enqueue topology snapshot to history (maintain max capacity of delta_time)
+        self.topology_history.append(topology_snapshot)
         if len(self.topology_history) > self.delta_time:
-            # Dequeue the oldest topology to maintain capacity
+            # Dequeue the oldest snapshot to maintain capacity
             self.dequeued_topology = self.topology_history.pop(0)  # Remove from front (FIFO)
         
         # Check for empty graph BEFORE executing actions to prevent policy from seeing invalid state
@@ -1700,19 +1709,21 @@ class DurotaxisEnv(gym.Env):
         - On low-quality substrate (marked by the heuristic system)
         
         Args:
-            prev_state: Previous state dict
-            new_state: Current state dict
+            prev_state: Previous state dict (using snapshots)
+            new_state: Current state dict (using snapshots)
             
         Returns:
             float: Efficiency reward for smart deletions
         """
-        if prev_state['num_nodes'] == 0 or 'persistent_id' not in prev_state['topology'].graph.ndata:
+        # Use snapshot data instead of topology references
+        if prev_state['num_nodes'] == 0 or 'persistent_id' not in prev_state:
             return 0.0
 
         efficiency_reward = 0.0
         
-        prev_pids = set(prev_state['topology'].graph.ndata['persistent_id'].cpu().numpy())
-        current_pids = set(new_state['topology'].graph.ndata['persistent_id'].cpu().numpy()) if new_state['num_nodes'] > 0 else set()
+        # Get persistent IDs from snapshots
+        prev_pids = set(prev_state['persistent_id'].cpu().tolist())
+        current_pids = set(new_state['persistent_id'].cpu().tolist()) if new_state['num_nodes'] > 0 else set()
         
         deleted_pids = prev_pids - current_pids
 

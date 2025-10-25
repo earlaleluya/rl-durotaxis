@@ -88,9 +88,9 @@ def test_delete_rewards():
         include_substrate=True, node_age=env._node_age, node_stagnation=env._node_stagnation
     )
     
-    # Manually calculate reward using our snapshots
+    # Manually calculate reward using our snapshots (use snapshot data, not topology)
     delete_reward_manual = 0.0
-    current_pids = new_state['topology'].graph.ndata['persistent_id'].tolist()
+    current_pids = set(new_state['persistent_id'].cpu().tolist())  # Use snapshot
     for i, flag in enumerate(prev_topo_snapshot['to_delete']):
         pid = prev_topo_snapshot['persistent_id'][i].item()
         was_deleted = pid not in current_pids
@@ -105,10 +105,6 @@ def test_delete_rewards():
     
     print(f"Result (manual calculation): {delete_reward_manual:+.1f}")
     print(f"✓ PASS" if abs(delete_reward_manual - proper_reward) < 0.01 else f"✗ FAIL (expected {proper_reward:+.1f})")
-    
-    # Note: The actual _calculate_delete_reward won't work correctly in this test
-    # because both prev_state and new_state reference the same (modified) topology
-    # In real training, the issue doesn't occur because to_delete flags are managed differently
     
     # Reset
     env.reset()

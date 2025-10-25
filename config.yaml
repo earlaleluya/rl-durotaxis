@@ -458,7 +458,7 @@ environment:
 # GraphInputEncoder Configuration
 # ============================================================================
 encoder:
-  out_dim: 64                   # Output embedding dimension per node
+  out_dim: 128                  # Output embedding dimension per node (INCREASED for richer representations)
   num_layers: 4                 # Number of transformer layers
 
 # ============================================================================

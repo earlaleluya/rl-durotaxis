@@ -20,6 +20,11 @@ class TopologyState:
             The topology instance containing the graph and substrate
         """
         self.topology = topology
+        
+        # Track previous state for delta features
+        self._prev_centroid_x = None
+        self._prev_num_nodes = None
+        self._prev_avg_intensity = None
     
     def set_topology(self, topology):
         """Set or update the topology instance."""
@@ -42,7 +47,8 @@ class TopologyState:
 
     def get_state_features(self, include_substrate=True, node_age=None, node_stagnation=None):
         """
-        Get topology state features: graph features, node features, and edge features.
+        Get IMMUTABLE snapshot of topology state features.
+        All tensors are cloned/detached and moved to consistent device to prevent aliasing.
         
         Parameters
         ----------
@@ -55,17 +61,25 @@ class TopologyState:
             
         Returns
         -------
-        dict : State dictionary containing:
-            - 'graph_features': Graph-level feature vector
-            - 'node_features': Node feature matrix [num_nodes, node_feature_dim]
-            - 'edge_attr': Edge feature matrix [num_edges, edge_feature_dim]
-            - 'edge_index': Edge connectivity (src, dst) tuples for GNN
-            - 'num_nodes': Number of nodes
-            - 'num_edges': Number of edges
-            - 'persistent_id': Node persistent IDs for tracking
+        dict : Immutable state dictionary containing:
+            - 'graph_features': Graph-level feature vector [G] (cloned)
+            - 'node_features': Node feature matrix [N, F] (cloned)
+            - 'edge_attr': Edge feature matrix [E, F] (cloned)
+            - 'edge_index': Edge connectivity (src, dst) tuples (cloned)
+            - 'persistent_id': Node persistent IDs [N] (cloned)
+            - 'to_delete': Node deletion flags [N] (cloned)
+            - 'num_nodes': Number of nodes (int)
+            - 'num_edges': Number of edges (int)
+            - 'centroid_x': Graph centroid x-coordinate (float)
+            - 'goal_x': Goal x-position (float)
+            
+        Note: 'topology' reference is NOT included to prevent aliasing.
         """
         
-        # Extract the three main feature types
+        # Determine device from graph data (all tensors will use this device)
+        device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+        
+        # Extract features (these return tensors on the graph's device)
         node_features = self._get_node_features(
             include_substrate=include_substrate,
             node_age=node_age,
@@ -77,26 +91,68 @@ class TopologyState:
         # Get edge connectivity for GNN
         src, dst = self.graph.edges()
         
-        # Get persistent IDs for node tracking (clone to preserve state)
+        # Get persistent IDs - CLONE to create immutable snapshot
         persistent_ids = self.graph.ndata.get('persistent_id', None)
         if persistent_ids is not None:
-            persistent_ids = persistent_ids.clone()
+            persistent_ids = persistent_ids.clone().detach().to(device)
+        else:
+            persistent_ids = torch.empty(0, dtype=torch.long, device=device)
         
-        # Get to_delete flags (clone to preserve state for reward calculation)
+        # Get to_delete flags - CLONE to create immutable snapshot
         to_delete_flags = self.graph.ndata.get('to_delete', None)
         if to_delete_flags is not None:
-            to_delete_flags = to_delete_flags.clone()
+            to_delete_flags = to_delete_flags.clone().detach().to(device)
+        else:
+            to_delete_flags = torch.zeros(self.graph.num_nodes(), dtype=torch.float32, device=device)
         
+        # Calculate centroid x-coordinate for distance-based rewards
+        centroid_x = 0.0
+        avg_intensity = 0.0
+        if self.graph.num_nodes() > 0:
+            positions = self.graph.ndata['pos']
+            centroid_x = float(torch.mean(positions[:, 0]).item())
+            
+            # Calculate average substrate intensity if available
+            if 'substrate_intensity' in self.graph.ndata:
+                avg_intensity = float(torch.mean(self.graph.ndata['substrate_intensity']).item())
+        
+        # Calculate delta features (change from previous state)
+        delta_centroid_x = 0.0
+        delta_num_nodes = 0
+        delta_avg_intensity = 0.0
+        
+        if self._prev_centroid_x is not None:
+            delta_centroid_x = centroid_x - self._prev_centroid_x
+        if self._prev_num_nodes is not None:
+            delta_num_nodes = self.graph.num_nodes() - self._prev_num_nodes
+        if self._prev_avg_intensity is not None:
+            delta_avg_intensity = avg_intensity - self._prev_avg_intensity
+        
+        # Update previous values for next iteration
+        self._prev_centroid_x = centroid_x
+        self._prev_num_nodes = self.graph.num_nodes()
+        self._prev_avg_intensity = avg_intensity
+        
+        # Calculate goal x-position (rightmost substrate boundary)
+        goal_x = float(self.substrate.width - 1) if self.substrate is not None else 1.0
+        
+        # Build immutable state dict with ALL tensors cloned/detached/device-consistent
+        # DO NOT include 'topology' to prevent aliasing
         state = {
-            'topology': self.topology,                   
-            'graph_features': graph_features,            # Shape: [graph_feature_dim]
-            'node_features': node_features,              # Shape: [num_nodes, node_feature_dim]
-            'edge_attr': edge_features,                  # Shape: [num_edges, edge_feature_dim]
-            'edge_index': (src, dst),                    # Edge connectivity
-            'persistent_id': persistent_ids,             # Node persistent IDs for tracking (cloned)
-            'to_delete': to_delete_flags,                # to_delete flags for reward calculation (cloned)
-            'num_nodes': self.graph.num_nodes(),
-            'num_edges': self.graph.num_edges()
+            'graph_features': graph_features.clone().detach().to(device),  # [G]
+            'node_features': node_features.clone().detach().to(device),    # [N, F]
+            'edge_attr': edge_features.clone().detach().to(device),        # [E, F]
+            'edge_index': (src.clone().detach().to(device), dst.clone().detach().to(device)),  # Cloned tuple
+            'persistent_id': persistent_ids,                                # [N] (already cloned above)
+            'to_delete': to_delete_flags,                                   # [N] (already cloned above)
+            'num_nodes': int(self.graph.num_nodes()),
+            'num_edges': int(self.graph.num_edges()),
+            'centroid_x': centroid_x,
+            'goal_x': goal_x,
+            # Delta features for temporal context (reduces partial observability)
+            'delta_centroid_x': delta_centroid_x,
+            'delta_num_nodes': delta_num_nodes,
+            'delta_avg_intensity': delta_avg_intensity
         }
         
         return state
@@ -216,7 +272,7 @@ class TopologyState:
 
     def _get_graph_features(self):
         """
-        Extract graph-level features.
+        Extract graph-level features with RICHER pooling for better representation.
         
         Returns
         -------
@@ -225,6 +281,7 @@ class TopologyState:
             - Basic statistics: num_nodes, num_edges, density
             - Spatial statistics: centroid, bounding box, convex hull area
             - Topological statistics: average degree
+            - ENHANCED: mean/max/sum pooling of node features for richer context
         """
         positions = self.graph.ndata['pos']
         
@@ -250,12 +307,18 @@ class TopologyState:
             bbox_size = bbox_max - bbox_min  # [2]
             bbox_area = torch.prod(bbox_size) if len(bbox_size) > 1 else bbox_size[0]  # scalar
             bbox_area = bbox_area.unsqueeze(0) if bbox_area.dim() == 0 else bbox_area  # [1]
+            
+            # ENHANCED: Add max pooling of positions for better shape representation
+            pos_max = torch.max(positions, dim=0)[0]  # [2] - rightmost and highest positions
+            pos_min = torch.min(positions, dim=0)[0]  # [2] - leftmost and lowest positions
         else:
             centroid = torch.zeros(2, device=device)
             bbox_min = torch.zeros(2, device=device)
             bbox_max = torch.zeros(2, device=device)
             bbox_size = torch.zeros(2, device=device)
             bbox_area = torch.zeros(1, device=device)
+            pos_max = torch.zeros(2, device=device)
+            pos_min = torch.zeros(2, device=device)
         
         # Add spatial features
         features.append(centroid)     # [2]
@@ -280,10 +343,31 @@ class TopologyState:
         if num_nodes > 0:
             degrees = self._get_node_degrees()
             avg_degree = torch.mean(degrees).unsqueeze(0)  # [1]
+            max_degree = torch.max(degrees).unsqueeze(0)  # [1] - ENHANCED
+            sum_degree = torch.sum(degrees).unsqueeze(0)  # [1] - ENHANCED
         else:
             avg_degree = torch.tensor([0.0], device=device)  # [1]
+            max_degree = torch.tensor([0.0], device=device)  # [1]
+            sum_degree = torch.tensor([0.0], device=device)  # [1]
         
         features.append(avg_degree)
+        features.append(max_degree)  # NEW
+        features.append(sum_degree)  # NEW
+        
+        # 5. ENHANCED: Substrate intensity statistics (mean/max/sum pooling)
+        if num_nodes > 0 and 'substrate_intensity' in self.graph.ndata:
+            intensities = self.graph.ndata['substrate_intensity'].unsqueeze(1) if self.graph.ndata['substrate_intensity'].dim() == 1 else self.graph.ndata['substrate_intensity']
+            mean_intensity = torch.mean(intensities).unsqueeze(0)  # [1]
+            max_intensity = torch.max(intensities).unsqueeze(0)   # [1]
+            sum_intensity = torch.sum(intensities).unsqueeze(0)   # [1]
+        else:
+            mean_intensity = torch.tensor([0.0], device=device)
+            max_intensity = torch.tensor([0.0], device=device)
+            sum_intensity = torch.tensor([0.0], device=device)
+        
+        features.append(mean_intensity)  # NEW
+        features.append(max_intensity)   # NEW
+        features.append(sum_intensity)   # NEW
         
         return torch.cat(features, dim=0)
 
