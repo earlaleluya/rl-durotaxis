@@ -285,7 +285,20 @@ environment:
   #                                   out_of_bounds_penalty, leftward_drift_penalty, timeout_penalty
   # NO positive rewards for spawning/movement/milestones (proper deletions give 0 instead of positive reward).
   # Use this to test if the agent can learn node management purely from penalties and outcome feedback.
-  simple_delete_only_mode: true  # Set to true to enable simplified reward system
+  simple_delete_only_mode: false  # Set to true to enable simplified reward system
+  
+  # ============================================================================
+  # EXPERIMENTAL: Centroid-to-Goal Distance Penalty Mode
+  # ============================================================================
+  # When enabled, this mode provides ONLY a distance-based penalty from centroid to goal:
+  # The agent receives ONLY:
+  #   - Distance penalty = -(goal_x - centroid_x) / goal_x
+  #   - Example: If centroid_x=6 and goal_x=100, penalty = -(100-6)/100 = -0.94
+  #   - As centroid approaches goal, penalty approaches 0
+  #   - At goal (centroid_x = goal_x), penalty = 0
+  # ALL other rewards/penalties are disabled (movement, spawn, delete, milestones, termination, etc.)
+  # Use this to test if the agent can learn pure goal-seeking behavior from distance feedback alone.
+  centroid_distance_only_mode: true  # Set to true to enable centroid distance penalty mode
   
   # Basic environment parameters - EXPANDED for successful migration
   substrate_size: [600, 400]  # Much larger substrate (3x width)

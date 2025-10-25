@@ -248,6 +248,9 @@ class DurotaxisEnv(gym.Env):
         # Simple delete-only mode flag
         self.simple_delete_only_mode = config.get('simple_delete_only_mode', False)
         
+        # Centroid-to-goal distance-only mode flag
+        self.centroid_distance_only_mode = config.get('centroid_distance_only_mode', False)
+        
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
             'connectivity_penalty': 10.0,
@@ -442,6 +445,9 @@ class DurotaxisEnv(gym.Env):
         
         # 3. Initialize environment components
         self._setup_environment()
+        
+        # Goal X position (rightmost substrate boundary) - set after substrate is created
+        self.goal_x = self.substrate.width - 1
         
         # 4. Rendering setup complete
         
@@ -952,7 +958,9 @@ class DurotaxisEnv(gym.Env):
         if empty_graph_recovered:
             recovery_penalty = self.empty_graph_recovery_penalty
             reward_components['empty_graph_recovery_penalty'] = recovery_penalty
-            reward_components['total_reward'] += recovery_penalty
+            # Don't add recovery penalty in centroid distance mode (only distance matters)
+            if not self.centroid_distance_only_mode:
+                reward_components['total_reward'] += recovery_penalty
         
         # Reset new_node flags after reward calculation (they've served their purpose)
         self._reset_new_node_flags()
@@ -971,6 +979,11 @@ class DurotaxisEnv(gym.Env):
                 reward_components['total_reward'] = (
                     reward_components.get('graph_reward', 0.0) + termination_reward
                 )
+            # In centroid_distance_only_mode, ignore termination rewards
+            elif self.centroid_distance_only_mode:
+                # Keep only the distance penalty, ignore termination rewards
+                # This ensures pure distance-based learning without outcome bias
+                pass  # total_reward already set to distance_penalty only
             else:
                 # Normal mode: add termination reward to existing total
                 reward_components['total_reward'] += termination_reward
@@ -1266,6 +1279,49 @@ class DurotaxisEnv(gym.Env):
             
             # Zero out all other components
             spawn_reward = 0.0
+            efficiency_reward = 0.0
+            edge_reward = 0.0
+            centroid_reward = 0.0
+            milestone_reward = 0.0
+            total_node_reward = 0.0
+            survival_reward = 0.0
+        
+        # === CENTROID-TO-GOAL DISTANCE-ONLY MODE ===
+        # When enabled, provide ONLY distance-based penalty from centroid to goal
+        elif self.centroid_distance_only_mode:
+            # Calculate centroid x position
+            centroid_x = 0.0
+            if num_nodes > 0:
+                try:
+                    graph_features = new_state.get('graph_features')
+                    if graph_features is not None:
+                        if isinstance(graph_features, torch.Tensor):
+                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                        else:
+                            centroid_x = graph_features[3]
+                except (IndexError, TypeError) as e:
+                    # Fallback: calculate centroid from node positions
+                    node_features = new_state.get('node_features', [])
+                    if len(node_features) > 0:
+                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                     for node in node_features]
+                        centroid_x = sum(x_positions) / len(x_positions)
+            
+            # Calculate distance penalty: -(goal_x - centroid_x) / goal_x
+            # As centroid approaches goal, penalty approaches 0
+            # If centroid is at or past goal, penalty is 0 or positive (reward)
+            if self.goal_x > 0:
+                distance_penalty = -(self.goal_x - centroid_x) / self.goal_x
+            else:
+                distance_penalty = 0.0
+            
+            # Set total reward to distance penalty only
+            total_reward = distance_penalty
+            graph_reward = distance_penalty
+            
+            # Zero out all other components
+            spawn_reward = 0.0
+            delete_reward = 0.0
             efficiency_reward = 0.0
             edge_reward = 0.0
             centroid_reward = 0.0
