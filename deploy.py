@@ -189,10 +189,20 @@ class DurotaxisDeployment:
             print(f"   Initial nodes: {env.topology.graph.num_nodes()}")
         
         while not done and step_count < max_steps:
-            # Get current state
-            state_dict = self.state_extractor.get_state_features(include_substrate=True)
-            state_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                         for k, v in state_dict.items()}
+            # Get current state with age/stagnation tracking from environment
+            state_dict = self.state_extractor.get_state_features(
+                include_substrate=True,
+                node_age=env._node_age,
+                node_stagnation=env._node_stagnation
+            )
+            
+            # Move tensors to device (handle edge_index tuple specially)
+            for k, v in state_dict.items():
+                if isinstance(v, torch.Tensor):
+                    state_dict[k] = v.to(self.device)
+                elif k == 'edge_index' and isinstance(v, tuple):
+                    # edge_index is a tuple of (src, dst) tensors
+                    state_dict[k] = tuple(t.to(self.device) for t in v)
             
             # Check for empty graph
             if state_dict['num_nodes'] == 0:
