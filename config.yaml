@@ -11,7 +11,7 @@ trainer:
   # automatically scale curriculum stage durations to this value. If you change
   # this number (for example to 10000), the curriculum stages will be resized
   # proportionally so the curriculum covers the full training run.
-  total_episodes: 1000
+  total_episodes: 10000
   max_steps: 1000
   learning_rate: 0.0002   
   save_dir: "./training_results"
@@ -30,7 +30,7 @@ trainer:
   # This curriculum works WITH the new reward structure to progressively
   # guide the agent from basic survival to successful rightmost migration
   curriculum_learning:
-    enable_curriculum: true           # Enable progressive learning stages
+    enable_curriculum: false           # Enable progressive learning stages
     
     # Stage 1: Survival & Basic Movement (Episodes 0-200)
     # GOAL: Learn to stay alive and move rightward without catastrophic failures
