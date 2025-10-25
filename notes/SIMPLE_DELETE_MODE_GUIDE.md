@@ -16,7 +16,8 @@ The standard reward system includes multiple components:
 
 This can be complex for initial experiments. The **simple delete-only mode** strips away all of this complexity and provides:
 
-**ONLY TWO PENALTIES:**
+**ONLY THREE PENALTIES:**
+0. **Rule 0 (Growth Penalty)**: When `num_nodes > max_critical_nodes`
 1. **Rule 1 (Persistence Penalty)**: When a node marked `to_delete=1` still exists in the next state
 2. **Rule 2 (Improper Deletion Penalty)**: When a node NOT marked `to_delete=0` is deleted anyway
 
@@ -46,7 +47,7 @@ environment:
 ### When `simple_delete_only_mode: true`
 
 1. **All reward components are zeroed out:**
-   - `graph_reward = 0.0` (except delete penalty)
+   - `graph_reward = 0.0` (except growth penalty and delete penalties)
    - `spawn_reward = 0.0`
    - `edge_reward = 0.0`
    - `centroid_reward = 0.0`
@@ -54,12 +55,13 @@ environment:
    - `survival_reward = 0.0`
    - `total_node_reward = 0.0`
 
-2. **Only delete penalties are computed:**
-   - If a node marked for deletion persists: `-persistence_penalty`
-   - If an unmarked node is deleted: `-improper_deletion_penalty`
+2. **Only three penalties are computed:**
+   - **Rule 0**: If `num_nodes > max_critical_nodes`: `-growth_penalty * (1 + excess_nodes / max_critical_nodes)`
+   - **Rule 1**: If a node marked for deletion persists: `-persistence_penalty`
+   - **Rule 2**: If an unmarked node is deleted: `-improper_deletion_penalty`
    - If a marked node is properly deleted: `0.0` (no reward!)
 
-3. **Total reward = delete penalties only**
+3. **Total reward = growth_penalty + delete_penalties**
 
 ### Penalty Values
 
@@ -67,6 +69,11 @@ Configure in `config.yaml`:
 
 ```yaml
 environment:
+  max_critical_nodes: 75              # Rule 0 threshold
+  
+  graph_rewards:
+    growth_penalty: 3.0               # Rule 0 penalty (scaled by excess)
+  
   delete_reward:
     proper_deletion: 2.0              # NOT used in simple mode
     persistence_penalty: 2.0          # RULE 1 penalty
@@ -74,19 +81,25 @@ environment:
 ```
 
 In simple mode:
+- `growth_penalty` penalizes spawning too many nodes (Rule 0)
 - `proper_deletion` is ignored (no positive rewards)
-- `persistence_penalty` penalizes keeping marked nodes
-- `improper_deletion_penalty` penalizes deleting unmarked nodes
+- `persistence_penalty` penalizes keeping marked nodes (Rule 1)
+- `improper_deletion_penalty` penalizes deleting unmarked nodes (Rule 2)
 
 ## Expected Agent Behavior
 
 With only penalties and no positive rewards, the agent should learn to:
 
-1. **Avoid deleting nodes unnecessarily** (to avoid improper deletion penalty)
-2. **Delete nodes when marked** (to avoid persistence penalty)
-3. **Conservative deletion strategy** (bias toward keeping nodes to minimize penalties)
+1. **Avoid spawning too many nodes** (to avoid growth penalty - Rule 0)
+2. **Avoid deleting nodes unnecessarily** (to avoid improper deletion penalty - Rule 2)
+3. **Delete nodes when marked** (to avoid persistence penalty - Rule 1)
+4. **Conservative deletion strategy** (bias toward keeping nodes to minimize penalties)
+5. **Controlled spawning strategy** (balance between having enough nodes and staying under limit)
 
-The hypothesis is that the agent will develop a cautious deletion policy, only acting when it's confident the node should be removed.
+The hypothesis is that the agent will develop a cautious policy that:
+- Carefully manages node count to stay below `max_critical_nodes`
+- Only deletes nodes when they're marked with high confidence
+- Learns the relationship between spawning and the need to delete marked nodes
 
 ## Use Cases
 
@@ -172,7 +185,7 @@ environment:
 
 All reward components will be restored to their standard behavior.
 
-## Implementation Details
+### Implementation Details
 
 ### Code Changes
 
@@ -184,9 +197,17 @@ All reward components will be restored to their standard behavior.
 2. **Reward Calculation** (`durotaxis_env.py` line ~1240):
    ```python
    if self.simple_delete_only_mode:
-       # Zero out everything except delete penalties
+       # Rule 0: Growth penalty
+       growth_penalty_only = 0.0
+       if num_nodes > self.max_critical_nodes:
+           excess_nodes = num_nodes - self.max_critical_nodes
+           growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
+       
+       # Rules 1 & 2: Delete penalties
        delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
-       total_reward = delete_penalty_only
+       
+       # Combine all penalties
+       total_reward = growth_penalty_only + delete_penalty_only
        # ... zero out all other components
    ```
 

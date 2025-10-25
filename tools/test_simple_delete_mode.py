@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Test the simple_delete_only_mode flag to ensure:
+0. Growth penalty is applied when num_nodes > max_critical_nodes (Rule 0)
 1. Only delete penalties are computed (Rule 1 & 2)
 2. All other rewards are zeroed out
 3. No positive rewards are given (proper deletions give 0)
@@ -254,6 +255,112 @@ def test_simple_delete_mode():
         print("✓ Total reward equals improper deletion penalty")
     else:
         print(f"✗ Total reward does NOT equal improper deletion penalty")
+    
+    # Test 5: Growth penalty (Rule 0)
+    print("\n" + "-" * 80)
+    print("TEST 5: Growth Penalty (Rule 0 - simple mode)")
+    print("-" * 80)
+    
+    env5 = DurotaxisEnv(config_path="config.yaml", substrate_type='linear', simple_delete_only_mode=True)
+    env5.reset()
+    
+    state_extractor5 = TopologyState(env5.topology)
+    
+    # Spawn many nodes to exceed max_critical_nodes
+    max_critical = env5.max_critical_nodes
+    print(f"Max critical nodes: {max_critical}")
+    
+    # Spawn nodes until we exceed the limit
+    while env5.topology.graph.num_nodes() <= max_critical:
+        env5.topology.spawn(0, gamma=5.0, alpha=0.0, noise=0.0, theta=0.0)
+    
+    print(f"Current nodes: {env5.topology.graph.num_nodes()}")
+    
+    prev_state5 = state_extractor5.get_state_features(
+        include_substrate=True, node_age=env5._node_age, node_stagnation=env5._node_stagnation
+    )
+    
+    # Don't delete anything, just check growth penalty
+    new_state5 = state_extractor5.get_state_features(
+        include_substrate=True, node_age=env5._node_age, node_stagnation=env5._node_stagnation
+    )
+    
+    # Calculate rewards
+    reward_breakdown5 = env5._calculate_reward(prev_state5, new_state5, [])
+    
+    # Calculate expected growth penalty
+    num_nodes = env5.topology.graph.num_nodes()
+    excess_nodes = num_nodes - max_critical
+    expected_growth_penalty = -env5.growth_penalty * (1 + excess_nodes / max_critical)
+    
+    print(f"Growth penalty (Rule 0):")
+    print(f"  Num nodes: {num_nodes}")
+    print(f"  Max critical: {max_critical}")
+    print(f"  Excess nodes: {excess_nodes}")
+    print(f"  Expected growth penalty: {expected_growth_penalty:.4f}")
+    print(f"  Total Reward: {reward_breakdown5['total_reward']:.4f}")
+    print(f"  Graph Reward: {reward_breakdown5['graph_reward']:.4f}")
+    
+    if abs(reward_breakdown5['total_reward'] - expected_growth_penalty) < 0.01:
+        print("✓ Growth penalty matches expected (Rule 0)")
+    else:
+        print(f"✗ Growth penalty does NOT match")
+        print(f"  Expected: {expected_growth_penalty:.4f}")
+        print(f"  Actual: {reward_breakdown5['total_reward']:.4f}")
+    
+    # Test 6: Combined penalties (Rule 0 + Rule 1 + Rule 2)
+    print("\n" + "-" * 80)
+    print("TEST 6: Combined Penalties (Rules 0 + 1 + 2)")
+    print("-" * 80)
+    
+    env6 = DurotaxisEnv(config_path="config.yaml", substrate_type='linear', simple_delete_only_mode=True)
+    env6.reset()
+    
+    state_extractor6 = TopologyState(env6.topology)
+    
+    # Spawn enough nodes to exceed max_critical_nodes
+    max_critical6 = env6.max_critical_nodes
+    while env6.topology.graph.num_nodes() <= max_critical6 + 2:
+        env6.topology.spawn(0, gamma=5.0, alpha=0.0, noise=0.0, theta=0.0)
+    
+    # Mark node 0 for deletion but don't delete (Rule 1)
+    env6.topology.graph.ndata['to_delete'][0] = 1.0
+    # Don't mark node 1 but we'll delete it (Rule 2)
+    env6.topology.graph.ndata['to_delete'][1] = 0.0
+    
+    prev_state6 = state_extractor6.get_state_features(
+        include_substrate=True, node_age=env6._node_age, node_stagnation=env6._node_stagnation
+    )
+    
+    # Delete node 1 (improper deletion - Rule 2)
+    env6.topology.delete(1)
+    
+    new_state6 = state_extractor6.get_state_features(
+        include_substrate=True, node_age=env6._node_age, node_stagnation=env6._node_stagnation
+    )
+    
+    # Calculate rewards
+    reward_breakdown6 = env6._calculate_reward(prev_state6, new_state6, [])
+    
+    # Calculate expected penalties
+    num_nodes6 = env6.topology.graph.num_nodes()
+    excess_nodes6 = num_nodes6 - max_critical6
+    expected_growth6 = -env6.growth_penalty * (1 + excess_nodes6 / max_critical6)
+    expected_persistence6 = -env6.delete_persistence_penalty  # Rule 1
+    expected_improper6 = -env6.delete_improper_penalty  # Rule 2
+    expected_total6 = expected_growth6 + expected_persistence6 + expected_improper6
+    
+    print(f"Combined penalties:")
+    print(f"  Rule 0 (growth): {expected_growth6:.4f}")
+    print(f"  Rule 1 (persistence): {expected_persistence6:.4f}")
+    print(f"  Rule 2 (improper): {expected_improper6:.4f}")
+    print(f"  Expected total: {expected_total6:.4f}")
+    print(f"  Actual total: {reward_breakdown6['total_reward']:.4f}")
+    
+    if abs(reward_breakdown6['total_reward'] - expected_total6) < 0.01:
+        print("✓ Combined penalties match expected")
+    else:
+        print(f"✗ Combined penalties do NOT match")
     
     print("\n" + "=" * 80)
     print("All tests completed!")

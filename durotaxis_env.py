@@ -1239,19 +1239,23 @@ class DurotaxisEnv(gym.Env):
         total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
         
         # === SIMPLE DELETE-ONLY MODE ===
-        # When enabled, zero out all rewards except delete penalties (Rule 1 & 2)
+        # When enabled, zero out all rewards except delete penalties (Rule 1 & 2) and growth penalty (Rule 0)
         if self.simple_delete_only_mode:
             # Extract only the delete penalties from delete_reward
             # In simple mode, we want ONLY penalties, no positive rewards
-            delete_penalty_only = 0.0
-            
-            # We need to recalculate delete_reward with only penalties
-            # The _calculate_delete_reward will be modified to check this flag
             delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
             
-            # Zero out everything, keep only delete penalties
-            total_reward = delete_penalty_only
-            graph_reward = delete_penalty_only
+            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
+            growth_penalty_only = 0.0
+            if num_nodes > self.max_critical_nodes:
+                excess_nodes = num_nodes - self.max_critical_nodes
+                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
+            
+            # Combine penalties: Rule 0 (growth) + Rule 1 (persistence) + Rule 2 (improper deletion)
+            total_reward = growth_penalty_only + delete_penalty_only
+            graph_reward = growth_penalty_only + delete_penalty_only
+            
+            # Zero out all other components
             spawn_reward = 0.0
             efficiency_reward = 0.0
             edge_reward = 0.0
