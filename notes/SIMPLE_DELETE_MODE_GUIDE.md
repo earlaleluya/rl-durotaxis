@@ -21,6 +21,14 @@ This can be complex for initial experiments. The **simple delete-only mode** str
 1. **Rule 1 (Persistence Penalty)**: When a node marked `to_delete=1` still exists in the next state
 2. **Rule 2 (Improper Deletion Penalty)**: When a node NOT marked `to_delete=0` is deleted anyway
 
+**PLUS TERMINATION REWARDS/PENALTIES:**
+- **Success Reward**: When agent reaches rightmost substrate (goal completion)
+- **Critical Nodes Penalty**: When `num_nodes > threshold_critical_nodes`
+- **No Nodes Penalty**: When all nodes are lost
+- **Out of Bounds Penalty**: When any node exits substrate boundaries
+- **Leftward Drift Penalty**: When centroid moves left consecutively
+- **Timeout Penalty**: When max steps reached without success/failure
+
 **NO POSITIVE REWARDS** - Not even for proper deletions (proper deletions give 0.0)
 
 ## Configuration
@@ -61,7 +69,15 @@ environment:
    - **Rule 2**: If an unmarked node is deleted: `-improper_deletion_penalty`
    - If a marked node is properly deleted: `0.0` (no reward!)
 
-3. **Total reward = growth_penalty + delete_penalties**
+3. **Termination rewards/penalties are included:**
+   - Success (reach rightmost): `+success_reward`
+   - Critical nodes exceeded: `+critical_nodes_penalty` (negative)
+   - All nodes lost: `+no_nodes_penalty` (negative)
+   - Out of bounds: `+out_of_bounds_penalty` (negative)
+   - Leftward drift: `+leftward_drift_penalty` (negative)
+   - Timeout: `+timeout_penalty` (negative)
+
+4. **Total reward = growth_penalty + delete_penalties + termination_reward**
 
 ### Penalty Values
 
@@ -70,6 +86,7 @@ Configure in `config.yaml`:
 ```yaml
 environment:
   max_critical_nodes: 75              # Rule 0 threshold
+  threshold_critical_nodes: 500       # Termination threshold (higher than max_critical)
   
   graph_rewards:
     growth_penalty: 3.0               # Rule 0 penalty (scaled by excess)
@@ -78,28 +95,40 @@ environment:
     proper_deletion: 2.0              # NOT used in simple mode
     persistence_penalty: 2.0          # RULE 1 penalty
     improper_deletion_penalty: 2.0    # RULE 2 penalty
+  
+  termination_rewards:
+    success_reward: 100.0             # Positive reward for goal completion
+    critical_nodes_penalty: -25.0     # Penalty for exceeding critical threshold
+    no_nodes_penalty: -30.0           # Penalty for losing all nodes
+    out_of_bounds_penalty: -30.0      # Penalty for nodes going out of bounds
+    leftward_drift_penalty: -30.0     # Penalty for persistent leftward drift
+    timeout_penalty: -10.0            # Penalty for timeout without completion
 ```
 
 In simple mode:
 - `growth_penalty` penalizes spawning too many nodes (Rule 0)
-- `proper_deletion` is ignored (no positive rewards)
+- `proper_deletion` is ignored (no positive rewards for deletion)
 - `persistence_penalty` penalizes keeping marked nodes (Rule 1)
 - `improper_deletion_penalty` penalizes deleting unmarked nodes (Rule 2)
+- All `termination_rewards` are included to provide outcome feedback
 
 ## Expected Agent Behavior
 
-With only penalties and no positive rewards, the agent should learn to:
+With only penalties and termination feedback (no step-wise positive rewards), the agent should learn to:
 
 1. **Avoid spawning too many nodes** (to avoid growth penalty - Rule 0)
 2. **Avoid deleting nodes unnecessarily** (to avoid improper deletion penalty - Rule 2)
 3. **Delete nodes when marked** (to avoid persistence penalty - Rule 1)
-4. **Conservative deletion strategy** (bias toward keeping nodes to minimize penalties)
-5. **Controlled spawning strategy** (balance between having enough nodes and staying under limit)
+4. **Stay within substrate bounds** (to avoid out-of-bounds termination)
+5. **Maintain forward progress** (to avoid leftward drift termination)
+6. **Complete the task efficiently** (to earn success reward and avoid timeout)
 
 The hypothesis is that the agent will develop a cautious policy that:
 - Carefully manages node count to stay below `max_critical_nodes`
 - Only deletes nodes when they're marked with high confidence
 - Learns the relationship between spawning and the need to delete marked nodes
+- Understands episode outcomes (success vs. various failure modes)
+- Optimizes for task completion to earn the success reward
 
 ## Use Cases
 
@@ -206,12 +235,25 @@ All reward components will be restored to their standard behavior.
        # Rules 1 & 2: Delete penalties
        delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
        
-       # Combine all penalties
+       # Combine penalties (termination rewards handled separately)
        total_reward = growth_penalty_only + delete_penalty_only
        # ... zero out all other components
    ```
 
-3. **Delete Reward Logic** (`durotaxis_env.py` line ~1582):
+3. **Termination Reward Handling** (`durotaxis_env.py` line ~965):
+   ```python
+   if terminated:
+       if self.simple_delete_only_mode:
+           # Add termination reward to the penalties
+           reward_components['total_reward'] = (
+               reward_components.get('graph_reward', 0.0) + termination_reward
+           )
+       else:
+           # Normal mode
+           reward_components['total_reward'] += termination_reward
+   ```
+
+4. **Delete Reward Logic** (`durotaxis_env.py` line ~1582):
    ```python
    if node_was_deleted:
        if not self.simple_delete_only_mode:

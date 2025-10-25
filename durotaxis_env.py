@@ -963,8 +963,17 @@ class DurotaxisEnv(gym.Env):
         # Add termination reward to the reward components
         if terminated:
             reward_components['termination_reward'] = termination_reward
-            # Update total reward to include termination reward
-            reward_components['total_reward'] += termination_reward
+            
+            # In simple_delete_only_mode, handle termination rewards specially
+            if self.simple_delete_only_mode:
+                # Keep termination penalties/rewards as they provide critical feedback
+                # about episode outcomes (success vs failure modes)
+                reward_components['total_reward'] = (
+                    reward_components.get('graph_reward', 0.0) + termination_reward
+                )
+            else:
+                # Normal mode: add termination reward to existing total
+                reward_components['total_reward'] += termination_reward
         
         # Accumulate episode total reward (using scalar total for tracking)
         scalar_reward = reward_components['total_reward']

@@ -3,8 +3,9 @@
 Test the simple_delete_only_mode flag to ensure:
 0. Growth penalty is applied when num_nodes > max_critical_nodes (Rule 0)
 1. Only delete penalties are computed (Rule 1 & 2)
-2. All other rewards are zeroed out
-3. No positive rewards are given (proper deletions give 0)
+2. Termination rewards/penalties are included
+3. All other rewards are zeroed out
+4. No positive rewards are given (proper deletions give 0)
 """
 import os
 import sys
@@ -361,6 +362,97 @@ def test_simple_delete_mode():
         print("✓ Combined penalties match expected")
     else:
         print(f"✗ Combined penalties do NOT match")
+    
+    # Test 7: Termination rewards in simple mode
+    print("\n" + "-" * 80)
+    print("TEST 7: Termination Rewards (simple mode)")
+    print("-" * 80)
+    
+    # Test timeout penalty
+    print("\nTesting timeout penalty...")
+    env7 = DurotaxisEnv(config_path="config.yaml", substrate_type='linear', 
+                        simple_delete_only_mode=True, max_steps=5)
+    obs, info = env7.reset()
+    
+    # Take steps until timeout
+    for _ in range(5):
+        obs, reward, terminated, truncated, info = env7.step(0)  # No-op action
+    
+    # Check if timeout penalty is included
+    if 'termination_reward' in env7.last_reward_breakdown:
+        term_reward = env7.last_reward_breakdown['termination_reward']
+        expected_timeout = env7.timeout_penalty
+        print(f"  Expected timeout penalty: {expected_timeout:.4f}")
+        print(f"  Actual termination reward: {term_reward:.4f}")
+        
+        if abs(term_reward - expected_timeout) < 0.01:
+            print("  ✓ Timeout penalty matches expected")
+        else:
+            print(f"  ✗ Timeout penalty does NOT match")
+    else:
+        print("  ✗ No termination reward found")
+    
+    # Test success reward
+    print("\nTesting success reward...")
+    env8 = DurotaxisEnv(config_path="config.yaml", substrate_type='linear', 
+                        simple_delete_only_mode=True)
+    obs, info = env8.reset()
+    
+    # Manually place a node at rightmost position to trigger success
+    substrate_width = env8.substrate.width
+    rightmost_x = substrate_width - 1
+    
+    if env8.topology.graph.num_nodes() > 0:
+        # Move first node to rightmost position
+        env8.topology.graph.ndata['pos'][0][0] = rightmost_x
+        
+        # Take a step to trigger termination check
+        obs, reward, terminated, truncated, info = env8.step(0)
+        
+        if terminated:
+            if 'termination_reward' in env8.last_reward_breakdown:
+                term_reward = env8.last_reward_breakdown['termination_reward']
+                expected_success = env8.success_reward
+                print(f"  Expected success reward: {expected_success:.4f}")
+                print(f"  Actual termination reward: {term_reward:.4f}")
+                
+                if abs(term_reward - expected_success) < 0.01:
+                    print("  ✓ Success reward matches expected")
+                else:
+                    print(f"  ✗ Success reward does NOT match")
+            else:
+                print("  ✗ No termination reward found")
+        else:
+            print("  ✗ Episode did not terminate on success")
+    
+    # Test out of bounds penalty
+    print("\nTesting out of bounds penalty...")
+    env9 = DurotaxisEnv(config_path="config.yaml", substrate_type='linear', 
+                        simple_delete_only_mode=True)
+    obs, info = env9.reset()
+    
+    if env9.topology.graph.num_nodes() > 0:
+        # Move first node out of bounds
+        env9.topology.graph.ndata['pos'][0][0] = -10.0  # Out of bounds
+        
+        # Take a step to trigger termination check
+        obs, reward, terminated, truncated, info = env9.step(0)
+        
+        if terminated:
+            if 'termination_reward' in env9.last_reward_breakdown:
+                term_reward = env9.last_reward_breakdown['termination_reward']
+                expected_oob = env9.out_of_bounds_penalty
+                print(f"  Expected out of bounds penalty: {expected_oob:.4f}")
+                print(f"  Actual termination reward: {term_reward:.4f}")
+                
+                if abs(term_reward - expected_oob) < 0.01:
+                    print("  ✓ Out of bounds penalty matches expected")
+                else:
+                    print(f"  ✗ Out of bounds penalty does NOT match")
+            else:
+                print("  ✗ No termination reward found")
+        else:
+            print("  ✗ Episode did not terminate on out of bounds")
     
     print("\n" + "=" * 80)
     print("All tests completed!")
