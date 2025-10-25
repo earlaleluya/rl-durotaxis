@@ -196,7 +196,7 @@ trainer:
     max_log_file_size_mb: 50           # Maximum size per log file in MB
   
   # Environment setup parameters
-  substrate_type: 'random'  # 'linear', 'exponential', or 'random'
+  substrate_type: 'linear'  # 'linear', 'exponential', or 'random'
   
   # Empty graph handling configuration
   empty_graph_handling:
@@ -273,6 +273,17 @@ trainer:
 # DurotaxisEnv Configuration
 # ============================================================================
 environment:
+  # ============================================================================
+  # EXPERIMENTAL: Simple Delete-Only Reward Mode
+  # ============================================================================
+  # When enabled, this mode zeros out ALL reward components except delete penalties.
+  # The agent receives ONLY penalties for:
+  #   1. Persistence: keeping a node marked for deletion (Rule 1)
+  #   2. Improper deletion: deleting a node NOT marked for deletion (Rule 2)
+  # NO positive rewards are given (proper deletions give 0 instead of positive reward).
+  # Use this to test if the agent can learn node management purely from negative feedback.
+  simple_delete_only_mode: true  # Set to true to enable simplified reward system
+  
   # Basic environment parameters - EXPANDED for successful migration
   substrate_size: [600, 400]  # Much larger substrate (3x width)
   substrate_type: 'linear'

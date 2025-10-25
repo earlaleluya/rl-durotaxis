@@ -245,6 +245,9 @@ class DurotaxisEnv(gym.Env):
         self.flush_delay = config.get('flush_delay', 0.0001)
         self.enable_visualization = config.get('enable_visualization', True)
         
+        # Simple delete-only mode flag
+        self.simple_delete_only_mode = config.get('simple_delete_only_mode', False)
+        
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
             'connectivity_penalty': 10.0,
@@ -1235,6 +1238,28 @@ class DurotaxisEnv(gym.Env):
         # Final combined reward
         total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
         
+        # === SIMPLE DELETE-ONLY MODE ===
+        # When enabled, zero out all rewards except delete penalties (Rule 1 & 2)
+        if self.simple_delete_only_mode:
+            # Extract only the delete penalties from delete_reward
+            # In simple mode, we want ONLY penalties, no positive rewards
+            delete_penalty_only = 0.0
+            
+            # We need to recalculate delete_reward with only penalties
+            # The _calculate_delete_reward will be modified to check this flag
+            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
+            
+            # Zero out everything, keep only delete penalties
+            total_reward = delete_penalty_only
+            graph_reward = delete_penalty_only
+            spawn_reward = 0.0
+            efficiency_reward = 0.0
+            edge_reward = 0.0
+            centroid_reward = 0.0
+            milestone_reward = 0.0
+            total_node_reward = 0.0
+            survival_reward = 0.0
+        
         # Create detailed reward information dictionary
         reward_breakdown = {
             'total_reward': total_reward,
@@ -1578,15 +1603,17 @@ class DurotaxisEnv(gym.Env):
             if to_delete_flag.item() > 0.5:  # Node was marked for deletion
                 if node_was_deleted:
                     # Node was marked for deletion and was actually deleted - reward
-                    delete_reward += self.delete_proper_reward
+                    # In simple_delete_only_mode, we give 0 instead of positive reward
+                    if not self.simple_delete_only_mode:
+                        delete_reward += self.delete_proper_reward
                     # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
                 else:
-                    # Node was marked for deletion but still exists - penalty
+                    # Node was marked for deletion but still exists - penalty (RULE 1)
                     delete_reward -= self.delete_persistence_penalty
                     # print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
             else:  # Node was NOT marked for deletion (to_delete=0)
                 if node_was_deleted:
-                    # Node was NOT marked but was deleted anyway - penalty
+                    # Node was NOT marked but was deleted anyway - penalty (RULE 2)
                     delete_reward -= self.delete_improper_penalty
                     # print(f"🔴 Improper delete penalty! Node PID:{prev_persistent_id} was deleted without marking (-{self.delete_improper_penalty})")
                 # else: node not marked and still exists - neutral (expected behavior)
