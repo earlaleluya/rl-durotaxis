@@ -1503,6 +1503,10 @@ class DurotaxisEnv(gym.Env):
         if not hasattr(self, 'milestone_rewards') or not self.milestone_rewards.get('enabled', False):
             return 0.0
         
+        # Skip milestone rewards and printing when in centroid distance only mode
+        if self.centroid_distance_only_mode:
+            return 0.0
+        
         if new_state['num_nodes'] == 0:
             return 0.0
         
