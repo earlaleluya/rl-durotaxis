@@ -660,6 +660,7 @@ class DurotaxisTrainer:
         self.smoothed_losses = []   # Track moving average of losses
         self.best_total_reward = float('-inf')
         self.start_episode = 0  # For resume training
+        self.last_checkpoint_filename = None  # Track last saved checkpoint for loss metrics
         
         # Resume training if configured (check both trainer.resume_training and top-level)
         resume_config = self.config_loader.config.get('trainer', {}).get('resume_training', {})
@@ -3789,7 +3790,8 @@ class DurotaxisTrainer:
         metrics = {
             'episode': episode,
             'loss': self.losses['total_loss'][-1] if self.losses['total_loss'] else None,
-            'smoothed_loss': self.smoothed_losses[-1] if self.smoothed_losses else None
+            'smoothed_loss': self.smoothed_losses[-1] if self.smoothed_losses else None,
+            'checkpoint_filename': self.last_checkpoint_filename  # Track which checkpoint contains this episode
         }
         # Append to file
         if os.path.exists(metrics_path):
@@ -3904,13 +3906,17 @@ class DurotaxisTrainer:
             'best_reward': self.best_total_reward,
             'component_weights': self.component_weights,
             'run_number': self.run_number,
-            'episode_count': episode_count,  # Track episode progress
+            'episode_count': episode_count,  # Next episode to run (episodes 0 to episode_count-1 are completed)
             'smoothed_rewards': self.smoothed_rewards,
             'smoothed_losses': self.smoothed_losses,
         }
         
         filepath = os.path.join(self.run_dir, filename)
         torch.save(checkpoint, filepath)
+        
+        # Track last checkpoint for loss metrics logging
+        self.last_checkpoint_filename = filename
+        
         print(f"💾 Saved: {filename} (Run #{self.run_number}, Episode {episode_count})")
     
     def _load_checkpoint_for_resume(self, resume_config: dict):
@@ -3970,10 +3976,12 @@ class DurotaxisTrainer:
                 print(f"   ⚠️ Optimizer state reset (as configured)")
             
             # Conditionally load episode count
+            # NOTE: episode_count in checkpoint represents the NEXT episode to run
+            # (it's incremented after each episode completes, so it's always "ready for next")
             if not resume_config.get('reset_episode_count', False):
                 if 'episode_count' in checkpoint:
                     self.start_episode = checkpoint['episode_count']
-                    print(f"   ✅ Resuming from episode {self.start_episode}")
+                    print(f"   ✅ Resuming from episode {self.start_episode} (next episode to run)")
             else:
                 self.start_episode = 0
                 print(f"   ⚠️ Episode count reset to 0 (as configured)")
