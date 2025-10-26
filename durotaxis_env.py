@@ -251,6 +251,12 @@ class DurotaxisEnv(gym.Env):
         # Centroid-to-goal distance-only mode flag
         self.centroid_distance_only_mode = config.get('centroid_distance_only_mode', False)
         
+        # Include termination rewards flag (for special modes)
+        # Default behavior:
+        #   - If both modes are False: Always use termination rewards (default True, ignored)
+        #   - If either mode is True: User must explicitly set this to True to include termination rewards
+        self.include_termination_rewards = config.get('include_termination_rewards', False)
+        
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
             'connectivity_penalty': 10.0,
@@ -981,21 +987,26 @@ class DurotaxisEnv(gym.Env):
         if terminated:
             reward_components['termination_reward'] = termination_reward
             
-            # In simple_delete_only_mode, handle termination rewards specially
-            if self.simple_delete_only_mode:
-                # Keep termination penalties/rewards as they provide critical feedback
-                # about episode outcomes (success vs failure modes)
-                reward_components['total_reward'] = (
-                    reward_components.get('graph_reward', 0.0) + termination_reward
-                )
-            # In centroid_distance_only_mode, ignore termination rewards
-            elif self.centroid_distance_only_mode:
-                # Keep only the distance penalty, ignore termination rewards
-                # This ensures pure distance-based learning without outcome bias
-                pass  # total_reward already set to distance_penalty only
-            else:
-                # Normal mode: add termination reward to existing total
-                reward_components['total_reward'] += termination_reward
+            # Determine if termination rewards should be included
+            is_normal_mode = not self.simple_delete_only_mode and not self.centroid_distance_only_mode
+            is_special_mode_with_termination = (self.simple_delete_only_mode or self.centroid_distance_only_mode) and self.include_termination_rewards
+            
+            # Include termination rewards if:
+            # 1. Normal mode (both special modes disabled), OR
+            # 2. Special mode with include_termination_rewards=True
+            if is_normal_mode or is_special_mode_with_termination:
+                if self.simple_delete_only_mode:
+                    # Simple delete mode: Replace total with graph_reward + termination
+                    reward_components['total_reward'] = (
+                        reward_components.get('graph_reward', 0.0) + termination_reward
+                    )
+                elif self.centroid_distance_only_mode:
+                    # Centroid distance mode: Add termination to distance penalty
+                    reward_components['total_reward'] += termination_reward
+                else:
+                    # Normal mode: Add termination reward to existing total
+                    reward_components['total_reward'] += termination_reward
+            # else: Special mode without include_termination_rewards flag - ignore termination rewards
         
         # Accumulate episode total reward (using scalar total for tracking)
         scalar_reward = reward_components['total_reward']

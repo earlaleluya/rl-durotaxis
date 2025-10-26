@@ -48,6 +48,15 @@ Examples:
   
   # Baseline ablation configuration (a1)
   python train_cli.py --pretrained-weights imagenet --no-wsa --no-sem --experiment a1_baseline --seed 1
+  
+  # Simple delete-only mode (Rule 0, 1, 2) with termination rewards
+  python train_cli.py --simple-delete-only --include-termination-rewards --experiment delete_only_with_term
+  
+  # Centroid distance-only mode (pure distance learning)
+  python train_cli.py --centroid-distance-only --experiment pure_distance
+  
+  # Centroid distance mode with success rewards enabled
+  python train_cli.py --centroid-distance-only --include-termination-rewards --experiment distance_with_success
         """
     )
     
@@ -88,6 +97,20 @@ Examples:
                         help='Initial number of nodes')
     parser.add_argument('--max-nodes', type=int, default=None,
                         help='Maximum critical nodes allowed')
+    
+    # Reward mode configuration
+    parser.add_argument('--simple-delete-only', action='store_true', default=None,
+                        help='Enable simple delete-only reward mode (Rule 0, 1, 2 only)')
+    parser.add_argument('--no-simple-delete-only', dest='simple_delete_only', action='store_false',
+                        help='Disable simple delete-only reward mode')
+    parser.add_argument('--centroid-distance-only', action='store_true', default=None,
+                        help='Enable centroid distance-only reward mode (pure distance learning)')
+    parser.add_argument('--no-centroid-distance-only', dest='centroid_distance_only', action='store_false',
+                        help='Disable centroid distance-only reward mode')
+    parser.add_argument('--include-termination-rewards', action='store_true', default=None,
+                        help='Include termination rewards in special modes (default: False)')
+    parser.add_argument('--no-include-termination-rewards', dest='include_termination_rewards', action='store_false',
+                        help='Exclude termination rewards in special modes')
     
     # Checkpoint and logging
     parser.add_argument('--save-dir', type=str, default=None,
@@ -174,6 +197,17 @@ def main():
         # Map to the correct config key
         print(f"   ⚠️  --max-nodes override requires modifying environment config directly")
         print(f"      Please set environment.max_critical_nodes in config.yaml")
+    
+    # Reward mode configuration
+    if args.simple_delete_only is not None:
+        overrides['simple_delete_only_mode'] = args.simple_delete_only
+        print(f"   Simple delete-only mode: {args.simple_delete_only}")
+    if args.centroid_distance_only is not None:
+        overrides['centroid_distance_only_mode'] = args.centroid_distance_only
+        print(f"   Centroid distance-only mode: {args.centroid_distance_only}")
+    if args.include_termination_rewards is not None:
+        overrides['include_termination_rewards'] = args.include_termination_rewards
+        print(f"   Include termination rewards: {args.include_termination_rewards}")
     
     # Logging parameters
     if args.save_dir is not None:

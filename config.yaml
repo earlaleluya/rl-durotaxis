@@ -18,8 +18,8 @@ trainer:
   
   # Resume training configuration
   resume_training:
-    enabled: false                      # Set to true to resume from checkpoint
-    checkpoint_path: null               # Path to checkpoint file (e.g., "./training_results/run0001/checkpoint_episode_500.pt")
+    enabled: true                      # Set to true to resume from checkpoint
+    checkpoint_path: "training_results/run0012/best_model_batch4.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/checkpoint_episode_500.pt")
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
     reset_optimizer: false              # If true, create fresh optimizer (useful if changing learning rate)
     reset_episode_count: false          # If true, restart episode counter from 0
@@ -299,6 +299,18 @@ environment:
   # ALL other rewards/penalties are disabled (movement, spawn, delete, milestones, termination, etc.)
   # Use this to test if the agent can learn pure goal-seeking behavior from distance feedback alone.
   centroid_distance_only_mode: true  # Set to true to enable centroid distance penalty mode
+  
+  # ============================================================================
+  # Termination Reward Control Flag
+  # ============================================================================
+  # Controls whether termination rewards (success_reward, out_of_bounds_penalty, etc.) are included.
+  # Behavior:
+  #   - If simple_delete_only_mode=False AND centroid_distance_only_mode=False (normal mode):
+  #     Termination rewards are ALWAYS included (this flag is ignored)
+  #   - If simple_delete_only_mode=True OR centroid_distance_only_mode=True (special modes):
+  #     Set this to True to include termination rewards, False to exclude them
+  # Default: false (special modes exclude termination rewards by default for pure learning)
+  include_termination_rewards: true
   
   # Basic environment parameters - EXPANDED for successful migration
   substrate_size: [600, 400]  # Much larger substrate (3x width)
