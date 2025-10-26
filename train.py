@@ -28,6 +28,71 @@ import time
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# ===========================
+# Safe Normalization Utilities
+# ===========================
+
+def safe_standardize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Standardize tensor to zero mean and unit variance with numerical safety.
+    Returns zeros if variance is too small (degenerate case).
+    """
+    if x.numel() == 0:
+        return x
+    mean = x.mean()
+    std = x.std()
+    if std < eps:
+        # Zero variance - return zero-centered
+        return x - mean
+    return (x - mean) / (std + eps)
+
+def safe_zero_center(x: torch.Tensor) -> torch.Tensor:
+    """Center tensor to zero mean without scaling."""
+    if x.numel() == 0:
+        return x
+    return x - x.mean()
+
+class RunningMeanStd:
+    """
+    Tracks running mean and std for normalization with Welford's algorithm.
+    Useful for normalizing rewards/values with stable streaming statistics.
+    """
+    def __init__(self, shape=(), eps=1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps  # Avoid division by zero
+        self.eps = eps
+    
+    def update(self, x):
+        """Update statistics with new batch of data."""
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+    
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Welford's online algorithm for stable mean/var computation."""
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
+        new_var = M2 / total_count
+        
+        self.mean = new_mean
+        self.var = new_var
+        self.count = total_count
+    
+    def normalize(self, x):
+        """Normalize using tracked statistics."""
+        return (x - self.mean) / np.sqrt(self.var + self.eps)
+
+# ===========================
+# Trajectory Buffer
+# ===========================
+
 class TrajectoryBuffer:
     """Buffer to store multiple episodes of trajectories for batch training"""
     
@@ -1087,12 +1152,13 @@ class DurotaxisTrainer:
     
     def compute_enhanced_advantage_weights(self, advantages: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Enhanced learnable advantage weighting system
+        Enhanced learnable advantage weighting system with component masking
         
         Combines three approaches:
         1. Learnable base weights (trainable parameters)
         2. Attention-based dynamic weighting (context-dependent)  
         3. Adaptive scaling for stability
+        4. Zero-variance component masking (NEW)
         
         Args:
             advantages: Dictionary of advantages per component
@@ -1112,13 +1178,30 @@ class DurotaxisTrainer:
         advantage_list = [advantages[comp] for comp in self.component_names]
         advantage_tensor = torch.stack(advantage_list, dim=1)  # Shape: [batch_size, num_components]
         
-        # Step 2: Learnable base weights (Tier 1)
-        base_weights = torch.softmax(self.learnable_component_weights.base_weights, dim=0)
+        # Step 2: Mask zero-variance components (critical for special modes)
+        component_stds = advantage_tensor.std(dim=0)  # [num_components]
+        valid_mask = component_stds > 1e-8  # Components with meaningful variance
         
-        # Step 3: Attention-based dynamic weighting (Tier 2)
+        if not valid_mask.any():
+            # All components are zero-variance, return zeros
+            return torch.zeros(batch_size, device=device)
+        
+        # Step 3: Learnable base weights (Tier 1) - masked
+        base_weights = torch.softmax(self.learnable_component_weights.base_weights, dim=0)
+        base_weights = base_weights * valid_mask.float()  # Zero out invalid components
+        
+        # Renormalize if any valid components remain
+        if base_weights.sum() > 1e-8:
+            base_weights = base_weights / base_weights.sum()
+        else:
+            # Fallback: uniform weights on valid components
+            base_weights = valid_mask.float() / valid_mask.sum()
+        
+        # Step 4: Attention-based dynamic weighting (Tier 2) - masked
         if self.enable_attention_weighting and self.learnable_component_weights.attention_weights is not None:
-            # Compute attention weights based on advantage magnitudes
+            # Compute attention weights based on advantage magnitudes (only valid components)
             advantage_magnitudes = torch.abs(advantage_tensor).mean(dim=0)  # [num_components]
+            advantage_magnitudes = advantage_magnitudes * valid_mask.float()  # Mask invalid
             
             # Ensure advantage_magnitudes is a 1D tensor, then add batch dimension correctly
             if advantage_magnitudes.dim() == 2:
@@ -1129,33 +1212,36 @@ class DurotaxisTrainer:
             attention_input = advantage_magnitudes.unsqueeze(0)  # [1, num_components]
             attention_logits = self.learnable_component_weights.attention_weights(attention_input)  # [1, num_components]
             attention_logits = attention_logits.squeeze(0)  # Remove batch dim -> [num_components]
+            
+            # Mask attention before softmax
+            attention_logits = torch.where(valid_mask, attention_logits, torch.tensor(-1e10, device=device))
             attention_weights = torch.softmax(attention_logits, dim=0)
             
             # Combine base weights with attention
             final_weights = base_weights * attention_weights
-            final_weights = final_weights / final_weights.sum()  # Renormalize
+            final_weights = final_weights / (final_weights.sum() + 1e-8)  # Renormalize
         else:
             final_weights = base_weights
         
-        # Step 4: Apply weights to advantages
+        # Step 5: Apply weights to advantages
         weighted_advantages = (advantage_tensor * final_weights.unsqueeze(0)).sum(dim=1)
         
-        # Step 5: Normalize final advantages
-        if len(weighted_advantages) > 1:
-            weighted_advantages = (weighted_advantages - weighted_advantages.mean()) / (weighted_advantages.std() + 1e-8)
+        # Step 6: Safe normalization of final advantages
+        weighted_advantages = safe_standardize(weighted_advantages, eps=1e-8)
         
         return weighted_advantages
     
     def _compute_traditional_weighted_advantages(self, advantages: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Fallback to traditional component weighting method"""
-        total_advantages = torch.zeros(len(next(iter(advantages.values()))), device=self.device)
+        """Fallback to traditional component weighting method with safe normalization"""
+        device = next(iter(advantages.values())).device
+        total_advantages = torch.zeros(len(next(iter(advantages.values()))), device=device)
+        
         for component, adv in advantages.items():
             weight = self.component_weights.get(component, 1.0)
             total_advantages += weight * adv
         
-        # Normalize advantages
-        if len(total_advantages) > 1:
-            total_advantages = (total_advantages - total_advantages.mean()) / (total_advantages.std() + 1e-8)
+        # Safe normalization of advantages
+        total_advantages = safe_standardize(total_advantages, eps=1e-8)
         
         return total_advantages
     
@@ -2334,7 +2420,7 @@ class DurotaxisTrainer:
     def compute_returns_and_advantages(self, rewards: List[Dict], values: List[Dict], 
                                      final_values: Optional[Dict] = None, terminated: bool = False,
                                      gamma: float = 0.99, gae_lambda: float = 0.95) -> Dict[str, torch.Tensor]:
-        """Compute returns and advantages for each reward component with improved normalization"""
+        """Compute returns and advantages for each reward component with safe normalization"""
         if not rewards or not values:
             return {}, {}
         
@@ -2395,6 +2481,9 @@ class DurotaxisTrainer:
                 # Return: R_t = Â_t + V(s_t)
                 component_returns[t] = gae + component_values[t]
             
+            # Safe normalization of component advantages (critical for stability)
+            component_advantages = safe_standardize(component_advantages, eps=1e-8)
+            
             returns[component] = component_returns
             advantages[component] = component_advantages
         
@@ -2436,8 +2525,19 @@ class DurotaxisTrainer:
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_discrete_log_prob - old_discrete_log_prob, -20.0, 20.0)
             
-            # Compute ratio
+            # Compute ratio with additional safety
             ratio_discrete = torch.exp(log_prob_diff)
+            
+            # Guard against NaN/Inf in ratio (critical for numerical stability)
+            if not torch.isfinite(ratio_discrete).all():
+                ratio_discrete = torch.where(
+                    torch.isfinite(ratio_discrete),
+                    ratio_discrete,
+                    torch.tensor(1.0, device=self.device)
+                )
+            
+            # Additional safety: clamp ratio to reasonable range before PPO clipping
+            ratio_discrete = torch.clamp(ratio_discrete, 0.01, 100.0)
             
             # PPO clipping
             clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
@@ -2476,8 +2576,19 @@ class DurotaxisTrainer:
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_continuous_log_prob - old_continuous_log_prob, -20.0, 20.0)
             
-            # Compute ratio
+            # Compute ratio with additional safety
             ratio_continuous = torch.exp(log_prob_diff)
+            
+            # Guard against NaN/Inf in ratio (critical for numerical stability)
+            if not torch.isfinite(ratio_continuous).all():
+                ratio_continuous = torch.where(
+                    torch.isfinite(ratio_continuous),
+                    ratio_continuous,
+                    torch.tensor(1.0, device=self.device)
+                )
+            
+            # Additional safety: clamp ratio to reasonable range before PPO clipping
+            ratio_continuous = torch.clamp(ratio_continuous, 0.01, 100.0)
             
             # PPO clipping
             clipped_ratio_continuous = torch.clamp(ratio_continuous, 1 - clip_eps, 1 + clip_eps)
@@ -2508,6 +2619,15 @@ class DurotaxisTrainer:
         # Total policy loss
         total_policy_loss = sum(policy_losses.values())
         
+        # Guard against NaN/Inf in total policy loss (critical safety check)
+        if not torch.isfinite(total_policy_loss):
+            print(f"WARNING: Non-finite policy loss detected! Resetting to zero.")
+            print(f"  discrete_loss: {policy_losses['discrete']}")
+            print(f"  continuous_loss: {policy_losses['continuous']}")
+            total_policy_loss = torch.tensor(0.0, device=self.device)
+            policy_losses['discrete'] = torch.tensor(0.0, device=self.device)
+            policy_losses['continuous'] = torch.tensor(0.0, device=self.device)
+        
         # Ensure entropy loss is always a tensor
         if entropy_losses:
             total_entropy_loss = sum(entropy_losses.values())
@@ -2517,6 +2637,11 @@ class DurotaxisTrainer:
         # Ensure it's a tensor, not a scalar
         if not isinstance(total_entropy_loss, torch.Tensor):
             total_entropy_loss = torch.tensor(total_entropy_loss, device=self.device)
+        
+        # Guard against NaN/Inf in entropy loss
+        if not torch.isfinite(total_entropy_loss):
+            print(f"WARNING: Non-finite entropy loss detected! Resetting to zero.")
+            total_entropy_loss = torch.tensor(0.0, device=self.device)
         
         return {
             'policy_loss_discrete': policy_losses['discrete'],
@@ -2678,9 +2803,20 @@ class DurotaxisTrainer:
         for component, component_losses in value_losses.items():
             if component_losses:
                 component_loss = torch.stack(component_losses).mean()
+                
+                # Guard against NaN/Inf in component value loss
+                if not torch.isfinite(component_loss):
+                    print(f"WARNING: Non-finite value loss for component {component}! Resetting to zero.")
+                    component_loss = torch.tensor(0.0, device=self.device)
+                
                 weight = self.component_weights.get(component, 1.0)
                 total_value_loss += weight * component_loss
                 losses[f'value_loss_{component}'] = component_loss.item()
+        
+        # Final guard on total value loss
+        if not torch.isfinite(total_value_loss):
+            print(f"WARNING: Non-finite total value loss! Resetting to zero.")
+            total_value_loss = torch.tensor(0.0, device=self.device)
         
         losses['total_value_loss'] = total_value_loss.item()
         
@@ -2941,9 +3077,20 @@ class DurotaxisTrainer:
         for component, component_losses in value_losses.items():
             if component_losses:
                 component_loss = torch.stack(component_losses).mean()
+                
+                # Guard against NaN/Inf in component value loss
+                if not torch.isfinite(component_loss):
+                    print(f"WARNING: Non-finite value loss for component {component}! Resetting to zero.")
+                    component_loss = torch.tensor(0.0, device=self.device)
+                
                 weight = self.component_weights.get(component, 1.0)
                 total_value_loss += weight * component_loss
                 losses[f'value_loss_{component}'] = component_loss.item()
+        
+        # Final guard on total value loss
+        if not torch.isfinite(total_value_loss):
+            print(f"WARNING: Non-finite total value loss! Resetting to zero.")
+            total_value_loss = torch.tensor(0.0, device=self.device)
         
         losses['total_value_loss'] = total_value_loss.item()
         losses['value_clipping_enabled'] = self.enable_value_clipping
