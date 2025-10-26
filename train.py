@@ -2620,7 +2620,7 @@ class DurotaxisTrainer:
         total_policy_loss = sum(policy_losses.values())
         
         # Guard against NaN/Inf in total policy loss (critical safety check)
-        if not torch.isfinite(total_policy_loss):
+        if not torch.isfinite(total_policy_loss).all():
             print(f"WARNING: Non-finite policy loss detected! Resetting to zero.")
             print(f"  discrete_loss: {policy_losses['discrete']}")
             print(f"  continuous_loss: {policy_losses['continuous']}")
@@ -2639,7 +2639,7 @@ class DurotaxisTrainer:
             total_entropy_loss = torch.tensor(total_entropy_loss, device=self.device)
         
         # Guard against NaN/Inf in entropy loss
-        if not torch.isfinite(total_entropy_loss):
+        if not torch.isfinite(total_entropy_loss).all():
             print(f"WARNING: Non-finite entropy loss detected! Resetting to zero.")
             total_entropy_loss = torch.tensor(0.0, device=self.device)
         
@@ -2805,7 +2805,7 @@ class DurotaxisTrainer:
                 component_loss = torch.stack(component_losses).mean()
                 
                 # Guard against NaN/Inf in component value loss
-                if not torch.isfinite(component_loss):
+                if not torch.isfinite(component_loss).all():
                     print(f"WARNING: Non-finite value loss for component {component}! Resetting to zero.")
                     component_loss = torch.tensor(0.0, device=self.device)
                 
@@ -2814,7 +2814,7 @@ class DurotaxisTrainer:
                 losses[f'value_loss_{component}'] = component_loss.item()
         
         # Final guard on total value loss
-        if not torch.isfinite(total_value_loss):
+        if not torch.isfinite(total_value_loss).all():
             print(f"WARNING: Non-finite total value loss! Resetting to zero.")
             total_value_loss = torch.tensor(0.0, device=self.device)
         
@@ -3079,7 +3079,7 @@ class DurotaxisTrainer:
                 component_loss = torch.stack(component_losses).mean()
                 
                 # Guard against NaN/Inf in component value loss
-                if not torch.isfinite(component_loss):
+                if not torch.isfinite(component_loss).all():
                     print(f"WARNING: Non-finite value loss for component {component}! Resetting to zero.")
                     component_loss = torch.tensor(0.0, device=self.device)
                 
@@ -3088,7 +3088,7 @@ class DurotaxisTrainer:
                 losses[f'value_loss_{component}'] = component_loss.item()
         
         # Final guard on total value loss
-        if not torch.isfinite(total_value_loss):
+        if not torch.isfinite(total_value_loss).all():
             print(f"WARNING: Non-finite total value loss! Resetting to zero.")
             total_value_loss = torch.tensor(0.0, device=self.device)
         
