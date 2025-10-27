@@ -3364,8 +3364,8 @@ class DurotaxisTrainer:
                     smoothed_loss = moving_average(self.losses['total_loss'], window)
                     self.smoothed_losses.append(smoothed_loss)
 
-                # ---- Update per-episode JSON entries with computed episode loss ----
-                self.save_loss_statistics(episode_count)
+                # ---- Update per-batch JSON entries with computed batch loss and best reward ----
+                self.save_loss_statistics(episode_count, batch_num=batch_count, best_reward=self.best_total_reward)
                 try:
                     episode_loss_value = float(final_losses.get('total_policy_loss', None)) if final_losses else None
                     num_episodes_in_batch = len(batch_episode_rewards)
@@ -3506,10 +3506,13 @@ class DurotaxisTrainer:
                           f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
                 
                 # Save best model (check against best episode in this batch)
-                best_batch_reward = max(batch_episode_rewards) if batch_episode_rewards else 0.0
-                if best_batch_reward > self.best_total_reward:
-                    self.best_total_reward = best_batch_reward
-                    self.save_model(f"best_model_batch{batch_count}.pt", episode_count)
+                if batch_episode_rewards:
+                    best_batch_reward = max(batch_episode_rewards)
+                    if best_batch_reward > self.best_total_reward:
+                        prev_best = self.best_total_reward
+                        self.best_total_reward = best_batch_reward
+                        self.save_model(f"best_model_batch{batch_count}.pt", episode_count)
+                        print(f"💾 Best model saved at batch {batch_count} with reward: {best_batch_reward:.3f} (previous: {prev_best:.3f})")
                 
                 # Periodic saves (only if checkpoint_every is configured)
                 if self.checkpoint_every is not None and batch_count % (self.checkpoint_every // self.rollout_batch_size) == 0 and batch_count > 0:
@@ -3784,13 +3787,15 @@ class DurotaxisTrainer:
         
         return stats
     
-    def save_loss_statistics(self, episode: int) -> None:
-        """Save per-episode and smoothed losses to JSON file for analysis"""
+    def save_loss_statistics(self, episode: int, batch_num: int = None, best_reward: float = None) -> None:
+        """Save per-batch losses and best reward to JSON file for analysis"""
         metrics_path = os.path.join(self.run_dir, 'loss_metrics.json')
         metrics = {
             'episode': episode,
+            'batch': batch_num,
             'loss': self.losses['total_loss'][-1] if self.losses['total_loss'] else None,
             'smoothed_loss': self.smoothed_losses[-1] if self.smoothed_losses else None,
+            'best_reward': float(best_reward) if best_reward is not None else None,
             'checkpoint_filename': self.last_checkpoint_filename  # Track which checkpoint contains this episode
         }
         # Append to file

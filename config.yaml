@@ -21,8 +21,8 @@ trainer:
     enabled: true                      # Set to true to resume from checkpoint
     checkpoint_path: "training_results/run0012/best_model_batch4.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/checkpoint_episode_500.pt")
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
-    reset_optimizer: false              # If true, create fresh optimizer (useful if changing learning rate)
-    reset_episode_count: false          # If true, restart episode counter from 0
+    reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
+    reset_episode_count: true          # If true, restart episode counter from 0
   
   # ============================================================================
   # CURRICULUM LEARNING SYSTEM - Progressive Migration Training
@@ -310,7 +310,7 @@ environment:
   #   - If simple_delete_only_mode=True OR centroid_distance_only_mode=True (special modes):
   #     Set this to True to include termination rewards, False to exclude them
   # Default: false (special modes exclude termination rewards by default for pure learning)
-  include_termination_rewards: true
+  include_termination_rewards: false
   
   # Basic environment parameters - EXPANDED for successful migration
   substrate_size: [600, 400]  # Much larger substrate (3x width)
