@@ -18,13 +18,8 @@ trainer:
   
   # Resume training configuration
   resume_training:
-<<<<<<< HEAD
-    enabled: true                      # Set to true to resume from checkpoint
-    checkpoint_path: "training_results/run0012/best_model_batch4.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batchX.pt")
-=======
     enabled: false                      # Set to true to resume from checkpoint
     checkpoint_path: ""               # Path to checkpoint file (e.g., "./training_results/run0001/checkpoint_episode_500.pt")
->>>>>>> 13f04797cc028739811b3cca44911e03f94d5308
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
     reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
     reset_episode_count: true          # If true, restart episode counter from 0
