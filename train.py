@@ -662,6 +662,21 @@ class DurotaxisTrainer:
         self.start_episode = 0  # For resume training
         self.last_checkpoint_filename = None  # Track last saved checkpoint for loss metrics
         
+        # Adaptive terminal scale scheduler (for distance mode optimization)
+        # Gradually reduces terminal reward influence as rightward progress becomes consistent
+        env_config = self.config_loader.config.get('environment', {})
+        dm_config = env_config.get('distance_mode', {})
+        self.dm_scheduler_enabled = bool(dm_config.get('scheduler_enabled', True))
+        self.dm_scheduler_window_size = int(dm_config.get('scheduler_window_size', 5))
+        self.dm_scheduler_progress_threshold = float(dm_config.get('scheduler_progress_threshold', 0.6))
+        self.dm_scheduler_consecutive_windows = int(dm_config.get('scheduler_consecutive_windows', 3))
+        self.dm_scheduler_decay_rate = float(dm_config.get('scheduler_decay_rate', 0.9))
+        self.dm_scheduler_min_scale = float(dm_config.get('scheduler_min_scale', 0.005))
+        # Scheduler state
+        self._dm_rightward_progress_history = []  # List of (episode, progress_rate) tuples
+        self._dm_consecutive_good_windows = 0  # Count of consecutive windows meeting threshold
+        self._dm_terminal_scale_history = []  # List of (episode, scale) tuples for tracking
+        
         # Resume training if configured (check both trainer.resume_training and top-level)
         resume_config = self.config_loader.config.get('trainer', {}).get('resume_training', {})
         if not resume_config:
@@ -3165,6 +3180,65 @@ class DurotaxisTrainer:
         self.optimizer.step()
         
         return losses
+
+    def _compute_rightward_progress_rate(self, episode_count: int) -> float:
+        """
+        Compute rightward progress rate over the last window_size episodes.
+        
+        Returns:
+            progress_rate (float): Fraction of episodes with positive net centroid movement (0.0-1.0)
+        """
+        if not hasattr(self.env, 'centroid_history') or len(self.env.centroid_history) < 2:
+            return 0.0
+        
+        # Get the last window_size episodes from episode_rewards
+        window = self.dm_scheduler_window_size
+        if len(self.episode_rewards.get('total_reward', [])) < window:
+            return 0.0  # Not enough data yet
+        
+        # Count episodes with net rightward progress (final - initial centroid > 0)
+        # We approximate this by looking at total rewards - higher reward correlates with rightward progress
+        recent_rewards = self.episode_rewards['total_reward'][-window:]
+        positive_episodes = sum(1 for r in recent_rewards if r > 0)
+        progress_rate = positive_episodes / window
+        
+        return progress_rate
+    
+    def _update_terminal_scale_scheduler(self, episode_count: int):
+        """
+        Update the adaptive terminal scale scheduler.
+        
+        If rightward progress is consistently good (>= threshold for consecutive windows),
+        reduce terminal_reward_scale to let dense distance signals dominate.
+        """
+        if not self.dm_scheduler_enabled:
+            return
+        
+        if not self.env.centroid_distance_only_mode:
+            return  # Only relevant for distance mode
+        
+        # Compute current progress rate
+        progress_rate = self._compute_rightward_progress_rate(episode_count)
+        self._dm_rightward_progress_history.append((episode_count, progress_rate))
+        
+        # Check if progress meets threshold
+        if progress_rate >= self.dm_scheduler_progress_threshold:
+            self._dm_consecutive_good_windows += 1
+        else:
+            self._dm_consecutive_good_windows = 0  # Reset counter
+        
+        # Trigger scale reduction if consecutive threshold is met
+        if self._dm_consecutive_good_windows >= self.dm_scheduler_consecutive_windows:
+            current_scale = self.env.dm_terminal_reward_scale
+            new_scale = max(current_scale * self.dm_scheduler_decay_rate, self.dm_scheduler_min_scale)
+            
+            if new_scale != current_scale:
+                self.env.dm_terminal_reward_scale = new_scale
+                self._dm_terminal_scale_history.append((episode_count, new_scale))
+                print(f"🔧 Adaptive Scheduler: Reduced terminal_reward_scale: {current_scale:.4f} → {new_scale:.4f} (Progress: {progress_rate:.2f})")
+            
+            # Reset consecutive counter after applying decay
+            self._dm_consecutive_good_windows = 0
     
     def _collect_and_process_episode(self, episode_count: int) -> Tuple:
         """Helper function to collect an episode and add it to the buffer."""
@@ -3197,6 +3271,9 @@ class DurotaxisTrainer:
         self.scheduler.step()
         self.save_spawn_statistics(episode_count)
         self.save_reward_statistics(episode_count)
+        
+        # Update adaptive terminal scale scheduler (distance mode optimization)
+        self._update_terminal_scale_scheduler(episode_count)
         
         if self.enable_detailed_logging and self.detailed_node_logs:
             self.save_detailed_node_logs(episode_count)
@@ -3847,7 +3924,10 @@ class DurotaxisTrainer:
             'learning_rate': float(self.optimizer.param_groups[0]['lr']) if hasattr(self, 'optimizer') else None,
             'component_weights_snapshot': dict(self.component_weights) if hasattr(self, 'component_weights') else None,
             'spawn_summary': dict(self.current_spawn_summary) if hasattr(self, 'current_spawn_summary') else None,
-            'success': None
+            'success': None,
+            # Distance mode scheduler history
+            'dm_terminal_scale': self.env.dm_terminal_reward_scale if hasattr(self.env, 'dm_terminal_reward_scale') else None,
+            'dm_progress_rate': self._dm_rightward_progress_history[-1][1] if self._dm_rightward_progress_history else None
         }
 
         # Load existing data if file exists, otherwise start with empty list
