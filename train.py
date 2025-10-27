@@ -3364,8 +3364,11 @@ class DurotaxisTrainer:
                     smoothed_loss = moving_average(self.losses['total_loss'], window)
                     self.smoothed_losses.append(smoothed_loss)
 
+                # Calculate best reward for current batch
+                best_batch_reward = max(batch_episode_rewards) if batch_episode_rewards else None
+                
                 # ---- Update per-batch JSON entries with computed batch loss and best reward ----
-                self.save_loss_statistics(episode_count, batch_num=batch_count, best_reward=self.best_total_reward)
+                self.save_loss_statistics(episode_count, batch_num=batch_count, best_reward=best_batch_reward)
                 try:
                     episode_loss_value = float(final_losses.get('total_policy_loss', None)) if final_losses else None
                     num_episodes_in_batch = len(batch_episode_rewards)
@@ -3506,8 +3509,7 @@ class DurotaxisTrainer:
                           f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
                 
                 # Save best model (check against best episode in this batch)
-                if batch_episode_rewards:
-                    best_batch_reward = max(batch_episode_rewards)
+                if best_batch_reward is not None:
                     if best_batch_reward > self.best_total_reward:
                         prev_best = self.best_total_reward
                         self.best_total_reward = best_batch_reward
