@@ -18,8 +18,13 @@ trainer:
   
   # Resume training configuration
   resume_training:
+<<<<<<< HEAD
     enabled: true                      # Set to true to resume from checkpoint
     checkpoint_path: "training_results/run0012/best_model_batch4.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batchX.pt")
+=======
+    enabled: false                      # Set to true to resume from checkpoint
+    checkpoint_path: ""               # Path to checkpoint file (e.g., "./training_results/run0001/checkpoint_episode_500.pt")
+>>>>>>> 13f04797cc028739811b3cca44911e03f94d5308
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
     reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
     reset_episode_count: true          # If true, restart episode counter from 0
@@ -259,15 +264,15 @@ trainer:
     weight_learning_rate: 0.01        # Learning rate for component weights
     weight_regularization: 0.001      # L2 regularization for weight stability
     
-  # Enhanced entropy regularization system - INCREASED FOR MORE EXPLORATION
+  # Enhanced entropy regularization system 
   entropy_regularization:
     enable_adaptive_entropy: true     # Enable adaptive entropy scheduling
-    entropy_coeff_start: 0.8          # GREATLY INCREASED from 0.5 for maximum exploration
-    entropy_coeff_end: 0.15           # FURTHER INCREASED to maintain MORE exploration
-    entropy_decay_episodes: 500       # MUCH SLOWER decay (was 180) - explore for longer!
-    discrete_entropy_weight: 3.0      # INCREASED from 2.0 for more discrete exploration
-    continuous_entropy_weight: 2.0    # INCREASED from 1.5 for more continuous exploration
-    min_entropy_threshold: 0.3        # FURTHER INCREASED to prevent exploration collapse
+    entropy_coeff_start: 0.25         # Reduced for faster policy commitment (was 0.8)
+    entropy_coeff_end: 0.05           # Reduced to allow exploitation sooner (was 0.15)
+    entropy_decay_episodes: 300       # Faster decay for quicker convergence (was 500)
+    discrete_entropy_weight: 1.5      # Reduced for clearer action selection (was 3.0)
+    continuous_entropy_weight: 1.0    # Reduced for more focused parameters (was 2.0)
+    min_entropy_threshold: 0.1        # Lower floor for better exploitation (was 0.3)
 
 # ============================================================================
 # DurotaxisEnv Configuration
@@ -299,6 +304,27 @@ environment:
   # ALL other rewards/penalties are disabled (movement, spawn, delete, milestones, termination, etc.)
   # Use this to test if the agent can learn pure goal-seeking behavior from distance feedback alone.
   centroid_distance_only_mode: true  # Set to true to enable centroid distance penalty mode
+  
+  # ============================================================================
+  # Distance Mode Scaling and Shaping (for centroid_distance_only_mode)
+  # ============================================================================
+  distance_mode:
+    # Dense delta-based reward shaping (potential-based, keeps optimal policy)
+    use_delta_distance: true              # Reward ∝ (cx_t - cx_{t-1}) / goal_x (dense directional signal)
+    distance_reward_scale: 5.0            # Scale up dense signal for better learning
+    
+    # Termination reward handling in distance-only mode
+    terminal_reward_scale: 0.02               # Downscale terminal rewards (e.g., +100 → +2.0)
+    clip_terminal_rewards: true               # Clip terminal reward contribution
+    terminal_reward_clip_value: 10.0          # Clamp to [-10, +10]
+    
+    # Adaptive terminal reward scheduler (reduces scale as rightward progress becomes consistent)
+    scheduler_enabled: true                   # Gradually reduce terminal_reward_scale
+    scheduler_window_size: 5                  # Episodes to measure progress
+    scheduler_progress_threshold: 0.6         # Threshold: >=60% episodes show progress
+    scheduler_consecutive_windows: 3          # Consecutive good windows before decay
+    scheduler_decay_rate: 0.9                 # Multiplicative decay factor
+    scheduler_min_scale: 0.005                # Lower bound for scheduler
   
   # ============================================================================
   # Termination Reward Control Flag

@@ -257,6 +257,18 @@ class DurotaxisEnv(gym.Env):
         #   - If either mode is True: User must explicitly set this to True to include termination rewards
         self.include_termination_rewards = config.get('include_termination_rewards', False)
         
+        # Distance mode optimization parameters (for centroid_distance_only_mode)
+        # These parameters enable delta distance shaping and scaled termination rewards
+        dm = config.get('distance_mode', {})
+        self.dm_use_delta_distance = bool(dm.get('use_delta_distance', True))
+        self.dm_distance_reward_scale = float(dm.get('distance_reward_scale', 5.0))
+        self.dm_terminal_reward_scale = float(dm.get('terminal_reward_scale', 0.02))
+        self.dm_clip_terminal_rewards = bool(dm.get('clip_terminal_rewards', True))
+        self.dm_terminal_reward_clip_value = float(dm.get('terminal_reward_clip_value', 10.0))
+        # Note: Scheduler-related parameters (adaptive terminal scale reduction) are managed by the training script
+        # Previous centroid position for delta distance computation (initialized in reset())
+        self._prev_centroid_x = None
+        
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
             'connectivity_penalty': 10.0,
@@ -1001,8 +1013,14 @@ class DurotaxisEnv(gym.Env):
                         reward_components.get('graph_reward', 0.0) + termination_reward
                     )
                 elif self.centroid_distance_only_mode:
-                    # Centroid distance mode: Add termination to distance penalty
-                    reward_components['total_reward'] += termination_reward
+                    # Centroid distance mode: Apply scaled and clipped termination
+                    scaled_termination = termination_reward * self.dm_terminal_reward_scale
+                    if self.dm_clip_terminal_rewards:
+                        scaled_termination = max(-self.dm_terminal_reward_clip_value, 
+                                                 min(self.dm_terminal_reward_clip_value, scaled_termination))
+                    reward_components['total_reward'] += scaled_termination
+                    # Store the scaled version for logging
+                    reward_components['termination_reward_scaled'] = scaled_termination
                 else:
                     # Normal mode: Add termination reward to existing total
                     reward_components['total_reward'] += termination_reward
@@ -1327,17 +1345,30 @@ class DurotaxisEnv(gym.Env):
                                      for node in node_features]
                         centroid_x = sum(x_positions) / len(x_positions)
             
-            # Calculate distance penalty: -(goal_x - centroid_x) / goal_x
-            # As centroid approaches goal, penalty approaches 0
-            # If centroid is at or past goal, penalty is 0 or positive (reward)
-            if self.goal_x > 0:
-                distance_penalty = -(self.goal_x - centroid_x) / self.goal_x
+            # === DISTANCE MODE OPTIMIZATION ===
+            # Use delta distance shaping (potential-based) for faster learning
+            if self.dm_use_delta_distance and self._prev_centroid_x is not None and self.goal_x > 0:
+                # Delta distance shaping: reward = scale × (cx_t - cx_{t-1}) / goal_x
+                # Potential-based: Φ(s) = cx / goal_x, preserves optimal policy
+                # Positive when moving right, negative when moving left
+                delta_x = centroid_x - self._prev_centroid_x
+                distance_signal = self.dm_distance_reward_scale * (delta_x / self.goal_x)
             else:
-                distance_penalty = 0.0
+                # Fallback: Static distance penalty (original behavior)
+                # Calculate distance penalty: -(goal_x - centroid_x) / goal_x
+                # As centroid approaches goal, penalty approaches 0
+                # If centroid is at or past goal, penalty is 0 or positive (reward)
+                if self.goal_x > 0:
+                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
+                else:
+                    distance_signal = 0.0
             
-            # Set total reward to distance penalty only
-            total_reward = distance_penalty
-            graph_reward = distance_penalty
+            # Update previous centroid for next step
+            self._prev_centroid_x = centroid_x
+            
+            # Set total reward to distance signal only
+            total_reward = distance_signal
+            graph_reward = distance_signal
             
             # Zero out all other components
             spawn_reward = 0.0
@@ -2392,6 +2423,9 @@ class DurotaxisEnv(gym.Env):
         # Reset centroid tracking for fail termination
         self.centroid_history = []
         self.consecutive_left_moves = 0
+        
+        # Reset previous centroid for delta distance computation (distance mode optimization)
+        self._prev_centroid_x = None
         
         # Reset topology history
         self.topology_history = []
