@@ -662,6 +662,25 @@ class DurotaxisTrainer:
         self.start_episode = 0  # For resume training
         self.last_checkpoint_filename = None  # Track last saved checkpoint for loss metrics
         
+        # Model selection configuration (hierarchical best model tracking)
+        model_sel_config = config.get('model_selection', {})
+        self.model_sel_primary_metric = model_sel_config.get('primary_metric', 'success_rate')
+        self.model_sel_primary_weight = float(model_sel_config.get('primary_weight', 1000.0))
+        self.model_sel_secondary_metric = model_sel_config.get('secondary_metric', 'progress')
+        self.model_sel_secondary_weight = float(model_sel_config.get('secondary_weight', 100.0))
+        self.model_sel_tertiary_metric = model_sel_config.get('tertiary_metric', 'return_mean')
+        self.model_sel_tertiary_weight = float(model_sel_config.get('tertiary_weight', 1.0))
+        self.model_sel_window_episodes = int(model_sel_config.get('window_episodes', 50))
+        self.model_sel_min_improvement = float(model_sel_config.get('min_improvement', 0.01))
+        
+        # Best model tracking state
+        self.best_model_score = None  # Composite score (weighted sum of metrics)
+        self.best_model_filename = None  # Filename of current best model
+        self.best_model_metrics = {}  # Dict of individual metric values at best
+        
+        # Episode history for model selection (rolling window)
+        self.episode_history = []  # List of dicts with {success, final_centroid_x, goal_x, return}
+        
         # Adaptive terminal scale scheduler (for distance mode optimization)
         # Gradually reduces terminal reward influence as rightward progress becomes consistent
         env_config = self.config_loader.config.get('environment', {})
@@ -3181,6 +3200,91 @@ class DurotaxisTrainer:
         
         return losses
 
+    def _compute_model_selection_kpis(self) -> dict:
+        """
+        Compute KPIs for model selection from episode history.
+        
+        Returns:
+            dict with keys: success_rate, progress, return_mean
+        """
+        if not self.episode_history:
+            return {'success_rate': 0.0, 'progress': 0.0, 'return_mean': 0.0}
+        
+        # Use last N episodes from window
+        window_size = min(self.model_sel_window_episodes, len(self.episode_history))
+        recent_episodes = self.episode_history[-window_size:]
+        
+        # Compute success rate
+        successes = [1.0 if ep.get('success', False) else 0.0 for ep in recent_episodes]
+        success_rate = sum(successes) / max(1, len(successes))
+        
+        # Compute progress (mean final_centroid_x / goal_x)
+        progress_values = []
+        for ep in recent_episodes:
+            goal_x = max(1.0, float(ep.get('goal_x', 1.0)))
+            final_cx = float(ep.get('final_centroid_x', 0.0))
+            # Clamp to [0, 1] range
+            progress_values.append(max(0.0, min(1.0, final_cx / goal_x)))
+        progress = sum(progress_values) / max(1, len(progress_values))
+        
+        # Compute mean return
+        returns = [float(ep.get('return', 0.0)) for ep in recent_episodes]
+        return_mean = sum(returns) / max(1, len(returns))
+        
+        return {
+            'success_rate': float(success_rate),
+            'progress': float(progress),
+            'return_mean': float(return_mean)
+        }
+    
+    def _compute_composite_score(self, kpis: dict) -> float:
+        """
+        Compute weighted composite score for model selection.
+        
+        Uses hierarchical weighting: primary >> secondary >> tertiary
+        
+        Args:
+            kpis: dict with success_rate, progress, return_mean
+            
+        Returns:
+            composite_score: weighted sum (higher is better)
+        """
+        score = 0.0
+        
+        # Primary metric (e.g., success_rate with weight 1000)
+        if self.model_sel_primary_metric in kpis:
+            score += self.model_sel_primary_weight * kpis[self.model_sel_primary_metric]
+        
+        # Secondary metric (e.g., progress with weight 100)
+        if self.model_sel_secondary_metric in kpis:
+            score += self.model_sel_secondary_weight * kpis[self.model_sel_secondary_metric]
+        
+        # Tertiary metric (e.g., return_mean with weight 1)
+        if self.model_sel_tertiary_metric in kpis:
+            score += self.model_sel_tertiary_weight * kpis[self.model_sel_tertiary_metric]
+        
+        return float(score)
+    
+    def _should_save_best_model(self, kpis: dict, composite_score: float) -> bool:
+        """
+        Determine if current model should be saved as best.
+        
+        Args:
+            kpis: current KPI dict
+            composite_score: current composite score
+            
+        Returns:
+            True if this is a new best (with hysteresis threshold)
+        """
+        if self.best_model_score is None:
+            # First evaluation
+            return True
+        
+        # Check if improvement exceeds threshold (hysteresis)
+        improvement = (composite_score - self.best_model_score) / max(abs(self.best_model_score), 1e-6)
+        
+        return improvement >= self.model_sel_min_improvement
+
     def _compute_rightward_progress_rate(self, episode_count: int) -> float:
         """
         Compute rightward progress rate over the last window_size episodes.
@@ -3271,6 +3375,36 @@ class DurotaxisTrainer:
         self.scheduler.step()
         self.save_spawn_statistics(episode_count)
         self.save_reward_statistics(episode_count)
+        
+        # Track episode data for model selection
+        if states:  # Only track if episode had valid data
+            # Get final centroid position from last state
+            final_state = states[-1] if states else None
+            final_centroid_x = 0.0
+            if final_state is not None and hasattr(self.env, 'topology'):
+                try:
+                    # Extract centroid from topology
+                    from state import TopologyState
+                    state_ext = TopologyState()
+                    state_ext.set_topology(self.env.topology)
+                    state_features = state_ext.get_state_features(include_substrate=False)
+                    if state_features['num_nodes'] > 0:
+                        graph_features = state_features.get('graph_features', [0, 0, 0, 0])
+                        final_centroid_x = graph_features[3].item() if hasattr(graph_features[3], 'item') else graph_features[3]
+                except:
+                    final_centroid_x = 0.0
+            
+            episode_data = {
+                'success': bool(success),
+                'final_centroid_x': float(final_centroid_x),
+                'goal_x': float(getattr(self.env, 'goal_x', 1.0)),
+                'return': float(episode_total_reward)
+            }
+            self.episode_history.append(episode_data)
+            
+            # Keep only recent window to avoid memory bloat
+            if len(self.episode_history) > self.model_sel_window_episodes * 2:
+                self.episode_history = self.episode_history[-self.model_sel_window_episodes:]
         
         # Update adaptive terminal scale scheduler (distance mode optimization)
         self._update_terminal_scale_scheduler(episode_count)
@@ -3585,13 +3719,36 @@ class DurotaxisTrainer:
                           f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
                           f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
                 
-                # Save best model (check against best episode in this batch)
-                if best_batch_reward is not None:
-                    if best_batch_reward > self.best_total_reward:
-                        prev_best = self.best_total_reward
-                        self.best_total_reward = best_batch_reward
-                        self.save_model(f"best_model_batch{batch_count}.pt", episode_count)
-                        print(f"💾 Best model saved at batch {batch_count} with reward: {best_batch_reward:.3f} (previous: {prev_best:.3f})")
+                # ==========================================
+                # PHASE 5: MODEL SELECTION & CHECKPOINTING
+                # ==========================================
+                
+                # Compute model selection KPIs and composite score
+                kpis = self._compute_model_selection_kpis()
+                composite_score = self._compute_composite_score(kpis)
+                
+                # Check if this is a new best model
+                if self._should_save_best_model(kpis, composite_score):
+                    prev_score = self.best_model_score
+                    self.best_model_score = composite_score
+                    self.best_model_metrics = kpis.copy()
+                    self.best_model_filename = f"best_model_batch{batch_count}.pt"
+                    
+                    # Save the best model
+                    self.save_model(self.best_model_filename, episode_count)
+                    
+                    # Print detailed improvement message
+                    if prev_score is None:
+                        print(f"💾 Best model saved (initial): {self.best_model_filename}")
+                    else:
+                        improvement_pct = ((composite_score - prev_score) / max(abs(prev_score), 1e-6)) * 100
+                        print(f"💾 NEW BEST model saved: {self.best_model_filename} (score: {composite_score:.2f}, +{improvement_pct:.1f}%)")
+                    
+                    print(f"   📊 Metrics: success_rate={kpis['success_rate']:.3f}, progress={kpis['progress']:.3f}, return_mean={kpis['return_mean']:.2f}")
+                
+                # Keep old best_total_reward for backward compatibility
+                if best_batch_reward is not None and best_batch_reward > self.best_total_reward:
+                    self.best_total_reward = best_batch_reward
                 
                 # Periodic saves (only if checkpoint_every is configured)
                 if self.checkpoint_every is not None and batch_count % (self.checkpoint_every // self.rollout_batch_size) == 0 and batch_count > 0:
@@ -3869,13 +4026,31 @@ class DurotaxisTrainer:
     def save_loss_statistics(self, episode: int, batch_num: int = None, best_reward: float = None) -> None:
         """Save per-batch losses and best reward to JSON file for analysis"""
         metrics_path = os.path.join(self.run_dir, 'loss_metrics.json')
+        
+        # Compute current model selection KPIs
+        kpis = self._compute_model_selection_kpis()
+        composite_score = self._compute_composite_score(kpis)
+        
         metrics = {
             'episode': episode,
             'batch': batch_num,
             'loss': self.losses['total_loss'][-1] if self.losses['total_loss'] else None,
             'smoothed_loss': self.smoothed_losses[-1] if self.smoothed_losses else None,
             'best_reward': float(best_reward) if best_reward is not None else None,
-            'checkpoint_filename': self.last_checkpoint_filename  # Track which checkpoint contains this episode
+            'checkpoint_filename': self.last_checkpoint_filename,  # Track which checkpoint contains this episode
+            
+            # Model selection metrics (NEW)
+            'model_selection': {
+                'composite_score': float(composite_score),
+                'best_composite_score': float(self.best_model_score) if self.best_model_score is not None else None,
+                'best_model_filename': self.best_model_filename,
+                'kpis': {
+                    'success_rate': float(kpis['success_rate']),
+                    'progress': float(kpis['progress']),
+                    'return_mean': float(kpis['return_mean'])
+                },
+                'best_kpis': self.best_model_metrics.copy() if self.best_model_metrics else None
+            }
         }
         # Append to file
         if os.path.exists(metrics_path):
