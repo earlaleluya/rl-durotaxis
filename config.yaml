@@ -615,7 +615,7 @@ algorithm:
     # These are reasonable defaults that encourage stable growth.
     stage_1_fixed_spawn_params:
       gamma: 5.0
-      alpha: 1.0
+      alpha: 2.0
       noise: 0.1
       theta: 0.0
   
@@ -653,29 +653,7 @@ experimental:
   # Substrate variation
   substrate_variation: true     # Enable substrate parameter variation during training
   
-  # CURRICULUM LEARNING - Now using advanced 3-stage system from trainer section
-  # The old simple 3-phase system is DEPRECATED and replaced by the comprehensive
-  # curriculum_learning configuration in the trainer section above.
-  # That system includes reward multipliers, milestone tracking, and adaptive progression.
-  curriculum_learning:
-    enable_curriculum: false          # DISABLED: Use trainer curriculum instead
-    # Legacy phase configuration kept for reference but not used
-    phase_1_episodes: 60
-    phase_2_episodes: 120
-    phase_1_config:
-      max_critical_nodes: 30
-      init_num_nodes: 3
-      no_nodes_penalty_multiplier: 0.5
-    phase_2_config:
-      max_critical_nodes: 40
-      init_num_nodes: 2
-      no_nodes_penalty_multiplier: 0.75
-    phase_3_config:
-      max_critical_nodes: 50
-      init_num_nodes: 1
-      no_nodes_penalty_multiplier: 1.0
-  
-  # NEW: Enhanced success criteria
+  # Enhanced success criteria
   success_criteria:
     enable_multiple_criteria: true    # Use multiple success definitions
     survival_success_steps: 10        # Maintain nodes for 10+ steps
