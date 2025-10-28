@@ -1,0 +1,66 @@
+[
+  {
+    "episode": 149,
+    "batch": 0,
+    "loss": 6459.707578716856,
+    "smoothed_loss": 6459.707578716856,
+    "best_reward": 314.3590790762925,
+    "checkpoint_filename": null
+  },
+  {
+    "episode": 291,
+    "batch": 1,
+    "loss": 6958.632309422348,
+    "smoothed_loss": 6709.169944069602,
+    "best_reward": 288.21372770459107,
+    "checkpoint_filename": "best_model_batch0.pt"
+  },
+  {
+    "episode": 367,
+    "batch": 2,
+    "loss": 17649.190755208332,
+    "smoothed_loss": 10355.843547782511,
+    "best_reward": 470.247231471041,
+    "checkpoint_filename": "best_model_batch0.pt"
+  },
+  {
+    "episode": 405,
+    "batch": 3,
+    "loss": 34340.68835449219,
+    "smoothed_loss": 16352.05474945993,
+    "best_reward": 1350.6541296702594,
+    "checkpoint_filename": "best_model_batch2.pt"
+  },
+  {
+    "episode": 431,
+    "batch": 4,
+    "loss": 57086.947443181816,
+    "smoothed_loss": 24499.033288204308,
+    "best_reward": 3311.131529615399,
+    "checkpoint_filename": "best_model_batch3.pt"
+  },
+  {
+    "episode": 465,
+    "batch": 5,
+    "loss": 50805.69370404412,
+    "smoothed_loss": 28883.47669084428,
+    "best_reward": 4142.188061390974,
+    "checkpoint_filename": "best_model_batch4.pt"
+  },
+  {
+    "episode": 497,
+    "batch": 6,
+    "loss": 51733.22679227941,
+    "smoothed_loss": 32147.726705335015,
+    "best_reward": 2087.2022630694714,
+    "checkpoint_filename": "best_model_batch5.pt"
+  },
+  {
+    "episode": 526,
+    "batch": 7,
+    "loss": 56197.33084753788,
+    "smoothed_loss": 35153.92722311037,
+    "best_reward": 3721.2513455500784,
+    "checkpoint_filename": "best_model_batch5.pt"
+  }
+]
