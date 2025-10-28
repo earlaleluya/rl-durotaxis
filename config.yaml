@@ -18,11 +18,35 @@ trainer:
   
   # Resume training configuration
   resume_training:
-    enabled: true                      # Set to true to resume from checkpoint
-    checkpoint_path: "training_results/run0013/best_model_batch5.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
+    enabled: false                      # Set to true to resume from checkpoint
+    checkpoint_path: ""               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
-    reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
-    reset_episode_count: true          # If true, restart episode counter from 0
+    reset_optimizer: false              # If true, create fresh optimizer (useful if changing learning rate)
+    reset_episode_count: false          # If true, restart episode counter from 0
+  
+  # ============================================================================
+  # MODEL SELECTION - Best Model Checkpointing Strategy
+  # ============================================================================
+  # Determines which metric to use for identifying the "best" model checkpoint.
+  # Uses a hierarchical system: primary → secondary → tertiary for tie-breaking.
+  model_selection:
+    # Primary metric: Success rate (goal achievement)
+    primary_metric: success_rate       # Fraction of episodes that reach the goal
+    primary_weight: 1000.0              # High weight for prioritization
+    
+    # Secondary metric: Progress (how far the agent gets)
+    secondary_metric: progress         # Mean final_centroid_x / goal_x
+    secondary_weight: 100.0             # Medium weight
+    
+    # Tertiary metric: Return (episodic reward sum)
+    tertiary_metric: return_mean       # Mean episodic return
+    tertiary_weight: 1.0                # Low weight (tie-breaker)
+    
+    # Averaging window for computing metrics
+    window_episodes: 50                 # Average over last 50 episodes for stability
+    
+    # Improvement threshold (hysteresis to avoid frequent saves)
+    min_improvement: 0.01               # Save only if composite score improves by ≥1%
   
   # ============================================================================
   # CURRICULUM LEARNING SYSTEM - Progressive Migration Training
@@ -342,8 +366,8 @@ environment:
   
   # Node and topology parameters - RELAXED for learning
   init_num_nodes: 5              # Start with more nodes for stability
-  max_critical_nodes: 75         # Allow more nodes
-  threshold_critical_nodes: 500  # GREATLY INCREASED: Allow agent to explore without premature termination
+  max_critical_nodes: 50         # Allow more nodes
+  threshold_critical_nodes: 100  # GREATLY INCREASED: Allow agent to explore without premature termination
   max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
