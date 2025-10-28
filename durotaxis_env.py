@@ -2100,18 +2100,18 @@ class DurotaxisEnv(gym.Env):
                     print(f"   Current centroid: {current_centroid:.2f}, Previous: {previous_centroid:.2f}")
                     return True, self.leftward_drift_penalty
 
-        # 5. Terminate if one node from the graph reaches the rightmost location ('success termination')
+        # 5. Terminate if one node from the graph reaches the rightmost area ('success termination')
         if state['num_nodes'] > 0:
-            # Get substrate width to determine rightmost position
+            # Get substrate width to determine success threshold (last 5% of width)
             substrate_width = self.substrate.width
-            rightmost_x = substrate_width - 1  # Rightmost valid x-coordinate
+            success_threshold = substrate_width * 0.95  # Success when reaching 95% of width (last 5% area)
             
             # Check each node's x-position (first element of node_features)
             node_features = state['node_features']
             for i in range(state['num_nodes']):
                 node_x = node_features[i][0].item()  # x-coordinate
-                if node_x >= rightmost_x:
-                    print(f"🎯 Episode terminated: Node {i} reached rightmost location (x={node_x:.2f} >= {rightmost_x}) - SUCCESS!")
+                if node_x >= success_threshold:
+                    print(f"🎯 Episode terminated: Node {i} reached rightmost area (x={node_x:.2f} >= {success_threshold:.2f}, {(node_x/substrate_width)*100:.1f}% of width) - SUCCESS!")
                     return True, self.success_reward
 
         # 6. Terminate if max_time_steps is reached
