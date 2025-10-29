@@ -2531,7 +2531,15 @@ class DurotaxisTrainer:
                     final_output = self.network(final_state_dict, deterministic=True)
                     final_values = final_output['value_predictions']
         
-        success = not done or episode_length >= 150  # Consider long episodes successful
+        # Determine success based on termination reward (if episode terminated)
+        success = False
+        if terminated and rewards:
+            # Check if the last reward contains a positive termination reward (success)
+            # success_reward is typically a large positive value (e.g., 500.0)
+            termination_reward = rewards[-1].get('termination_reward', 0.0)
+            # Success is indicated by positive termination reward (reaching goal)
+            # Negative termination rewards indicate failures (penalties)
+            success = termination_reward > 0
         
         return states, actions_taken, rewards, values, log_probs_list, final_values, terminated, success
     

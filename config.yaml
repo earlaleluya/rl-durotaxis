@@ -309,7 +309,7 @@ environment:
   #                                   out_of_bounds_penalty, leftward_drift_penalty, timeout_penalty
   # NO positive rewards for spawning/movement/milestones (proper deletions give 0 instead of positive reward).
   # Use this to test if the agent can learn node management purely from penalties and outcome feedback.
-  simple_delete_only_mode: false  # Set to true to enable simplified reward system
+  simple_delete_only_mode: true  # Set to true to enable simplified reward system
   
   # ============================================================================
   # EXPERIMENTAL: Centroid-to-Goal Distance Penalty Mode
@@ -355,7 +355,7 @@ environment:
   #   - If simple_delete_only_mode=True OR centroid_distance_only_mode=True (special modes):
   #     Set this to True to include termination rewards, False to exclude them
   # Default: false (special modes exclude termination rewards by default for pure learning)
-  include_termination_rewards: false
+  include_termination_rewards: true  # ENABLED to help agent learn goal achievement
   
   # Basic environment parameters - EXPANDED for successful migration
   substrate_size: [200, 400]  # Much larger substrate (3x width)

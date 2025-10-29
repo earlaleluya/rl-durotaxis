@@ -200,8 +200,8 @@ class DurotaxisEnv(gym.Env):
     metadata = {"render_fps": 30}
 
     def __init__(self, 
-                 config_path: str = "config.yaml",
-                 **overrides):
+                 config_path: str | dict | None = None,
+                 **kwargs):
         """
         Initialize DurotaxisEnv with configuration from YAML file
         
@@ -219,7 +219,7 @@ class DurotaxisEnv(gym.Env):
         config = config_loader.get_environment_config()
         
         # Apply overrides
-        for key, value in overrides.items():
+        for key, value in kwargs.items():
             if value is not None:
                 config[key] = value
         
@@ -235,9 +235,9 @@ class DurotaxisEnv(gym.Env):
         # Encoder configuration from trainer overrides or config
         encoder_config = config_loader.get_encoder_config()
         # Note: hidden_dim was moved to actor_critic section, so we use trainer overrides or fallback
-        self.encoder_hidden_dim = overrides.get('encoder_hidden_dim', 128)  # Default fallback since hidden_dim was removed from encoder config
-        self.encoder_out_dim = overrides.get('encoder_output_dim', encoder_config.get('out_dim', 64))
-        self.encoder_num_layers = overrides.get('encoder_num_layers', encoder_config.get('num_layers', 4))
+        self.encoder_hidden_dim = kwargs.get('encoder_hidden_dim', 128)  # Default fallback since hidden_dim was removed from encoder config
+        self.encoder_out_dim = kwargs.get('encoder_output_dim', encoder_config.get('out_dim', 64))
+        self.encoder_num_layers = kwargs.get('encoder_num_layers', encoder_config.get('num_layers', 4))
         
         # Simulation parameters
         self.delta_time = config.get('delta_time', 3)
@@ -256,19 +256,18 @@ class DurotaxisEnv(gym.Env):
         #   - If both modes are False: Always use termination rewards (default True, ignored)
         #   - If either mode is True: User must explicitly set this to True to include termination rewards
         self.include_termination_rewards = config.get('include_termination_rewards', False)
-        
-        # Distance mode optimization parameters (for centroid_distance_only_mode)
-        # These parameters enable delta distance shaping and scaled termination rewards
+
+        # Distance-mode parameters
         dm = config.get('distance_mode', {})
-        self.dm_use_delta_distance = bool(dm.get('use_delta_distance', True))
-        self.dm_distance_reward_scale = float(dm.get('distance_reward_scale', 5.0))
-        self.dm_terminal_reward_scale = float(dm.get('terminal_reward_scale', 0.02))
-        self.dm_clip_terminal_rewards = bool(dm.get('clip_terminal_rewards', True))
-        self.dm_terminal_reward_clip_value = float(dm.get('terminal_reward_clip_value', 10.0))
-        # Note: Scheduler-related parameters (adaptive terminal scale reduction) are managed by the training script
-        # Previous centroid position for delta distance computation (initialized in reset())
+        self.dm_use_delta = bool(dm.get('use_delta_distance', True))
+        self.dm_dist_scale = float(dm.get('distance_reward_scale', 5.0))
+        self.dm_term_scale = float(dm.get('terminal_reward_scale', 0.02))
+        self.dm_term_clip = bool(dm.get('clip_terminal_rewards', True))
+        self.dm_term_clip_val = float(dm.get('terminal_reward_clip_value', 10.0))
+        self.dm_delete_scale = float(dm.get('delete_penalty_scale', 1.0))
+        # Scheduler knobs already wired in trainer (optional)
         self._prev_centroid_x = None
-        
+
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
             'connectivity_penalty': 10.0,
@@ -1001,23 +1000,33 @@ class DurotaxisEnv(gym.Env):
             
             # Determine if termination rewards should be included
             is_normal_mode = not self.simple_delete_only_mode and not self.centroid_distance_only_mode
+            is_combined_mode = self.simple_delete_only_mode and self.centroid_distance_only_mode
             is_special_mode_with_termination = (self.simple_delete_only_mode or self.centroid_distance_only_mode) and self.include_termination_rewards
             
             # Include termination rewards if:
             # 1. Normal mode (both special modes disabled), OR
             # 2. Special mode with include_termination_rewards=True
             if is_normal_mode or is_special_mode_with_termination:
-                if self.simple_delete_only_mode:
-                    # Simple delete mode: Replace total with graph_reward + termination
+                if is_combined_mode:
+                    # Combined mode: Distance + Delete + Scaled Termination
+                    # Apply scaled and clipped termination (prioritize distance signal)
+                    scaled_termination = termination_reward * self.dm_term_scale
+                    if self.dm_term_clip:
+                        scaled_termination = max(-self.dm_term_clip_val, 
+                                                 min(self.dm_term_clip_val, scaled_termination))
+                    reward_components['total_reward'] += scaled_termination
+                    reward_components['termination_reward_scaled'] = scaled_termination
+                elif self.simple_delete_only_mode:
+                    # Simple delete mode only: Replace total with graph_reward + termination
                     reward_components['total_reward'] = (
                         reward_components.get('graph_reward', 0.0) + termination_reward
                     )
                 elif self.centroid_distance_only_mode:
-                    # Centroid distance mode: Apply scaled and clipped termination
-                    scaled_termination = termination_reward * self.dm_terminal_reward_scale
-                    if self.dm_clip_terminal_rewards:
-                        scaled_termination = max(-self.dm_terminal_reward_clip_value, 
-                                                 min(self.dm_terminal_reward_clip_value, scaled_termination))
+                    # Centroid distance mode only: Apply scaled and clipped termination
+                    scaled_termination = termination_reward * self.dm_term_scale
+                    if self.dm_term_clip:
+                        scaled_termination = max(-self.dm_term_clip_val, 
+                                                 min(self.dm_term_clip_val, scaled_termination))
                     reward_components['total_reward'] += scaled_termination
                     # Store the scaled version for logging
                     reward_components['termination_reward_scaled'] = scaled_termination
@@ -1042,7 +1051,7 @@ class DurotaxisEnv(gym.Env):
             'reward_breakdown': reward_components,  # Detailed reward information as dictionary
             'empty_graph_recovered': empty_graph_recovered,
             'empty_graph_recovery_attempts': self.empty_graph_recovery_attempts,
-            'empty_graph_recoveries_this_episode': self.empty_graph_recoveries_this_episode
+            'empty_graph_recoveries_this_episode': self.empty_graph_recovery_attempts
         }
         
         # 📊 One-line performance summary with boundary warnings
@@ -1298,9 +1307,73 @@ class DurotaxisEnv(gym.Env):
         # Final combined reward
         total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
         
+        # === COMBINED MODE: Distance Shaping + Delete Penalties ===
+        # When BOTH modes are enabled, combine distance shaping with delete penalties
+        if self.simple_delete_only_mode and self.centroid_distance_only_mode:
+            # === 1. Calculate Distance Signal (Dense, Directional) ===
+            centroid_x = 0.0
+            if num_nodes > 0:
+                try:
+                    graph_features = new_state.get('graph_features')
+                    if graph_features is not None:
+                        if isinstance(graph_features, torch.Tensor):
+                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                        else:
+                            centroid_x = graph_features[3]
+                except (IndexError, TypeError):
+                    # Fallback: calculate centroid from node positions
+                    node_features = new_state.get('node_features', [])
+                    if len(node_features) > 0:
+                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                     for node in node_features]
+                        centroid_x = sum(x_positions) / len(x_positions)
+            
+            # Use delta distance shaping (potential-based) for rightward migration
+            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
+                # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
+                # Positive when moving right, negative when moving left
+                delta_x = centroid_x - self._prev_centroid_x
+                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
+            else:
+                # Fallback: static distance penalty
+                if self.goal_x > 0:
+                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
+                else:
+                    distance_signal = 0.0
+            
+            # Update previous centroid for next step
+            self._prev_centroid_x = centroid_x
+            
+            # === 2. Calculate Delete Penalties (Efficient Node Management) ===
+            # Extract only the delete penalties from delete_reward
+            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
+            
+            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
+            growth_penalty_only = 0.0
+            if num_nodes > self.max_critical_nodes:
+                excess_nodes = num_nodes - self.max_critical_nodes
+                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
+            
+            # Combine delete penalties
+            delete_penalties_total = growth_penalty_only + delete_penalty_only
+            
+            # === 3. Combine Distance + Delete ===
+            total_reward = distance_signal + delete_penalties_total
+            graph_reward = distance_signal + delete_penalties_total
+            
+            # Zero out all other components (keep reward focused)
+            spawn_reward = 0.0
+            delete_reward = delete_penalties_total  # Keep for logging
+            efficiency_reward = 0.0
+            edge_reward = 0.0
+            centroid_reward = 0.0
+            milestone_reward = 0.0
+            total_node_reward = 0.0
+            survival_reward = 0.0
+        
         # === SIMPLE DELETE-ONLY MODE ===
         # When enabled, zero out all rewards except delete penalties (Rule 1 & 2) and growth penalty (Rule 0)
-        if self.simple_delete_only_mode:
+        elif self.simple_delete_only_mode:
             # Extract only the delete penalties from delete_reward
             # In simple mode, we want ONLY penalties, no positive rewards
             delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
@@ -1323,6 +1396,7 @@ class DurotaxisEnv(gym.Env):
             milestone_reward = 0.0
             total_node_reward = 0.0
             survival_reward = 0.0
+        
         
         # === CENTROID-TO-GOAL DISTANCE-ONLY MODE ===
         # When enabled, provide ONLY distance-based penalty from centroid to goal
