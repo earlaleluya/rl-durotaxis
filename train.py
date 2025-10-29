@@ -3424,11 +3424,11 @@ class DurotaxisTrainer:
         
         # Trigger scale reduction if consecutive threshold is met
         if self._dm_consecutive_good_windows >= self.dm_scheduler_consecutive_windows:
-            current_scale = self.env.dm_terminal_reward_scale
+            current_scale = self.env.dm_term_scale
             new_scale = max(current_scale * self.dm_scheduler_decay_rate, self.dm_scheduler_min_scale)
             
             if new_scale != current_scale:
-                self.env.dm_terminal_reward_scale = new_scale
+                self.env.dm_term_scale = new_scale
                 self._dm_terminal_scale_history.append((episode_count, new_scale))
                 print(f"🔧 Adaptive Scheduler: Reduced terminal_reward_scale: {current_scale:.4f} → {new_scale:.4f} (Progress: {progress_rate:.2f})")
             
@@ -4192,7 +4192,7 @@ class DurotaxisTrainer:
             'spawn_summary': dict(self.current_spawn_summary) if hasattr(self, 'current_spawn_summary') else None,
             'success': None,
             # Distance mode scheduler history
-            'dm_terminal_scale': self.env.dm_terminal_reward_scale if hasattr(self.env, 'dm_terminal_reward_scale') else None,
+            'dm_terminal_scale': self.env.dm_term_scale if hasattr(self.env, 'dm_term_scale') else None,
             'dm_progress_rate': self._dm_rightward_progress_history[-1][1] if self._dm_rightward_progress_history else None
         }
 
@@ -4262,6 +4262,11 @@ class DurotaxisTrainer:
             'episode_count': episode_count,  # Next episode to run (episodes 0 to episode_count-1 are completed)
             'smoothed_rewards': self.smoothed_rewards,
             'smoothed_losses': self.smoothed_losses,
+            # Model selection metrics (for preserving across restarts)
+            'best_model_score': self.best_model_score,
+            'best_model_metrics': self.best_model_metrics.copy() if self.best_model_metrics else {},
+            'best_model_filename': self.best_model_filename,
+            'episode_history': self.episode_history.copy() if self.episode_history else [],
         }
         
         filepath = os.path.join(self.run_dir, filename)
@@ -4363,6 +4368,27 @@ class DurotaxisTrainer:
             if 'smoothed_losses' in checkpoint:
                 self.smoothed_losses = checkpoint['smoothed_losses']
                 print(f"   ✅ Loaded smoothed losses")
+            
+            # Load model selection metrics (if available)
+            if 'best_model_score' in checkpoint:
+                self.best_model_score = checkpoint['best_model_score']
+                print(f"   ✅ Loaded best model score: {self.best_model_score:.2f}" if self.best_model_score is not None else "   ✅ Loaded best model score: None")
+            
+            if 'best_model_metrics' in checkpoint:
+                self.best_model_metrics = checkpoint['best_model_metrics']
+                if self.best_model_metrics:
+                    print(f"   ✅ Loaded best model metrics: success_rate={self.best_model_metrics.get('success_rate', 0):.3f}, "
+                          f"progress={self.best_model_metrics.get('progress', 0):.3f}")
+            
+            if 'best_model_filename' in checkpoint:
+                self.best_model_filename = checkpoint['best_model_filename']
+                if self.best_model_filename:
+                    print(f"   ✅ Loaded best model filename: {self.best_model_filename}")
+            
+            if 'episode_history' in checkpoint:
+                self.episode_history = checkpoint['episode_history']
+                if self.episode_history:
+                    print(f"   ✅ Loaded episode history: {len(self.episode_history)} episodes")
             
             print(f"✅ Resume checkpoint loaded successfully!")
             

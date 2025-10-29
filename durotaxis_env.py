@@ -981,12 +981,12 @@ class DurotaxisEnv(gym.Env):
         reward_components = self._calculate_reward(prev_state, new_state, executed_actions)
 
         # Apply penalty when empty-graph recovery was needed (discourage aggressive deletions)
-        if empty_graph_recovered:
+        # Only apply if enable_empty_graph_recovery is True (controlled by config flag)
+        if empty_graph_recovered and self.enable_empty_graph_recovery:
             recovery_penalty = self.empty_graph_recovery_penalty
             reward_components['empty_graph_recovery_penalty'] = recovery_penalty
-            # Don't add recovery penalty in centroid distance mode (only distance matters)
-            if not self.centroid_distance_only_mode:
-                reward_components['total_reward'] += recovery_penalty
+            # Apply recovery penalty to all modes when the flag is enabled
+            reward_components['total_reward'] += recovery_penalty
         
         # Reset new_node flags after reward calculation (they've served their purpose)
         self._reset_new_node_flags()
@@ -1421,12 +1421,12 @@ class DurotaxisEnv(gym.Env):
             
             # === DISTANCE MODE OPTIMIZATION ===
             # Use delta distance shaping (potential-based) for faster learning
-            if self.dm_use_delta_distance and self._prev_centroid_x is not None and self.goal_x > 0:
+            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
                 # Delta distance shaping: reward = scale × (cx_t - cx_{t-1}) / goal_x
                 # Potential-based: Φ(s) = cx / goal_x, preserves optimal policy
                 # Positive when moving right, negative when moving left
                 delta_x = centroid_x - self._prev_centroid_x
-                distance_signal = self.dm_distance_reward_scale * (delta_x / self.goal_x)
+                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
             else:
                 # Fallback: Static distance penalty (original behavior)
                 # Calculate distance penalty: -(goal_x - centroid_x) / goal_x
