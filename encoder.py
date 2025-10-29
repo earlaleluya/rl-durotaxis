@@ -56,8 +56,8 @@ class GraphInputEncoder(nn.Module):
     Graph Input Encoder using Graph Transformer architecture for durotaxis simulation.
     
     This encoder processes graph-structured data representing cellular topology with:
-    - Graph-level features (14 dimensions): Global properties [num_nodes, num_edges, density, centroid_x, centroid_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y, bbow_width, bbox_height, bbox_area, hull_area, avg_degree]
-    - Node-level features (9 dimensions): Per-cell properties [node_x, node_y, substrate_intensity, in_degree, out_degree, centrality, centroid_distance, is_boundary, new_node_flag]  
+    - Graph-level features (19 dimensions): Global properties [num_nodes, num_edges, density, centroid_x, centroid_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y, bbox_width, bbox_height, bbox_area, hull_area, avg_degree, max_degree, sum_degree, mean_intensity, max_intensity, sum_intensity]
+    - Node-level features (11 dimensions): Per-cell properties [node_x, node_y, substrate_intensity, in_degree, out_degree, centrality, centroid_distance, is_boundary, new_node_flag, age, stagnation]  
     - Edge-level features (3 dimensions): Connection properties [distances, direction_norm_x, direction_norm_y]
     
     Architecture:
@@ -67,16 +67,17 @@ class GraphInputEncoder(nn.Module):
     4. Output: Per-node embeddings for downstream policy decisions
     
     The encoder uses PyTorch Geometric's TransformerConv for efficient graph attention
-    with proper residual connections and edge-aware processing.
+    with proper residual connections and edge-aware processing. Enhanced with richer
+    pooling (mean+max+sum) for better representation capacity.
     
     Args:
         hidden_dim (int, optional): Hidden dimension for internal representations. Defaults to 128.
-        out_dim (int, optional): Output embedding dimension per node. Defaults to 64.
+        out_dim (int, optional): Output embedding dimension per node. Defaults to 128.
         num_layers (int, optional): Number of transformer layers. Defaults to 4.
         
     Input Shapes:
-        graph_features: [14] - Global graph properties
-        node_features: [num_nodes, 9] - Per-node cell properties  
+        graph_features: [19] - Global graph properties (enhanced with max/sum pooling)
+        node_features: [num_nodes, 11] - Per-node cell properties  
         edge_features: [num_edges, 3] - Per-edge connection properties
         edge_index: [2, num_edges] - Graph connectivity in COO format
         batch: [num_nodes] (optional) - Batch assignment for multiple graphs
@@ -85,13 +86,13 @@ class GraphInputEncoder(nn.Module):
         [num_nodes+1, out_dim] - Node embeddings with graph token as first element
         
     Example:
-        >>> encoder = GraphInputEncoder(hidden_dim=128, out_dim=64, num_layers=3)
-        >>> graph_feat = torch.randn(14)
-        >>> node_feat = torch.randn(5, 9)  # 5 nodes, 9 features
+        >>> encoder = GraphInputEncoder(hidden_dim=128, out_dim=128, num_layers=3)
+        >>> graph_feat = torch.randn(19)  # Enhanced with pooling stats
+        >>> node_feat = torch.randn(5, 11)  # 5 nodes, 11 features
         >>> edge_feat = torch.randn(6, 3)  # 6 edges
         >>> edge_idx = torch.randint(0, 5, (2, 6))
         >>> out = encoder(graph_feat, node_feat, edge_feat, edge_idx)
-        >>> print(out.shape)  # torch.Size([6, 64]) = [5 nodes + 1 graph token, 64]
+        >>> print(out.shape)  # torch.Size([6, 128]) = [5 nodes + 1 graph token, 128]
     """
     
     def __init__(self, config_path="config.yaml", **overrides):
@@ -122,15 +123,15 @@ class GraphInputEncoder(nn.Module):
         self.out_dim = config.get('out_dim', overrides.get('out_dim', 64))
         self.num_layers = config.get('num_layers', overrides.get('num_layers', 4))
             
-        # Graph-level MLP → virtual node
+        # Graph-level MLP → virtual node (updated to 19 dims for enhanced pooling)
         self.graph_mlp = nn.Sequential(
-            nn.Linear(14, self.hidden_dim),
+            nn.Linear(19, self.hidden_dim),  # Updated from 14 to 19
             nn.GELU(),
             nn.LayerNorm(self.hidden_dim),
             nn.Linear(self.hidden_dim, self.hidden_dim)
         )
         # Node projection
-        self.node_proj = nn.Linear(9, self.hidden_dim)
+        self.node_proj = nn.Linear(11, self.hidden_dim)
         # Edge projection
         self.edge_mlp = nn.Sequential(
             nn.Linear(3, self.hidden_dim),
@@ -208,10 +209,10 @@ class GraphInputEncoder(nn.Module):
         6. Return node embeddings with graph context
         
         Args:
-            graph_features (torch.Tensor): Global graph properties [14]
-                Features include: substrate stats, topology metrics, cell counts, etc.
-            node_features (torch.Tensor): Per-node cell properties [num_nodes, 9]  
-                Features include: position, velocity, substrate intensity, cell state, new_node flag, etc.
+            graph_features (torch.Tensor): Global graph properties [19]
+                Features include: counts, density, spatial stats, topology metrics, ENHANCED pooling (mean/max/sum)
+            node_features (torch.Tensor): Per-node cell properties [num_nodes, 11]  
+                Features include: position, velocity, substrate intensity, cell state, new_node flag, age, stagnation
             edge_features (torch.Tensor): Per-edge connection properties [num_edges, 3]
                 Features include: distance, angle, connection strength, etc.
             edge_index (torch.Tensor): Graph connectivity in COO format [2, num_edges]

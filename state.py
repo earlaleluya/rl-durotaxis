@@ -20,6 +20,11 @@ class TopologyState:
             The topology instance containing the graph and substrate
         """
         self.topology = topology
+        
+        # Track previous state for delta features
+        self._prev_centroid_x = None
+        self._prev_num_nodes = None
+        self._prev_avg_intensity = None
     
     def set_topology(self, topology):
         """Set or update the topology instance."""
@@ -40,49 +45,130 @@ class TopologyState:
             raise ValueError("No topology set. Use set_topology() first.")
         return self.topology.substrate
 
-    def get_state_features(self, include_substrate=True):
+    def get_state_features(self, include_substrate=True, node_age=None, node_stagnation=None):
         """
-        Get topology state features: graph features, node features, and edge features.
+        Get IMMUTABLE snapshot of topology state features.
+        All tensors are cloned/detached and moved to consistent device to prevent aliasing.
         
         Parameters
         ----------
         include_substrate : bool
             Whether to include substrate intensity in node features
+        node_age : dict, optional
+            Dictionary mapping persistent_id to node age (number of steps existed)
+        node_stagnation : dict, optional
+            Dictionary mapping persistent_id to stagnation info {'pos': array, 'count': int}
             
         Returns
         -------
-        dict : State dictionary containing:
-            - 'graph_features': Graph-level feature vector
-            - 'node_features': Node feature matrix [num_nodes, node_feature_dim]
-            - 'edge_attr': Edge feature matrix [num_edges, edge_feature_dim]
-            - 'edge_index': Edge connectivity (src, dst) tuples for GNN
-            - 'num_nodes': Number of nodes
-            - 'num_edges': Number of edges
+        dict : Immutable state dictionary containing:
+            - 'graph_features': Graph-level feature vector [G] (cloned)
+            - 'node_features': Node feature matrix [N, F] (cloned)
+            - 'edge_attr': Edge feature matrix [E, F] (cloned)
+            - 'edge_index': Edge connectivity (src, dst) tuples (cloned)
+            - 'persistent_id': Node persistent IDs [N] (cloned)
+            - 'to_delete': Node deletion flags [N] (cloned)
+            - 'num_nodes': Number of nodes (int)
+            - 'num_edges': Number of edges (int)
+            - 'centroid_x': Graph centroid x-coordinate (float)
+            - 'goal_x': Goal x-position (float)
+            
+        Note: 'topology' reference is NOT included to prevent aliasing.
         """
         
-        # Extract the three main feature types
-        node_features = self._get_node_features(include_substrate=include_substrate)
+        # Determine device from graph data (all tensors will use this device)
+        device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+        
+        # Extract features (these return tensors on the graph's device)
+        node_features = self._get_node_features(
+            include_substrate=include_substrate,
+            node_age=node_age,
+            node_stagnation=node_stagnation
+        )
         edge_features = self._get_edge_features()
         graph_features = self._get_graph_features()
         
         # Get edge connectivity for GNN
         src, dst = self.graph.edges()
         
+        # Get persistent IDs - CLONE to create immutable snapshot
+        persistent_ids = self.graph.ndata.get('persistent_id', None)
+        if persistent_ids is not None:
+            persistent_ids = persistent_ids.clone().detach().to(device)
+        else:
+            persistent_ids = torch.empty(0, dtype=torch.long, device=device)
+        
+        # Get to_delete flags - CLONE to create immutable snapshot
+        to_delete_flags = self.graph.ndata.get('to_delete', None)
+        if to_delete_flags is not None:
+            to_delete_flags = to_delete_flags.clone().detach().to(device)
+        else:
+            to_delete_flags = torch.zeros(self.graph.num_nodes(), dtype=torch.float32, device=device)
+        
+        # Calculate centroid x-coordinate for distance-based rewards
+        centroid_x = 0.0
+        avg_intensity = 0.0
+        if self.graph.num_nodes() > 0:
+            positions = self.graph.ndata['pos']
+            centroid_x = float(torch.mean(positions[:, 0]).item())
+            
+            # Calculate average substrate intensity if available
+            if 'substrate_intensity' in self.graph.ndata:
+                avg_intensity = float(torch.mean(self.graph.ndata['substrate_intensity']).item())
+        
+        # Calculate delta features (change from previous state)
+        delta_centroid_x = 0.0
+        delta_num_nodes = 0
+        delta_avg_intensity = 0.0
+        
+        if self._prev_centroid_x is not None:
+            delta_centroid_x = centroid_x - self._prev_centroid_x
+        if self._prev_num_nodes is not None:
+            delta_num_nodes = self.graph.num_nodes() - self._prev_num_nodes
+        if self._prev_avg_intensity is not None:
+            delta_avg_intensity = avg_intensity - self._prev_avg_intensity
+        
+        # Update previous values for next iteration
+        self._prev_centroid_x = centroid_x
+        self._prev_num_nodes = self.graph.num_nodes()
+        self._prev_avg_intensity = avg_intensity
+        
+        # Calculate goal x-position (rightmost substrate boundary)
+        goal_x = float(self.substrate.width - 1) if self.substrate is not None else 1.0
+        
+        # Build immutable state dict with ALL tensors cloned/detached/device-consistent
+        # DO NOT include 'topology' to prevent aliasing
         state = {
-            'topology': self.topology,                   
-            'graph_features': graph_features,            # Shape: [graph_feature_dim]
-            'node_features': node_features,              # Shape: [num_nodes, node_feature_dim]
-            'edge_attr': edge_features,                  # Shape: [num_edges, edge_feature_dim]
-            'edge_index': (src, dst),                    # Edge connectivity
-            'num_nodes': self.graph.num_nodes(),
-            'num_edges': self.graph.num_edges()
+            'graph_features': graph_features.clone().detach().to(device),  # [G]
+            'node_features': node_features.clone().detach().to(device),    # [N, F]
+            'edge_attr': edge_features.clone().detach().to(device),        # [E, F]
+            'edge_index': (src.clone().detach().to(device), dst.clone().detach().to(device)),  # Cloned tuple
+            'persistent_id': persistent_ids,                                # [N] (already cloned above)
+            'to_delete': to_delete_flags,                                   # [N] (already cloned above)
+            'num_nodes': int(self.graph.num_nodes()),
+            'num_edges': int(self.graph.num_edges()),
+            'centroid_x': centroid_x,
+            'goal_x': goal_x,
+            # Delta features for temporal context (reduces partial observability)
+            'delta_centroid_x': delta_centroid_x,
+            'delta_num_nodes': delta_num_nodes,
+            'delta_avg_intensity': delta_avg_intensity
         }
         
         return state
 
-    def _get_node_features(self, include_substrate=True):
+    def _get_node_features(self, include_substrate=True, node_age=None, node_stagnation=None):
         """
         Extract node-level features for each node in the graph.
+        
+        Parameters
+        ----------
+        include_substrate : bool
+            Whether to include substrate intensity in node features
+        node_age : dict, optional
+            Dictionary mapping persistent_id to node age
+        node_stagnation : dict, optional
+            Dictionary mapping persistent_id to stagnation counter
         
         Returns
         -------
@@ -95,6 +181,8 @@ class TopologyState:
             - Distance from graph centroid
             - Boundary flag (convex hull membership)
             - New node flag (1.0 if newly spawned, 0.0 if existing)
+            - Age (normalized, 0.0 if not available)
+            - Stagnation count (normalized, 0.0 if not available)
         """
         positions = self.graph.ndata['pos']
         num_nodes = positions.shape[0]
@@ -136,6 +224,14 @@ class TopologyState:
             new_node_flags = torch.zeros(num_nodes, 1, dtype=torch.float32, device=device)
         features.append(new_node_flags)
         
+        # 8. Age feature (normalized for numerical stability)
+        age_features = self._get_age_features(num_nodes, node_age)
+        features.append(age_features)
+        
+        # 9. Stagnation feature (normalized for numerical stability)
+        stagnation_features = self._get_stagnation_features(num_nodes, node_stagnation)
+        features.append(stagnation_features)
+        
         return torch.cat(features, dim=1)
 
     def _get_edge_features(self):
@@ -176,7 +272,7 @@ class TopologyState:
 
     def _get_graph_features(self):
         """
-        Extract graph-level features.
+        Extract graph-level features with RICHER pooling for better representation.
         
         Returns
         -------
@@ -185,6 +281,7 @@ class TopologyState:
             - Basic statistics: num_nodes, num_edges, density
             - Spatial statistics: centroid, bounding box, convex hull area
             - Topological statistics: average degree
+            - ENHANCED: mean/max/sum pooling of node features for richer context
         """
         positions = self.graph.ndata['pos']
         
@@ -210,12 +307,18 @@ class TopologyState:
             bbox_size = bbox_max - bbox_min  # [2]
             bbox_area = torch.prod(bbox_size) if len(bbox_size) > 1 else bbox_size[0]  # scalar
             bbox_area = bbox_area.unsqueeze(0) if bbox_area.dim() == 0 else bbox_area  # [1]
+            
+            # ENHANCED: Add max pooling of positions for better shape representation
+            pos_max = torch.max(positions, dim=0)[0]  # [2] - rightmost and highest positions
+            pos_min = torch.min(positions, dim=0)[0]  # [2] - leftmost and lowest positions
         else:
             centroid = torch.zeros(2, device=device)
             bbox_min = torch.zeros(2, device=device)
             bbox_max = torch.zeros(2, device=device)
             bbox_size = torch.zeros(2, device=device)
             bbox_area = torch.zeros(1, device=device)
+            pos_max = torch.zeros(2, device=device)
+            pos_min = torch.zeros(2, device=device)
         
         # Add spatial features
         features.append(centroid)     # [2]
@@ -240,10 +343,31 @@ class TopologyState:
         if num_nodes > 0:
             degrees = self._get_node_degrees()
             avg_degree = torch.mean(degrees).unsqueeze(0)  # [1]
+            max_degree = torch.max(degrees).unsqueeze(0)  # [1] - ENHANCED
+            sum_degree = torch.sum(degrees).unsqueeze(0)  # [1] - ENHANCED
         else:
             avg_degree = torch.tensor([0.0], device=device)  # [1]
+            max_degree = torch.tensor([0.0], device=device)  # [1]
+            sum_degree = torch.tensor([0.0], device=device)  # [1]
         
         features.append(avg_degree)
+        features.append(max_degree)  # NEW
+        features.append(sum_degree)  # NEW
+        
+        # 5. ENHANCED: Substrate intensity statistics (mean/max/sum pooling)
+        if num_nodes > 0 and 'substrate_intensity' in self.graph.ndata:
+            intensities = self.graph.ndata['substrate_intensity'].unsqueeze(1) if self.graph.ndata['substrate_intensity'].dim() == 1 else self.graph.ndata['substrate_intensity']
+            mean_intensity = torch.mean(intensities).unsqueeze(0)  # [1]
+            max_intensity = torch.max(intensities).unsqueeze(0)   # [1]
+            sum_intensity = torch.sum(intensities).unsqueeze(0)   # [1]
+        else:
+            mean_intensity = torch.tensor([0.0], device=device)
+            max_intensity = torch.tensor([0.0], device=device)
+            sum_intensity = torch.tensor([0.0], device=device)
+        
+        features.append(mean_intensity)  # NEW
+        features.append(max_intensity)   # NEW
+        features.append(sum_intensity)   # NEW
         
         return torch.cat(features, dim=0)
 
@@ -309,6 +433,100 @@ class TopologyState:
             pass
         
         return boundary_flags
+
+    def _get_age_features(self, num_nodes, node_age):
+        """
+        Extract and normalize age features for each node.
+        
+        Age represents how many steps a node has existed. Normalized by dividing by 100
+        to keep values in a reasonable range for neural network training.
+        
+        Args:
+            num_nodes (int): Number of nodes in the graph.
+            node_age (dict or None): Dictionary mapping persistent_id -> age (int).
+                                     If None, all nodes get age 0.0.
+        
+        Returns:
+            torch.Tensor: Age features [num_nodes, 1], normalized to ~[0, 1] range.
+        """
+        # Infer device from existing graph data
+        device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata else torch.device('cpu')
+        
+        if num_nodes == 0:
+            return torch.empty(0, 1, dtype=torch.float32, device=device)
+        
+        # Initialize with zeros (default age)
+        age_features = torch.zeros(num_nodes, 1, dtype=torch.float32, device=device)
+        
+        # If no age data provided, return zeros
+        if node_age is None or len(node_age) == 0:
+            return age_features
+        
+        # Get persistent IDs for nodes
+        if 'persistent_id' not in self.graph.ndata:
+            return age_features
+        
+        persistent_ids = self.graph.ndata['persistent_id'].cpu().numpy()
+        
+        # Fill in age values from the dictionary
+        for i, pid in enumerate(persistent_ids):
+            if pid in node_age:
+                # Normalize age by dividing by 100 (typical episode length)
+                # This keeps values roughly in [0, 1] range for most episodes
+                age_features[i, 0] = node_age[pid] / 100.0
+        
+        return age_features
+
+    def _get_stagnation_features(self, num_nodes, node_stagnation):
+        """
+        Extract and normalize stagnation features for each node.
+        
+        Stagnation represents how many consecutive steps a node has not moved.
+        Normalized by dividing by 50 to keep values in a reasonable range.
+        
+        Args:
+            num_nodes (int): Number of nodes in the graph.
+            node_stagnation (dict or None): Dictionary mapping persistent_id -> {'pos': tuple, 'count': int}.
+                                            If None, all nodes get stagnation 0.0.
+        
+        Returns:
+            torch.Tensor: Stagnation features [num_nodes, 1], normalized to ~[0, 1] range.
+        """
+        # Infer device from existing graph data
+        device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata else torch.device('cpu')
+        
+        if num_nodes == 0:
+            return torch.empty(0, 1, dtype=torch.float32, device=device)
+        
+        # Initialize with zeros (default stagnation)
+        stagnation_features = torch.zeros(num_nodes, 1, dtype=torch.float32, device=device)
+        
+        # If no stagnation data provided, return zeros
+        if node_stagnation is None or len(node_stagnation) == 0:
+            return stagnation_features
+        
+        # Get persistent IDs for nodes
+        if 'persistent_id' not in self.graph.ndata:
+            return stagnation_features
+        
+        persistent_ids = self.graph.ndata['persistent_id'].cpu().numpy()
+        
+        # Fill in stagnation values from the dictionary
+        for i, pid in enumerate(persistent_ids):
+            if pid in node_stagnation:
+                # Extract count from stagnation dict (structure: {'pos': pos, 'count': count})
+                stagnation_info = node_stagnation[pid]
+                if isinstance(stagnation_info, dict) and 'count' in stagnation_info:
+                    count = stagnation_info['count']
+                else:
+                    # Fallback: if it's just a number, use it directly
+                    count = stagnation_info
+                
+                # Normalize stagnation by dividing by 50 (reasonable threshold)
+                # Values >1.0 indicate highly stagnant nodes
+                stagnation_features[i, 0] = count / 50.0
+        
+        return stagnation_features
 
 
 

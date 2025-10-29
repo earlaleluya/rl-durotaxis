@@ -200,8 +200,8 @@ class DurotaxisEnv(gym.Env):
     metadata = {"render_fps": 30}
 
     def __init__(self, 
-                 config_path: str = "config.yaml",
-                 **overrides):
+                 config_path: str | dict | None = None,
+                 **kwargs):
         """
         Initialize DurotaxisEnv with configuration from YAML file
         
@@ -219,7 +219,7 @@ class DurotaxisEnv(gym.Env):
         config = config_loader.get_environment_config()
         
         # Apply overrides
-        for key, value in overrides.items():
+        for key, value in kwargs.items():
             if value is not None:
                 config[key] = value
         
@@ -235,9 +235,9 @@ class DurotaxisEnv(gym.Env):
         # Encoder configuration from trainer overrides or config
         encoder_config = config_loader.get_encoder_config()
         # Note: hidden_dim was moved to actor_critic section, so we use trainer overrides or fallback
-        self.encoder_hidden_dim = overrides.get('encoder_hidden_dim', 128)  # Default fallback since hidden_dim was removed from encoder config
-        self.encoder_out_dim = overrides.get('encoder_output_dim', encoder_config.get('out_dim', 64))
-        self.encoder_num_layers = overrides.get('encoder_num_layers', encoder_config.get('num_layers', 4))
+        self.encoder_hidden_dim = kwargs.get('encoder_hidden_dim', 128)  # Default fallback since hidden_dim was removed from encoder config
+        self.encoder_out_dim = kwargs.get('encoder_output_dim', encoder_config.get('out_dim', 64))
+        self.encoder_num_layers = kwargs.get('encoder_num_layers', encoder_config.get('num_layers', 4))
         
         # Simulation parameters
         self.delta_time = config.get('delta_time', 3)
@@ -245,6 +245,29 @@ class DurotaxisEnv(gym.Env):
         self.flush_delay = config.get('flush_delay', 0.0001)
         self.enable_visualization = config.get('enable_visualization', True)
         
+        # Simple delete-only mode flag
+        self.simple_delete_only_mode = config.get('simple_delete_only_mode', False)
+        
+        # Centroid-to-goal distance-only mode flag
+        self.centroid_distance_only_mode = config.get('centroid_distance_only_mode', False)
+        
+        # Include termination rewards flag (for special modes)
+        # Default behavior:
+        #   - If both modes are False: Always use termination rewards (default True, ignored)
+        #   - If either mode is True: User must explicitly set this to True to include termination rewards
+        self.include_termination_rewards = config.get('include_termination_rewards', False)
+
+        # Distance-mode parameters
+        dm = config.get('distance_mode', {})
+        self.dm_use_delta = bool(dm.get('use_delta_distance', True))
+        self.dm_dist_scale = float(dm.get('distance_reward_scale', 5.0))
+        self.dm_term_scale = float(dm.get('terminal_reward_scale', 0.02))
+        self.dm_term_clip = bool(dm.get('clip_terminal_rewards', True))
+        self.dm_term_clip_val = float(dm.get('terminal_reward_clip_value', 10.0))
+        self.dm_delete_scale = float(dm.get('delete_penalty_scale', 1.0))
+        # Scheduler knobs already wired in trainer (optional)
+        self._prev_centroid_x = None
+
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
             'connectivity_penalty': 10.0,
@@ -272,7 +295,8 @@ class DurotaxisEnv(gym.Env):
         
         self.delete_reward = config.get('delete_reward', {
             'proper_deletion': 2.0,
-            'persistence_penalty': 2.0
+            'persistence_penalty': 2.0,
+            'improper_deletion_penalty': 2.0
         })
         
         self.position_rewards = config.get('position_rewards', {
@@ -293,6 +317,7 @@ class DurotaxisEnv(gym.Env):
         # Unpack reward component values for direct access
         self.delete_proper_reward = self.delete_reward['proper_deletion']
         self.delete_persistence_penalty = self.delete_reward['persistence_penalty']
+        self.delete_improper_penalty = self.delete_reward.get('improper_deletion_penalty', 2.0)
         
         self.edge_rightward_bonus = self.edge_reward['rightward_bonus']
         self.edge_leftward_penalty = self.edge_reward['leftward_penalty']
@@ -394,6 +419,11 @@ class DurotaxisEnv(gym.Env):
         self.topology_history = []
         self.dequeued_topology = None  # Store the most recently dequeued topology
         
+        # NEW: Advanced node feature tracking for intelligent deletion
+        self._node_age = {}  # Tracks age of each node by persistent_id
+        self._node_stagnation = {}  # Tracks stagnation counter for each node
+        self._stagnation_threshold = 5.0  # Distance threshold to be considered "stagnant"
+        
         # Node-level reward tracking
         self.prev_node_positions = []  # Store previous node positions for movement rewards
         self.last_reward_breakdown = None  # Store detailed reward information
@@ -432,6 +462,9 @@ class DurotaxisEnv(gym.Env):
         
         # 3. Initialize environment components
         self._setup_environment()
+        
+        # Goal X position (rightmost substrate boundary) - set after substrate is created
+        self.goal_x = self.substrate.width - 1
         
         # 4. Rendering setup complete
         
@@ -866,13 +899,26 @@ class DurotaxisEnv(gym.Env):
         self.current_step += 1
         
         # Store previous state for reward calculation
-        prev_state = self.state_extractor.get_state_features(include_substrate=True)
+        prev_state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
         prev_num_nodes = prev_state['num_nodes']
         
-        # Enqueue previous topology to history (maintain max capacity of delta_time)
-        self.topology_history.append(prev_state['topology'])
+        # Store a snapshot of topology for history tracking (not stored in state to avoid aliasing)
+        # We store just the persistent_ids and positions for history purposes
+        topology_snapshot = {
+            'persistent_ids': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0),
+            'num_nodes': prev_state['num_nodes'],
+            'num_edges': prev_state['num_edges'],
+            'centroid_x': prev_state['centroid_x']
+        }
+        
+        # Enqueue topology snapshot to history (maintain max capacity of delta_time)
+        self.topology_history.append(topology_snapshot)
         if len(self.topology_history) > self.delta_time:
-            # Dequeue the oldest topology to maintain capacity
+            # Dequeue the oldest snapshot to maintain capacity
             self.dequeued_topology = self.topology_history.pop(0)  # Remove from front (FIFO)
         
         # Check for empty graph BEFORE executing actions to prevent policy from seeing invalid state
@@ -904,7 +950,18 @@ class DurotaxisEnv(gym.Env):
                 executed_actions = {}
         
         # Get new state after actions
-        new_state = self.state_extractor.get_state_features(include_substrate=True)
+        new_state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
+
+        # NEW: Update and inject advanced node features (age, stagnation)
+        self._update_and_inject_node_features(new_state)
+
+        # NEW: Heuristically mark nodes for deletion based on lab rules
+        # This provides intelligent guidance to the agent about what to prune
+        self._heuristically_mark_nodes_for_deletion()
 
         # Attempt graceful recovery if topology collapsed to zero nodes AFTER actions
         empty_graph_recovered_post = False
@@ -924,9 +981,11 @@ class DurotaxisEnv(gym.Env):
         reward_components = self._calculate_reward(prev_state, new_state, executed_actions)
 
         # Apply penalty when empty-graph recovery was needed (discourage aggressive deletions)
-        if empty_graph_recovered:
+        # Only apply if enable_empty_graph_recovery is True (controlled by config flag)
+        if empty_graph_recovered and self.enable_empty_graph_recovery:
             recovery_penalty = self.empty_graph_recovery_penalty
             reward_components['empty_graph_recovery_penalty'] = recovery_penalty
+            # Apply recovery penalty to all modes when the flag is enabled
             reward_components['total_reward'] += recovery_penalty
         
         # Reset new_node flags after reward calculation (they've served their purpose)
@@ -938,8 +997,43 @@ class DurotaxisEnv(gym.Env):
         # Add termination reward to the reward components
         if terminated:
             reward_components['termination_reward'] = termination_reward
-            # Update total reward to include termination reward
-            reward_components['total_reward'] += termination_reward
+            
+            # Determine if termination rewards should be included
+            is_normal_mode = not self.simple_delete_only_mode and not self.centroid_distance_only_mode
+            is_combined_mode = self.simple_delete_only_mode and self.centroid_distance_only_mode
+            is_special_mode_with_termination = (self.simple_delete_only_mode or self.centroid_distance_only_mode) and self.include_termination_rewards
+            
+            # Include termination rewards if:
+            # 1. Normal mode (both special modes disabled), OR
+            # 2. Special mode with include_termination_rewards=True
+            if is_normal_mode or is_special_mode_with_termination:
+                if is_combined_mode:
+                    # Combined mode: Distance + Delete + Scaled Termination
+                    # Apply scaled and clipped termination (prioritize distance signal)
+                    scaled_termination = termination_reward * self.dm_term_scale
+                    if self.dm_term_clip:
+                        scaled_termination = max(-self.dm_term_clip_val, 
+                                                 min(self.dm_term_clip_val, scaled_termination))
+                    reward_components['total_reward'] += scaled_termination
+                    reward_components['termination_reward_scaled'] = scaled_termination
+                elif self.simple_delete_only_mode:
+                    # Simple delete mode only: Replace total with graph_reward + termination
+                    reward_components['total_reward'] = (
+                        reward_components.get('graph_reward', 0.0) + termination_reward
+                    )
+                elif self.centroid_distance_only_mode:
+                    # Centroid distance mode only: Apply scaled and clipped termination
+                    scaled_termination = termination_reward * self.dm_term_scale
+                    if self.dm_term_clip:
+                        scaled_termination = max(-self.dm_term_clip_val, 
+                                                 min(self.dm_term_clip_val, scaled_termination))
+                    reward_components['total_reward'] += scaled_termination
+                    # Store the scaled version for logging
+                    reward_components['termination_reward_scaled'] = scaled_termination
+                else:
+                    # Normal mode: Add termination reward to existing total
+                    reward_components['total_reward'] += termination_reward
+            # else: Special mode without include_termination_rewards flag - ignore termination rewards
         
         # Accumulate episode total reward (using scalar total for tracking)
         scalar_reward = reward_components['total_reward']
@@ -957,7 +1051,7 @@ class DurotaxisEnv(gym.Env):
             'reward_breakdown': reward_components,  # Detailed reward information as dictionary
             'empty_graph_recovered': empty_graph_recovered,
             'empty_graph_recovery_attempts': self.empty_graph_recovery_attempts,
-            'empty_graph_recoveries_this_episode': self.empty_graph_recoveries_this_episode
+            'empty_graph_recoveries_this_episode': self.empty_graph_recovery_attempts
         }
         
         # 📊 One-line performance summary with boundary warnings
@@ -1044,6 +1138,10 @@ class DurotaxisEnv(gym.Env):
         # === DELETE REWARD: Proper deletion compliance ===
         delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
         graph_reward += delete_reward
+        
+        # === DELETION EFFICIENCY REWARD: Tidiness bonus for smart pruning ===
+        efficiency_reward = self._calculate_deletion_efficiency_reward(prev_state, new_state)
+        graph_reward += efficiency_reward
         
         # === EDGE REWARD: Directional bias toward rightward movement ===
         edge_reward = self._calculate_edge_reward(prev_state, new_state, actions)
@@ -1209,12 +1307,160 @@ class DurotaxisEnv(gym.Env):
         # Final combined reward
         total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
         
+        # === COMBINED MODE: Distance Shaping + Delete Penalties ===
+        # When BOTH modes are enabled, combine distance shaping with delete penalties
+        if self.simple_delete_only_mode and self.centroid_distance_only_mode:
+            # === 1. Calculate Distance Signal (Dense, Directional) ===
+            centroid_x = 0.0
+            if num_nodes > 0:
+                try:
+                    graph_features = new_state.get('graph_features')
+                    if graph_features is not None:
+                        if isinstance(graph_features, torch.Tensor):
+                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                        else:
+                            centroid_x = graph_features[3]
+                except (IndexError, TypeError):
+                    # Fallback: calculate centroid from node positions
+                    node_features = new_state.get('node_features', [])
+                    if len(node_features) > 0:
+                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                     for node in node_features]
+                        centroid_x = sum(x_positions) / len(x_positions)
+            
+            # Use delta distance shaping (potential-based) for rightward migration
+            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
+                # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
+                # Positive when moving right, negative when moving left
+                delta_x = centroid_x - self._prev_centroid_x
+                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
+            else:
+                # Fallback: static distance penalty
+                if self.goal_x > 0:
+                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
+                else:
+                    distance_signal = 0.0
+            
+            # Update previous centroid for next step
+            self._prev_centroid_x = centroid_x
+            
+            # === 2. Calculate Delete Penalties (Efficient Node Management) ===
+            # Extract only the delete penalties from delete_reward
+            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
+            
+            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
+            growth_penalty_only = 0.0
+            if num_nodes > self.max_critical_nodes:
+                excess_nodes = num_nodes - self.max_critical_nodes
+                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
+            
+            # Combine delete penalties
+            delete_penalties_total = growth_penalty_only + delete_penalty_only
+            
+            # === 3. Combine Distance + Delete ===
+            total_reward = distance_signal + delete_penalties_total
+            graph_reward = distance_signal + delete_penalties_total
+            
+            # Zero out all other components (keep reward focused)
+            spawn_reward = 0.0
+            delete_reward = delete_penalties_total  # Keep for logging
+            efficiency_reward = 0.0
+            edge_reward = 0.0
+            centroid_reward = 0.0
+            milestone_reward = 0.0
+            total_node_reward = 0.0
+            survival_reward = 0.0
+        
+        # === SIMPLE DELETE-ONLY MODE ===
+        # When enabled, zero out all rewards except delete penalties (Rule 1 & 2) and growth penalty (Rule 0)
+        elif self.simple_delete_only_mode:
+            # Extract only the delete penalties from delete_reward
+            # In simple mode, we want ONLY penalties, no positive rewards
+            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
+            
+            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
+            growth_penalty_only = 0.0
+            if num_nodes > self.max_critical_nodes:
+                excess_nodes = num_nodes - self.max_critical_nodes
+                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
+            
+            # Combine penalties: Rule 0 (growth) + Rule 1 (persistence) + Rule 2 (improper deletion)
+            total_reward = growth_penalty_only + delete_penalty_only
+            graph_reward = growth_penalty_only + delete_penalty_only
+            
+            # Zero out all other components
+            spawn_reward = 0.0
+            efficiency_reward = 0.0
+            edge_reward = 0.0
+            centroid_reward = 0.0
+            milestone_reward = 0.0
+            total_node_reward = 0.0
+            survival_reward = 0.0
+        
+        
+        # === CENTROID-TO-GOAL DISTANCE-ONLY MODE ===
+        # When enabled, provide ONLY distance-based penalty from centroid to goal
+        elif self.centroid_distance_only_mode:
+            # Calculate centroid x position
+            centroid_x = 0.0
+            if num_nodes > 0:
+                try:
+                    graph_features = new_state.get('graph_features')
+                    if graph_features is not None:
+                        if isinstance(graph_features, torch.Tensor):
+                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                        else:
+                            centroid_x = graph_features[3]
+                except (IndexError, TypeError) as e:
+                    # Fallback: calculate centroid from node positions
+                    node_features = new_state.get('node_features', [])
+                    if len(node_features) > 0:
+                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                     for node in node_features]
+                        centroid_x = sum(x_positions) / len(x_positions)
+            
+            # === DISTANCE MODE OPTIMIZATION ===
+            # Use delta distance shaping (potential-based) for faster learning
+            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
+                # Delta distance shaping: reward = scale × (cx_t - cx_{t-1}) / goal_x
+                # Potential-based: Φ(s) = cx / goal_x, preserves optimal policy
+                # Positive when moving right, negative when moving left
+                delta_x = centroid_x - self._prev_centroid_x
+                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
+            else:
+                # Fallback: Static distance penalty (original behavior)
+                # Calculate distance penalty: -(goal_x - centroid_x) / goal_x
+                # As centroid approaches goal, penalty approaches 0
+                # If centroid is at or past goal, penalty is 0 or positive (reward)
+                if self.goal_x > 0:
+                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
+                else:
+                    distance_signal = 0.0
+            
+            # Update previous centroid for next step
+            self._prev_centroid_x = centroid_x
+            
+            # Set total reward to distance signal only
+            total_reward = distance_signal
+            graph_reward = distance_signal
+            
+            # Zero out all other components
+            spawn_reward = 0.0
+            delete_reward = 0.0
+            efficiency_reward = 0.0
+            edge_reward = 0.0
+            centroid_reward = 0.0
+            milestone_reward = 0.0
+            total_node_reward = 0.0
+            survival_reward = 0.0
+        
         # Create detailed reward information dictionary
         reward_breakdown = {
             'total_reward': total_reward,
             'graph_reward': graph_reward,
             'spawn_reward': spawn_reward,
             'delete_reward': delete_reward,
+            'deletion_efficiency_reward': efficiency_reward if 'efficiency_reward' in locals() else 0.0,
             'edge_reward': edge_reward,
             'centroid_reward': centroid_reward if 'centroid_reward' in locals() else 0.0,
             'milestone_reward': milestone_reward,
@@ -1264,7 +1510,11 @@ class DurotaxisEnv(gym.Env):
         if hasattr(self, 'state_extractor'):
             self.state_extractor.set_topology(self.topology)
 
-        return self.state_extractor.get_state_features(include_substrate=True)
+        return self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
 
     def _reposition_recovered_nodes(self, prev_state):
         """Shift recovered nodes near the previous centroid to preserve spatial continuity."""
@@ -1367,6 +1617,10 @@ class DurotaxisEnv(gym.Env):
             float: Milestone reward if a new milestone is reached, 0.0 otherwise
         """
         if not hasattr(self, 'milestone_rewards') or not self.milestone_rewards.get('enabled', False):
+            return 0.0
+        
+        # Skip milestone rewards and printing when in centroid distance only mode
+        if self.centroid_distance_only_mode:
             return 0.0
         
         if new_state['num_nodes'] == 0:
@@ -1506,7 +1760,8 @@ class DurotaxisEnv(gym.Env):
         
         Logic:
         - If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
-        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward
+        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence)
+        - If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper)
         
         Args:
             prev_state: Previous state dict containing topology
@@ -1514,51 +1769,113 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken this step
             
         Returns:
-            float: Delete reward (positive for proper deletions, negative for persistence)
+            float: Delete reward (positive for proper deletions, negative for persistence/improper deletions)
         """
         delete_reward = 0.0
         
-        # Need previous topology to check to_delete flags
-        if 'topology' not in prev_state or prev_state['topology'] is None:
+        # Need previous state with persistent_id and to_delete data  
+        if 'persistent_id' not in prev_state or prev_state['persistent_id'] is None:
             return 0.0
-            
-        prev_topology = prev_state['topology']
         
-        # Check if previous topology had any nodes
-        if prev_topology.graph.num_nodes() == 0:
+        if 'to_delete' not in prev_state or prev_state['to_delete'] is None:
             return 0.0
             
-        # Check if previous topology had to_delete flags
-        if 'to_delete' not in prev_topology.graph.ndata:
+        if prev_state['num_nodes'] == 0:
             return 0.0
-            
-        # Get previous topology data
-        prev_to_delete_flags = prev_topology.graph.ndata['to_delete']
-        prev_persistent_ids = prev_topology.graph.ndata['persistent_id']
         
-        # Current topology data
-        current_topology = new_state['topology']
-        if current_topology.graph.num_nodes() > 0:
-            current_persistent_ids = current_topology.graph.ndata['persistent_id'].tolist()
+        # Use the cloned data from prev_state (captured at the time of state extraction)
+        prev_to_delete_flags = prev_state['to_delete']
+        prev_persistent_ids = prev_state['persistent_id']
+        
+        # Get current persistent IDs
+        if new_state['num_nodes'] > 0 and 'persistent_id' in new_state:
+            current_persistent_ids = set(new_state['persistent_id'].cpu().tolist())
         else:
-            current_persistent_ids = []
+            current_persistent_ids = set()
         
-        # Check each node from previous topology
+        # Check each node from previous state
         for i, to_delete_flag in enumerate(prev_to_delete_flags):
+            prev_persistent_id = prev_persistent_ids[i].item()
+            node_was_deleted = prev_persistent_id not in current_persistent_ids
+            
             if to_delete_flag.item() > 0.5:  # Node was marked for deletion
-                prev_persistent_id = prev_persistent_ids[i].item()
-                
-                # Check if this persistent ID still exists in current topology
-                if prev_persistent_id in current_persistent_ids:
-                    # Node was marked for deletion but still exists - penalty
+                if node_was_deleted:
+                    # Node was marked for deletion and was actually deleted - reward
+                    # In simple_delete_only_mode, we give 0 instead of positive reward
+                    if not self.simple_delete_only_mode:
+                        delete_reward += self.delete_proper_reward
+                    # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
+                else:
+                    # Node was marked for deletion but still exists - penalty (RULE 1)
                     delete_reward -= self.delete_persistence_penalty
                     # print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
-                else:
-                    # Node was marked for deletion and was actually deleted - reward
-                    delete_reward += self.delete_proper_reward
-                    # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
+            else:  # Node was NOT marked for deletion (to_delete=0)
+                if node_was_deleted:
+                    # Node was NOT marked but was deleted anyway - penalty (RULE 2)
+                    delete_reward -= self.delete_improper_penalty
+                    # print(f"🔴 Improper delete penalty! Node PID:{prev_persistent_id} was deleted without marking (-{self.delete_improper_penalty})")
+                # else: node not marked and still exists - neutral (expected behavior)
         
         return delete_reward
+    
+    def _calculate_deletion_efficiency_reward(self, prev_state, new_state):
+        """
+        Reward the agent for deleting old, stagnant, or strategically unimportant nodes.
+        
+        This "tidiness" reward encourages the agent to prune its network efficiently,
+        particularly targeting nodes that are:
+        - Old (existed for many steps without contributing)
+        - Stagnant (not moving/exploring)
+        - On low-quality substrate (marked by the heuristic system)
+        
+        Args:
+            prev_state: Previous state dict (using snapshots)
+            new_state: Current state dict (using snapshots)
+            
+        Returns:
+            float: Efficiency reward for smart deletions
+        """
+        # Use snapshot data instead of topology references
+        if prev_state['num_nodes'] == 0 or 'persistent_id' not in prev_state:
+            return 0.0
+
+        efficiency_reward = 0.0
+        
+        # Get persistent IDs from snapshots
+        prev_pids = set(prev_state['persistent_id'].cpu().tolist())
+        current_pids = set(new_state['persistent_id'].cpu().tolist()) if new_state['num_nodes'] > 0 else set()
+        
+        deleted_pids = prev_pids - current_pids
+
+        if not deleted_pids:
+            return 0.0
+
+        # Define reward multipliers (tuned for balanced learning)
+        AGE_REWARD_MULTIPLIER = 0.05      # Reward for deleting old nodes
+        STAGNATION_REWARD_MULTIPLIER = 0.1  # Reward for deleting stagnant nodes
+        
+        for pid in deleted_pids:
+            reward = 0.0
+            
+            # Reward for deleting old nodes (>50 steps old)
+            if pid in self._node_age and self._node_age[pid] > 50:
+                age_bonus = (self._node_age[pid] - 50) * AGE_REWARD_MULTIPLIER
+                reward += age_bonus
+
+            # Reward for deleting stagnant nodes (>20 steps without movement)
+            if pid in self._node_stagnation and self._node_stagnation[pid]['count'] > 20:
+                stagnation_bonus = (self._node_stagnation[pid]['count'] - 20) * STAGNATION_REWARD_MULTIPLIER
+                reward += stagnation_bonus
+            
+            if reward > 0:
+                # Optional: Debug logging (uncomment for debugging)
+                # print(f"🧹 Tidiness reward! Deleted node {pid} "
+                #       f"(Age: {self._node_age.get(pid, 0)}, "
+                #       f"Stagnant: {self._node_stagnation.get(pid, {}).get('count', 0)}). "
+                #       f"Reward: +{reward:.2f}")
+                efficiency_reward += reward
+                
+        return efficiency_reward
 
     def _calculate_edge_reward(self, prev_state, new_state, actions):
         """
@@ -1857,18 +2174,18 @@ class DurotaxisEnv(gym.Env):
                     print(f"   Current centroid: {current_centroid:.2f}, Previous: {previous_centroid:.2f}")
                     return True, self.leftward_drift_penalty
 
-        # 5. Terminate if one node from the graph reaches the rightmost location ('success termination')
+        # 5. Terminate if one node from the graph reaches the rightmost area ('success termination')
         if state['num_nodes'] > 0:
-            # Get substrate width to determine rightmost position
+            # Get substrate width to determine success threshold (last 5% of width)
             substrate_width = self.substrate.width
-            rightmost_x = substrate_width - 1  # Rightmost valid x-coordinate
+            success_threshold = substrate_width * 0.95  # Success when reaching 95% of width (last 5% area)
             
             # Check each node's x-position (first element of node_features)
             node_features = state['node_features']
             for i in range(state['num_nodes']):
                 node_x = node_features[i][0].item()  # x-coordinate
-                if node_x >= rightmost_x:
-                    print(f"🎯 Episode terminated: Node {i} reached rightmost location (x={node_x:.2f} >= {rightmost_x}) - SUCCESS!")
+                if node_x >= success_threshold:
+                    print(f"🎯 Episode terminated: Node {i} reached rightmost area (x={node_x:.2f} >= {success_threshold:.2f}, {(node_x/substrate_width)*100:.1f}% of width) - SUCCESS!")
                     return True, self.success_reward
 
         # 6. Terminate if max_time_steps is reached
@@ -1966,6 +2283,138 @@ class DurotaxisEnv(gym.Env):
         if self.last_reward_breakdown:
             return self.last_reward_breakdown.get('edge_reward', 0.0)
         return 0.0
+    
+    def _update_and_inject_node_features(self, state):
+        """
+        Update age and stagnation for each node.
+        
+        This tracking provides the environment with information needed to make
+        intelligent deletion decisions based on node lifetime and activity.
+        """
+        if state['num_nodes'] == 0:
+            self._node_age.clear()
+            self._node_stagnation.clear()
+            return
+
+        current_pids = set()
+        if 'persistent_id' in self.topology.graph.ndata:
+            pids = self.topology.graph.ndata['persistent_id'].cpu().numpy()
+            positions = self.topology.graph.ndata['pos'].cpu().numpy()
+
+            for i, pid in enumerate(pids):
+                current_pids.add(pid)
+                pos = positions[i]
+
+                # Update age
+                self._node_age[pid] = self._node_age.get(pid, 0) + 1
+
+                # Update stagnation
+                if pid in self._node_stagnation:
+                    prev_pos = self._node_stagnation[pid]['pos']
+                    distance = np.linalg.norm(pos - prev_pos)
+                    if distance < self._stagnation_threshold:
+                        self._node_stagnation[pid]['count'] += 1
+                    else:
+                        self._node_stagnation[pid] = {'pos': pos, 'count': 0}
+                else:
+                    self._node_stagnation[pid] = {'pos': pos, 'count': 0}
+        
+        # Clean up trackers for deleted nodes
+        deleted_pids = set(self._node_age.keys()) - current_pids
+        for pid in deleted_pids:
+            if pid in self._node_age:
+                del self._node_age[pid]
+            if pid in self._node_stagnation:
+                del self._node_stagnation[pid]
+    
+    def _heuristically_mark_nodes_for_deletion(self):
+        """
+        Mark nodes for deletion based on the two rules from physical experiments.
+        
+        Rule 1: Only apply deletion logic if num_nodes > max_critical_nodes
+        Rule 2: Mark the rightmost nodes whose intensity at t-delta_time was
+                below the current average intensity
+        
+        This implements the domain-specific deletion strategy observed in lab
+        experiments, where the organism prunes inefficient parts of its network.
+        """
+        # Rule 1: Only apply deletion logic if the number of nodes exceeds the critical threshold
+        if self.topology.graph.num_nodes() <= self.max_critical_nodes:
+            return
+
+        # Ensure we have a past topology to compare against
+        if self.dequeued_topology is None:
+            return
+        
+        # Check if dequeued topology has the required data
+        if not isinstance(self.dequeued_topology, dict):
+            return
+        
+        if 'persistent_id' not in self.dequeued_topology or 'node_features' not in self.dequeued_topology:
+            return
+
+        # Rule 2: Identify nodes whose intensity at t-delta_time was less than current average
+        
+        # Get current graph info
+        current_state = self.state_extractor.get_state_features(
+            include_substrate=False,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
+        if current_state['num_nodes'] == 0:
+            return
+            
+        current_intensities = current_state['node_features'][:, 2].cpu().numpy()
+        current_avg_intensity = np.mean(current_intensities)
+        
+        # Get previous graph info from the dequeued topology
+        prev_pids = self.dequeued_topology['persistent_id'].cpu().numpy()
+        prev_intensities = self.dequeued_topology['node_features'][:, 2].cpu().numpy()
+
+        # Find candidate nodes: those with previous intensity below current average
+        candidate_pids = []
+        for i, pid in enumerate(prev_pids):
+            if prev_intensities[i] < current_avg_intensity:
+                candidate_pids.append(pid)
+
+        if not candidate_pids:
+            return
+
+        # Find these candidates in the current graph and mark the rightmost ones
+        current_pids_list = current_state['persistent_id'].cpu().numpy().tolist()
+        nodes_to_mark = []
+        
+        for pid in candidate_pids:
+            try:
+                # Find the index of the candidate node in the current graph
+                current_idx = current_pids_list.index(pid)
+                pos_x = current_state['node_features'][current_idx, 0].item()
+                nodes_to_mark.append((current_idx, pos_x, pid))
+            except ValueError:
+                # Node no longer exists, skip
+                continue
+        
+        if not nodes_to_mark:
+            return
+
+        # Sort candidates by their x-position (rightmost first)
+        nodes_to_mark.sort(key=lambda x: x[1], reverse=True)
+        
+        # Mark the top N rightmost candidates for deletion
+        # Strategy: Mark 10-20% of excess nodes to encourage gradual, controlled pruning
+        excess_nodes = self.topology.graph.num_nodes() - self.max_critical_nodes
+        num_to_mark = max(1, min(int(excess_nodes * 0.15), len(nodes_to_mark)))
+        
+        nodes_marked_count = 0
+        for i in range(num_to_mark):
+            node_idx_to_mark, pos_x, pid = nodes_to_mark[i]
+            self._set_node_to_delete_flag(node_idx_to_mark, 1.0)
+            nodes_marked_count += 1
+        
+        # Optional: Debug logging (uncomment for debugging)
+        # if nodes_marked_count > 0:
+        #     print(f"🚩 Marked {nodes_marked_count} rightmost low-intensity nodes for deletion "
+        #           f"(excess: {excess_nodes}, total: {self.topology.graph.num_nodes()})")
 
     def apply_curriculum_config(self, curriculum_config: dict):
         """Apply curriculum learning configuration to the environment."""
@@ -2049,6 +2498,9 @@ class DurotaxisEnv(gym.Env):
         self.centroid_history = []
         self.consecutive_left_moves = 0
         
+        # Reset previous centroid for delta distance computation (distance mode optimization)
+        self._prev_centroid_x = None
+        
         # Reset topology history
         self.topology_history = []
         self.dequeued_topology = None
@@ -2056,6 +2508,10 @@ class DurotaxisEnv(gym.Env):
         # Reset node-level reward tracking
         self.prev_node_positions = []
         self.last_reward_breakdown = None
+        
+        # NEW: Reset advanced feature trackers
+        self._node_age.clear()
+        self._node_stagnation.clear()
         
         # Reset milestone tracking for new episode
         self._milestones_reached = set()
@@ -2070,7 +2526,11 @@ class DurotaxisEnv(gym.Env):
         
         # Verify initial centroid is in safe center zone
         if self.init_num_nodes > 0:
-            initial_state = self.state_extractor.get_state_features(include_substrate=True)
+            initial_state = self.state_extractor.get_state_features(
+                include_substrate=True,
+                node_age=self._node_age,
+                node_stagnation=self._node_stagnation
+            )
             if initial_state['num_nodes'] > 0:
                 initial_centroid_y = initial_state['graph_features'][4].item()  # Centroid Y
                 substrate_height = self.substrate.height
@@ -2089,7 +2549,11 @@ class DurotaxisEnv(gym.Env):
         self._initialize_policy()
         
         # Get initial observation using state features
-        state = self.state_extractor.get_state_features(include_substrate=True)
+        state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
         
         # Get observation from GraphInputEncoder output
         observation = self._get_encoder_observation(state)
@@ -2107,7 +2571,11 @@ class DurotaxisEnv(gym.Env):
         """Render the current state of the environment using enable_visualization setting."""
         # Always show visualization if enabled, based on enable_visualization setting
         # This ensures visualization works consistently across different usage patterns
-        state = self.state_extractor.get_state_features(include_substrate=True)
+        state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
         
         # Debug: Track render calls
         # print(f"DEBUG: render() called - Episode {self.current_episode}, Step {self.current_step}")

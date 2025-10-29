@@ -6,14 +6,16 @@ This script allows you to load a trained model and run it on custom substrates
 with configurable parameters for evaluation and demonstration purposes.
 
 Usage:
-    python deploy.py --model_path ./training_results/run0004/best_model_batch4.pt \
+    python deploy.py --model_path ./training_results/run0014/best_model_batch11.pt \
                      --substrate_type linear --m 0.05 --b 1.0 \
-                     --deterministic --max_episodes 10 --max_steps 1000
+                     --deterministic --max_episodes 10 --max_steps 1000 \
+                     --max_critical_nodes 75 --threshold_critical_nodes 500
     
     # Without visualization
     python deploy.py --model_path ./training_results/run0004/best_model_batch4.pt \
                      --substrate_type linear --m 0.05 --b 1.0 \
-                     --deterministic --max_episodes 10 --max_steps 1000 --no_viz
+                     --deterministic --max_episodes 10 --max_steps 1000 --no_viz \
+                     --max_critical_nodes 100 --threshold_critical_nodes 600
 """
 
 import argparse
@@ -189,10 +191,20 @@ class DurotaxisDeployment:
             print(f"   Initial nodes: {env.topology.graph.num_nodes()}")
         
         while not done and step_count < max_steps:
-            # Get current state
-            state_dict = self.state_extractor.get_state_features(include_substrate=True)
-            state_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                         for k, v in state_dict.items()}
+            # Get current state with age/stagnation tracking from environment
+            state_dict = self.state_extractor.get_state_features(
+                include_substrate=True,
+                node_age=env._node_age,
+                node_stagnation=env._node_stagnation
+            )
+            
+            # Move tensors to device (handle edge_index tuple specially)
+            for k, v in state_dict.items():
+                if isinstance(v, torch.Tensor):
+                    state_dict[k] = v.to(self.device)
+                elif k == 'edge_index' and isinstance(v, tuple):
+                    # edge_index is a tuple of (src, dst) tensors
+                    state_dict[k] = tuple(t.to(self.device) for t in v)
             
             # Check for empty graph
             if state_dict['num_nodes'] == 0:
@@ -302,7 +314,9 @@ class DurotaxisDeployment:
                       max_steps: int = 100,
                       deterministic: bool = True,
                       save_results: bool = True,
-                      enable_visualization: bool = True) -> Dict:
+                      enable_visualization: bool = True,
+                      max_critical_nodes: int = 75,
+                      threshold_critical_nodes: int = 500) -> Dict:
         """
         Run evaluation over multiple episodes
         
@@ -315,6 +329,8 @@ class DurotaxisDeployment:
             deterministic: Whether to use deterministic policy
             save_results: Whether to save results to file
             enable_visualization: Whether to enable visualization during episodes
+            max_critical_nodes: Maximum allowed nodes before growth penalties
+            threshold_critical_nodes: Critical threshold for episode termination
             
         Returns:
             Dictionary with evaluation statistics
@@ -326,6 +342,7 @@ class DurotaxisDeployment:
             print(f"   Substrate: {substrate_type} (m={m}, b={b})")
             print(f"   Episodes: {max_episodes}, Max steps: {max_steps}")
             print(f"   Policy: {'Deterministic' if deterministic else 'Stochastic'}")
+            print(f"   Node limits: max_critical={max_critical_nodes}, threshold={threshold_critical_nodes}")
             print(f"   Visualization: {'Enabled' if enable_visualization else 'Disabled'}")
         
         # Create environment with specified substrate
@@ -334,7 +351,8 @@ class DurotaxisDeployment:
             substrate_type=substrate_type,
             substrate_m=m,
             substrate_b=b,
-            threshold_critical_nodes=500  # Increased from 200 to allow longer episodes
+            max_critical_nodes=max_critical_nodes,
+            threshold_critical_nodes=threshold_critical_nodes
         )
         
         # Run episodes
@@ -460,6 +478,12 @@ def main():
                        choices=['cpu', 'cuda'],
                        help='Device to run on (auto-detect if not specified)')
     
+    # Environment node limits
+    parser.add_argument('--max_critical_nodes', type=int, default=75,
+                       help='Maximum allowed nodes before growth penalties (default: 75)')
+    parser.add_argument('--threshold_critical_nodes', type=int, default=500,
+                       help='Critical threshold - episode terminates if exceeded (default: 500)')
+    
     # Output options
     parser.add_argument('--save_results', action='store_true', default=True,
                        help='Save evaluation results to JSON file')
@@ -497,7 +521,9 @@ def main():
             max_steps=args.max_steps,
             deterministic=args.deterministic,
             save_results=args.save_results,
-            enable_visualization=args.enable_visualization
+            enable_visualization=args.enable_visualization,
+            max_critical_nodes=args.max_critical_nodes,
+            threshold_critical_nodes=args.threshold_critical_nodes
         )
         
         # Only print completion message when not using visualization

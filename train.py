@@ -28,6 +28,71 @@ import time
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# ===========================
+# Safe Normalization Utilities
+# ===========================
+
+def safe_standardize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Standardize tensor to zero mean and unit variance with numerical safety.
+    Returns zeros if variance is too small (degenerate case).
+    """
+    if x.numel() == 0:
+        return x
+    mean = x.mean()
+    std = x.std()
+    if std < eps:
+        # Zero variance - return zero-centered
+        return x - mean
+    return (x - mean) / (std + eps)
+
+def safe_zero_center(x: torch.Tensor) -> torch.Tensor:
+    """Center tensor to zero mean without scaling."""
+    if x.numel() == 0:
+        return x
+    return x - x.mean()
+
+class RunningMeanStd:
+    """
+    Tracks running mean and std for normalization with Welford's algorithm.
+    Useful for normalizing rewards/values with stable streaming statistics.
+    """
+    def __init__(self, shape=(), eps=1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps  # Avoid division by zero
+        self.eps = eps
+    
+    def update(self, x):
+        """Update statistics with new batch of data."""
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+    
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Welford's online algorithm for stable mean/var computation."""
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
+        new_var = M2 / total_count
+        
+        self.mean = new_mean
+        self.var = new_var
+        self.count = total_count
+    
+    def normalize(self, x):
+        """Normalize using tracked statistics."""
+        return (x - self.mean) / np.sqrt(self.var + self.eps)
+
+# ===========================
+# Trajectory Buffer
+# ===========================
+
 class TrajectoryBuffer:
     """Buffer to store multiple episodes of trajectories for batch training"""
     
@@ -398,6 +463,13 @@ class DurotaxisTrainer:
         # PPO KL divergence early stopping (prevents policy from moving too far)
         self.target_kl = algorithm_config.get('target_kl', 0.03)  # Stop PPO epochs if KL > this
         self.enable_kl_early_stop = algorithm_config.get('enable_kl_early_stop', True)
+
+        # NEW: Two-stage curriculum settings
+        two_stage_config = algorithm_config.get('two_stage_curriculum', {})
+        self.training_stage = two_stage_config.get('stage', 1)
+        self.stage_1_fixed_spawn_params = two_stage_config.get('stage_1_fixed_spawn_params', {
+            'gamma': 5.0, 'alpha': 1.0, 'noise': 0.1, 'theta': 0.0
+        })
         
         # Adaptive weighting parameters
         self.weight_update_momentum = config.get('weight_momentum', 0.9)
@@ -430,6 +502,8 @@ class DurotaxisTrainer:
         self.min_entropy_threshold = entropy_config.get('min_entropy_threshold', 0.15) # Higher threshold
         
         # Batch training configuration
+        self.rollout_collection_mode = config.get('rollout_collection_mode', 'episodes')
+        self.rollout_steps = config.get('rollout_steps', 2048)
         self.rollout_batch_size = config.get('rollout_batch_size', 10)
         self.update_epochs = config.get('update_epochs', 4)
         self.minibatch_size = config.get('minibatch_size', 64)
@@ -571,8 +645,7 @@ class DurotaxisTrainer:
         
         # Optimizer (includes learnable weights)
         self.learning_rate = config.get('learning_rate', 3e-4)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
-        self.weight_optimizer = optim.Adam(self.learnable_component_weights.parameters(), lr=self.weight_learning_rate)
+        self._build_optimizer()
         
         # Learning rate scheduler for long runs
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=500)
@@ -586,6 +659,41 @@ class DurotaxisTrainer:
         self.smoothed_losses = []   # Track moving average of losses
         self.best_total_reward = float('-inf')
         self.start_episode = 0  # For resume training
+        self.last_checkpoint_filename = None  # Track last saved checkpoint for loss metrics
+        
+        # Model selection configuration (hierarchical best model tracking)
+        model_sel_config = config.get('model_selection', {})
+        self.model_sel_primary_metric = model_sel_config.get('primary_metric', 'success_rate')
+        self.model_sel_primary_weight = float(model_sel_config.get('primary_weight', 1000.0))
+        self.model_sel_secondary_metric = model_sel_config.get('secondary_metric', 'progress')
+        self.model_sel_secondary_weight = float(model_sel_config.get('secondary_weight', 100.0))
+        self.model_sel_tertiary_metric = model_sel_config.get('tertiary_metric', 'return_mean')
+        self.model_sel_tertiary_weight = float(model_sel_config.get('tertiary_weight', 1.0))
+        self.model_sel_window_episodes = int(model_sel_config.get('window_episodes', 50))
+        self.model_sel_min_improvement = float(model_sel_config.get('min_improvement', 0.01))
+        
+        # Best model tracking state
+        self.best_model_score = None  # Composite score (weighted sum of metrics)
+        self.best_model_filename = None  # Filename of current best model
+        self.best_model_metrics = {}  # Dict of individual metric values at best
+        
+        # Episode history for model selection (rolling window)
+        self.episode_history = []  # List of dicts with {success, final_centroid_x, goal_x, return}
+        
+        # Adaptive terminal scale scheduler (for distance mode optimization)
+        # Gradually reduces terminal reward influence as rightward progress becomes consistent
+        env_config = self.config_loader.config.get('environment', {})
+        dm_config = env_config.get('distance_mode', {})
+        self.dm_scheduler_enabled = bool(dm_config.get('scheduler_enabled', True))
+        self.dm_scheduler_window_size = int(dm_config.get('scheduler_window_size', 5))
+        self.dm_scheduler_progress_threshold = float(dm_config.get('scheduler_progress_threshold', 0.6))
+        self.dm_scheduler_consecutive_windows = int(dm_config.get('scheduler_consecutive_windows', 3))
+        self.dm_scheduler_decay_rate = float(dm_config.get('scheduler_decay_rate', 0.9))
+        self.dm_scheduler_min_scale = float(dm_config.get('scheduler_min_scale', 0.005))
+        # Scheduler state
+        self._dm_rightward_progress_history = []  # List of (episode, progress_rate) tuples
+        self._dm_consecutive_good_windows = 0  # Count of consecutive windows meeting threshold
+        self._dm_terminal_scale_history = []  # List of (episode, scale) tuples for tracking
         
         # Resume training if configured (check both trainer.resume_training and top-level)
         resume_config = self.config_loader.config.get('trainer', {}).get('resume_training', {})
@@ -685,6 +793,11 @@ class DurotaxisTrainer:
             print(f"   └─ Log substrate values: {'yes' if self.log_substrate_values else 'no'}")
             print(f"   └─ Compression: {'enabled' if self.compress_logs else 'disabled'}")
             print(f"   └─ Max file size: {self.max_log_file_size_mb} MB")
+        
+        if self.training_stage == 1:
+            print(f"   ⭐️ Training Mode: Stage 1 (Discrete Actions Only)")
+        else:
+            print(f"   ⭐️ Training Mode: Stage 2 (Fine-tuning Continuous Actions)")
     
     def _initialize_learnable_weights(self):
         """Initialize the enhanced learnable component weighting system"""
@@ -723,6 +836,90 @@ class DurotaxisTrainer:
         
         # Move to device
         self.learnable_component_weights = self.learnable_component_weights.to(self.device)
+    
+    def _build_optimizer(self):
+        """Build optimizer with parameter groups for different learning rates."""
+        # Get backbone config for LR settings
+        ac_config = self.config_loader.get_actor_critic_config()
+        backbone_cfg = ac_config.get('backbone', {})
+        bb_lr = float(backbone_cfg.get('backbone_lr', 1e-4))
+        hd_lr = float(backbone_cfg.get('head_lr', self.learning_rate))
+        
+        # Separate parameters into backbone and head groups
+        param_groups = []
+        
+        if not self.network.use_wsa:
+            # Standard Actor-Critic with ResNet backbone
+            # Actor backbone parameters
+            actor_backbone_params = list(self.network.actor.resnet_body.parameters())
+            # Critic backbone parameters
+            critic_backbone_params = list(self.network.critic.resnet_body.parameters())
+            
+            # Actor head parameters (everything except backbone)
+            actor_head_params = (
+                list(self.network.actor.feature_proj.parameters()) +
+                list(self.network.actor.action_mlp.parameters()) +
+                list(self.network.actor.discrete_head.parameters()) +
+                list(self.network.actor.continuous_mu_head.parameters()) +
+                list(self.network.actor.continuous_logstd_head.parameters()) +
+                [self.network.actor.discrete_bias]
+            )
+            
+            # Critic head parameters (everything except backbone)
+            critic_head_params = (
+                list(self.network.critic.feature_proj.parameters()) +
+                list(self.network.critic.value_mlp.parameters()) +
+                list(self.network.critic.value_heads.parameters())
+            )
+            
+            # Filter to only trainable parameters
+            def only_trainable(params):
+                return [p for p in params if p.requires_grad]
+            
+            # Add backbone group if any parameters are trainable
+            bb_params = only_trainable(actor_backbone_params + critic_backbone_params)
+            if len(bb_params) > 0:
+                param_groups.append({'params': bb_params, 'lr': bb_lr, 'name': 'backbone'})
+            
+            # Add head group
+            head_params = only_trainable(actor_head_params + critic_head_params)
+            if len(head_params) > 0:
+                param_groups.append({'params': head_params, 'lr': hd_lr, 'name': 'heads'})
+        else:
+            # WSA mode - treat all as single group for now
+            all_params = [p for p in self.network.parameters() if p.requires_grad]
+            if len(all_params) > 0:
+                param_groups.append({'params': all_params, 'lr': self.learning_rate, 'name': 'all'})
+        
+        # Add encoder parameters
+        encoder_params = [p for p in self.network.encoder.parameters() if p.requires_grad]
+        if len(encoder_params) > 0:
+            param_groups.append({'params': encoder_params, 'lr': hd_lr, 'name': 'encoder'})
+        
+        # Add learnable weights if enabled
+        if self.enable_learnable_weights:
+            weight_params = [p for p in self.learnable_component_weights.parameters() if p.requires_grad]
+            if len(weight_params) > 0:
+                self.weight_optimizer = torch.optim.Adam(weight_params, lr=self.weight_learning_rate)
+        
+        if len(param_groups) == 0:
+            raise RuntimeError("No trainable parameters found. Check freeze_mode configuration.")
+        
+        # Create main optimizer with parameter groups
+        self.optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), weight_decay=0.0)
+        
+        # Print optimizer configuration
+        print("\n" + "="*70)
+        print("🎓 OPTIMIZER CONFIGURATION")
+        print("="*70)
+        for i, group in enumerate(param_groups):
+            group_name = group.get('name', f'group_{i}')
+            group_lr = group['lr']
+            group_params = sum(p.numel() for p in group['params'])
+            print(f"  Group: {group_name}")
+            print(f"    LR: {group_lr:.6f}")
+            print(f"    Parameters: {group_params:,}")
+        print("="*70 + "\n")
     
     def create_action_mask(self, state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         """Create action mask to prevent invalid topology operations"""
@@ -1073,12 +1270,13 @@ class DurotaxisTrainer:
     
     def compute_enhanced_advantage_weights(self, advantages: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Enhanced learnable advantage weighting system
+        Enhanced learnable advantage weighting system with component masking
         
         Combines three approaches:
         1. Learnable base weights (trainable parameters)
         2. Attention-based dynamic weighting (context-dependent)  
         3. Adaptive scaling for stability
+        4. Zero-variance component masking (NEW)
         
         Args:
             advantages: Dictionary of advantages per component
@@ -1098,13 +1296,30 @@ class DurotaxisTrainer:
         advantage_list = [advantages[comp] for comp in self.component_names]
         advantage_tensor = torch.stack(advantage_list, dim=1)  # Shape: [batch_size, num_components]
         
-        # Step 2: Learnable base weights (Tier 1)
-        base_weights = torch.softmax(self.learnable_component_weights.base_weights, dim=0)
+        # Step 2: Mask zero-variance components (critical for special modes)
+        component_stds = advantage_tensor.std(dim=0)  # [num_components]
+        valid_mask = component_stds > 1e-8  # Components with meaningful variance
         
-        # Step 3: Attention-based dynamic weighting (Tier 2)
+        if not valid_mask.any():
+            # All components are zero-variance, return zeros
+            return torch.zeros(batch_size, device=device)
+        
+        # Step 3: Learnable base weights (Tier 1) - masked
+        base_weights = torch.softmax(self.learnable_component_weights.base_weights, dim=0)
+        base_weights = base_weights * valid_mask.float()  # Zero out invalid components
+        
+        # Renormalize if any valid components remain
+        if base_weights.sum() > 1e-8:
+            base_weights = base_weights / base_weights.sum()
+        else:
+            # Fallback: uniform weights on valid components
+            base_weights = valid_mask.float() / valid_mask.sum()
+        
+        # Step 4: Attention-based dynamic weighting (Tier 2) - masked
         if self.enable_attention_weighting and self.learnable_component_weights.attention_weights is not None:
-            # Compute attention weights based on advantage magnitudes
+            # Compute attention weights based on advantage magnitudes (only valid components)
             advantage_magnitudes = torch.abs(advantage_tensor).mean(dim=0)  # [num_components]
+            advantage_magnitudes = advantage_magnitudes * valid_mask.float()  # Mask invalid
             
             # Ensure advantage_magnitudes is a 1D tensor, then add batch dimension correctly
             if advantage_magnitudes.dim() == 2:
@@ -1115,33 +1330,36 @@ class DurotaxisTrainer:
             attention_input = advantage_magnitudes.unsqueeze(0)  # [1, num_components]
             attention_logits = self.learnable_component_weights.attention_weights(attention_input)  # [1, num_components]
             attention_logits = attention_logits.squeeze(0)  # Remove batch dim -> [num_components]
+            
+            # Mask attention before softmax
+            attention_logits = torch.where(valid_mask, attention_logits, torch.tensor(-1e10, device=device))
             attention_weights = torch.softmax(attention_logits, dim=0)
             
             # Combine base weights with attention
             final_weights = base_weights * attention_weights
-            final_weights = final_weights / final_weights.sum()  # Renormalize
+            final_weights = final_weights / (final_weights.sum() + 1e-8)  # Renormalize
         else:
             final_weights = base_weights
         
-        # Step 4: Apply weights to advantages
+        # Step 5: Apply weights to advantages
         weighted_advantages = (advantage_tensor * final_weights.unsqueeze(0)).sum(dim=1)
         
-        # Step 5: Normalize final advantages
-        if len(weighted_advantages) > 1:
-            weighted_advantages = (weighted_advantages - weighted_advantages.mean()) / (weighted_advantages.std() + 1e-8)
+        # Step 6: Safe normalization of final advantages
+        weighted_advantages = safe_standardize(weighted_advantages, eps=1e-8)
         
         return weighted_advantages
     
     def _compute_traditional_weighted_advantages(self, advantages: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Fallback to traditional component weighting method"""
-        total_advantages = torch.zeros(len(next(iter(advantages.values()))), device=self.device)
+        """Fallback to traditional component weighting method with safe normalization"""
+        device = next(iter(advantages.values())).device
+        total_advantages = torch.zeros(len(next(iter(advantages.values()))), device=device)
+        
         for component, adv in advantages.items():
             weight = self.component_weights.get(component, 1.0)
             total_advantages += weight * adv
         
-        # Normalize advantages
-        if len(total_advantages) > 1:
-            total_advantages = (total_advantages - total_advantages.mean()) / (total_advantages.std() + 1e-8)
+        # Safe normalization of advantages
+        total_advantages = safe_standardize(total_advantages, eps=1e-8)
         
         return total_advantages
     
@@ -1543,17 +1761,6 @@ class DurotaxisTrainer:
                 'num_edges': int(graph.num_edges()),
                 'node_count_history': list(self.current_episode_node_counts) if hasattr(self, 'current_episode_node_counts') else []
             }
-            
-            # Extract substrate information
-            if hasattr(self.env, 'substrate') and hasattr(self.env.substrate, 'substrate_kind'):
-                substrate_params = getattr(self, 'current_substrate_params', {})
-                detailed_data['substrate_info'] = {
-                    'type': substrate_params.get('kind', 'unknown'),
-                    'parameters': {
-                        'm': substrate_params.get('m', 0.0),
-                        'b': substrate_params.get('b', 0.0)
-                    }
-                }
             
             # Extract detailed node information
             if num_nodes > 0:
@@ -2219,7 +2426,20 @@ class DurotaxisTrainer:
                 for node_id, action_type in topology_actions.items():
                     try:
                         if action_type == 'spawn':
-                            params = self.network.get_spawn_parameters(output, node_id)
+                            # STAGE 1: Use fixed spawn parameters (discrete actions only)
+                            # STAGE 2: Use network's learned continuous parameters
+                            if self.training_stage == 1:
+                                # Use fixed default parameters from config
+                                params = [
+                                    self.stage_1_fixed_spawn_params['gamma'],
+                                    self.stage_1_fixed_spawn_params['alpha'],
+                                    self.stage_1_fixed_spawn_params['noise'],
+                                    self.stage_1_fixed_spawn_params['theta']
+                                ]
+                            else:
+                                # Use network's continuous output
+                                params = self.network.get_spawn_parameters(output, node_id)
+                            
                             # Track spawn parameters for statistics
                             self.current_episode_spawn_params['gamma'].append(params[0])
                             self.current_episode_spawn_params['alpha'].append(params[1])
@@ -2311,14 +2531,22 @@ class DurotaxisTrainer:
                     final_output = self.network(final_state_dict, deterministic=True)
                     final_values = final_output['value_predictions']
         
-        success = not done or episode_length >= 150  # Consider long episodes successful
+        # Determine success based on termination reward (if episode terminated)
+        success = False
+        if terminated and rewards:
+            # Check if the last reward contains a positive termination reward (success)
+            # success_reward is typically a large positive value (e.g., 500.0)
+            termination_reward = rewards[-1].get('termination_reward', 0.0)
+            # Success is indicated by positive termination reward (reaching goal)
+            # Negative termination rewards indicate failures (penalties)
+            success = termination_reward > 0
         
         return states, actions_taken, rewards, values, log_probs_list, final_values, terminated, success
     
     def compute_returns_and_advantages(self, rewards: List[Dict], values: List[Dict], 
                                      final_values: Optional[Dict] = None, terminated: bool = False,
                                      gamma: float = 0.99, gae_lambda: float = 0.95) -> Dict[str, torch.Tensor]:
-        """Compute returns and advantages for each reward component with improved normalization"""
+        """Compute returns and advantages for each reward component with safe normalization"""
         if not rewards or not values:
             return {}, {}
         
@@ -2379,6 +2607,9 @@ class DurotaxisTrainer:
                 # Return: R_t = Â_t + V(s_t)
                 component_returns[t] = gae + component_values[t]
             
+            # Safe normalization of component advantages (critical for stability)
+            component_advantages = safe_standardize(component_advantages, eps=1e-8)
+            
             returns[component] = component_returns
             advantages[component] = component_advantages
         
@@ -2420,8 +2651,19 @@ class DurotaxisTrainer:
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_discrete_log_prob - old_discrete_log_prob, -20.0, 20.0)
             
-            # Compute ratio
+            # Compute ratio with additional safety
             ratio_discrete = torch.exp(log_prob_diff)
+            
+            # Guard against NaN/Inf in ratio (critical for numerical stability)
+            if not torch.isfinite(ratio_discrete).all():
+                ratio_discrete = torch.where(
+                    torch.isfinite(ratio_discrete),
+                    ratio_discrete,
+                    torch.tensor(1.0, device=self.device)
+                )
+            
+            # Additional safety: clamp ratio to reasonable range before PPO clipping
+            ratio_discrete = torch.clamp(ratio_discrete, 0.01, 100.0)
             
             # PPO clipping
             clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
@@ -2441,7 +2683,9 @@ class DurotaxisTrainer:
         ratio_continuous = torch.tensor(1.0, device=self.device)
         clip_fraction_continuous = torch.tensor(0.0, device=self.device)
         
-        if ('continuous' in old_log_probs_dict and 
+        # STAGE 1: Skip continuous loss computation (discrete actions only)
+        # STAGE 2: Compute full continuous loss for fine-tuning
+        if self.training_stage == 2 and ('continuous' in old_log_probs_dict and 
             'continuous_log_probs' in eval_output and 
             len(old_log_probs_dict['continuous']) > 0 and 
             len(eval_output['continuous_log_probs']) > 0):
@@ -2458,8 +2702,19 @@ class DurotaxisTrainer:
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_continuous_log_prob - old_continuous_log_prob, -20.0, 20.0)
             
-            # Compute ratio
+            # Compute ratio with additional safety
             ratio_continuous = torch.exp(log_prob_diff)
+            
+            # Guard against NaN/Inf in ratio (critical for numerical stability)
+            if not torch.isfinite(ratio_continuous).all():
+                ratio_continuous = torch.where(
+                    torch.isfinite(ratio_continuous),
+                    ratio_continuous,
+                    torch.tensor(1.0, device=self.device)
+                )
+            
+            # Additional safety: clamp ratio to reasonable range before PPO clipping
+            ratio_continuous = torch.clamp(ratio_continuous, 0.01, 100.0)
             
             # PPO clipping
             clipped_ratio_continuous = torch.clamp(ratio_continuous, 1 - clip_eps, 1 + clip_eps)
@@ -2490,6 +2745,15 @@ class DurotaxisTrainer:
         # Total policy loss
         total_policy_loss = sum(policy_losses.values())
         
+        # Guard against NaN/Inf in total policy loss (critical safety check)
+        if not torch.isfinite(total_policy_loss).all():
+            print(f"WARNING: Non-finite policy loss detected! Resetting to zero.")
+            print(f"  discrete_loss: {policy_losses['discrete']}")
+            print(f"  continuous_loss: {policy_losses['continuous']}")
+            total_policy_loss = torch.tensor(0.0, device=self.device)
+            policy_losses['discrete'] = torch.tensor(0.0, device=self.device)
+            policy_losses['continuous'] = torch.tensor(0.0, device=self.device)
+        
         # Ensure entropy loss is always a tensor
         if entropy_losses:
             total_entropy_loss = sum(entropy_losses.values())
@@ -2499,6 +2763,11 @@ class DurotaxisTrainer:
         # Ensure it's a tensor, not a scalar
         if not isinstance(total_entropy_loss, torch.Tensor):
             total_entropy_loss = torch.tensor(total_entropy_loss, device=self.device)
+        
+        # Guard against NaN/Inf in entropy loss
+        if not torch.isfinite(total_entropy_loss).all():
+            print(f"WARNING: Non-finite entropy loss detected! Resetting to zero.")
+            total_entropy_loss = torch.tensor(0.0, device=self.device)
         
         return {
             'policy_loss_discrete': policy_losses['discrete'],
@@ -2660,9 +2929,20 @@ class DurotaxisTrainer:
         for component, component_losses in value_losses.items():
             if component_losses:
                 component_loss = torch.stack(component_losses).mean()
+                
+                # Guard against NaN/Inf in component value loss
+                if not torch.isfinite(component_loss).all():
+                    print(f"WARNING: Non-finite value loss for component {component}! Resetting to zero.")
+                    component_loss = torch.tensor(0.0, device=self.device)
+                
                 weight = self.component_weights.get(component, 1.0)
                 total_value_loss += weight * component_loss
                 losses[f'value_loss_{component}'] = component_loss.item()
+        
+        # Final guard on total value loss
+        if not torch.isfinite(total_value_loss).all():
+            print(f"WARNING: Non-finite total value loss! Resetting to zero.")
+            total_value_loss = torch.tensor(0.0, device=self.device)
         
         losses['total_value_loss'] = total_value_loss.item()
         
@@ -2923,9 +3203,20 @@ class DurotaxisTrainer:
         for component, component_losses in value_losses.items():
             if component_losses:
                 component_loss = torch.stack(component_losses).mean()
+                
+                # Guard against NaN/Inf in component value loss
+                if not torch.isfinite(component_loss).all():
+                    print(f"WARNING: Non-finite value loss for component {component}! Resetting to zero.")
+                    component_loss = torch.tensor(0.0, device=self.device)
+                
                 weight = self.component_weights.get(component, 1.0)
                 total_value_loss += weight * component_loss
                 losses[f'value_loss_{component}'] = component_loss.item()
+        
+        # Final guard on total value loss
+        if not torch.isfinite(total_value_loss).all():
+            print(f"WARNING: Non-finite total value loss! Resetting to zero.")
+            total_value_loss = torch.tensor(0.0, device=self.device)
         
         losses['total_value_loss'] = total_value_loss.item()
         losses['value_clipping_enabled'] = self.enable_value_clipping
@@ -2999,6 +3290,225 @@ class DurotaxisTrainer:
         self.optimizer.step()
         
         return losses
+
+    def _compute_model_selection_kpis(self) -> dict:
+        """
+        Compute KPIs for model selection from episode history.
+        
+        Returns:
+            dict with keys: success_rate, progress, return_mean
+        """
+        if not self.episode_history:
+            return {'success_rate': 0.0, 'progress': 0.0, 'return_mean': 0.0}
+        
+        # Use last N episodes from window
+        window_size = min(self.model_sel_window_episodes, len(self.episode_history))
+        recent_episodes = self.episode_history[-window_size:]
+        
+        # Compute success rate
+        successes = [1.0 if ep.get('success', False) else 0.0 for ep in recent_episodes]
+        success_rate = sum(successes) / max(1, len(successes))
+        
+        # Compute progress (mean final_centroid_x / goal_x)
+        progress_values = []
+        for ep in recent_episodes:
+            goal_x = max(1.0, float(ep.get('goal_x', 1.0)))
+            final_cx = float(ep.get('final_centroid_x', 0.0))
+            # Clamp to [0, 1] range
+            progress_values.append(max(0.0, min(1.0, final_cx / goal_x)))
+        progress = sum(progress_values) / max(1, len(progress_values))
+        
+        # Compute mean return
+        returns = [float(ep.get('return', 0.0)) for ep in recent_episodes]
+        return_mean = sum(returns) / max(1, len(returns))
+        
+        return {
+            'success_rate': float(success_rate),
+            'progress': float(progress),
+            'return_mean': float(return_mean)
+        }
+    
+    def _compute_composite_score(self, kpis: dict) -> float:
+        """
+        Compute weighted composite score for model selection.
+        
+        Uses hierarchical weighting: primary >> secondary >> tertiary
+        
+        Args:
+            kpis: dict with success_rate, progress, return_mean
+            
+        Returns:
+            composite_score: weighted sum (higher is better)
+        """
+        score = 0.0
+        
+        # Primary metric (e.g., success_rate with weight 1000)
+        if self.model_sel_primary_metric in kpis:
+            score += self.model_sel_primary_weight * kpis[self.model_sel_primary_metric]
+        
+        # Secondary metric (e.g., progress with weight 100)
+        if self.model_sel_secondary_metric in kpis:
+            score += self.model_sel_secondary_weight * kpis[self.model_sel_secondary_metric]
+        
+        # Tertiary metric (e.g., return_mean with weight 1)
+        if self.model_sel_tertiary_metric in kpis:
+            score += self.model_sel_tertiary_weight * kpis[self.model_sel_tertiary_metric]
+        
+        return float(score)
+    
+    def _should_save_best_model(self, kpis: dict, composite_score: float) -> bool:
+        """
+        Determine if current model should be saved as best.
+        
+        Args:
+            kpis: current KPI dict
+            composite_score: current composite score
+            
+        Returns:
+            True if this is a new best (with hysteresis threshold)
+        """
+        if self.best_model_score is None:
+            # First evaluation
+            return True
+        
+        # Check if improvement exceeds threshold (hysteresis)
+        improvement = (composite_score - self.best_model_score) / max(abs(self.best_model_score), 1e-6)
+        
+        return improvement >= self.model_sel_min_improvement
+
+    def _compute_rightward_progress_rate(self, episode_count: int) -> float:
+        """
+        Compute rightward progress rate over the last window_size episodes.
+        
+        Returns:
+            progress_rate (float): Fraction of episodes with positive net centroid movement (0.0-1.0)
+        """
+        if not hasattr(self.env, 'centroid_history') or len(self.env.centroid_history) < 2:
+            return 0.0
+        
+        # Get the last window_size episodes from episode_rewards
+        window = self.dm_scheduler_window_size
+        if len(self.episode_rewards.get('total_reward', [])) < window:
+            return 0.0  # Not enough data yet
+        
+        # Count episodes with net rightward progress (final - initial centroid > 0)
+        # We approximate this by looking at total rewards - higher reward correlates with rightward progress
+        recent_rewards = self.episode_rewards['total_reward'][-window:]
+        positive_episodes = sum(1 for r in recent_rewards if r > 0)
+        progress_rate = positive_episodes / window
+        
+        return progress_rate
+    
+    def _update_terminal_scale_scheduler(self, episode_count: int):
+        """
+        Update the adaptive terminal scale scheduler.
+        
+        If rightward progress is consistently good (>= threshold for consecutive windows),
+        reduce terminal_reward_scale to let dense distance signals dominate.
+        """
+        if not self.dm_scheduler_enabled:
+            return
+        
+        if not self.env.centroid_distance_only_mode:
+            return  # Only relevant for distance mode
+        
+        # Compute current progress rate
+        progress_rate = self._compute_rightward_progress_rate(episode_count)
+        self._dm_rightward_progress_history.append((episode_count, progress_rate))
+        
+        # Check if progress meets threshold
+        if progress_rate >= self.dm_scheduler_progress_threshold:
+            self._dm_consecutive_good_windows += 1
+        else:
+            self._dm_consecutive_good_windows = 0  # Reset counter
+        
+        # Trigger scale reduction if consecutive threshold is met
+        if self._dm_consecutive_good_windows >= self.dm_scheduler_consecutive_windows:
+            current_scale = self.env.dm_term_scale
+            new_scale = max(current_scale * self.dm_scheduler_decay_rate, self.dm_scheduler_min_scale)
+            
+            if new_scale != current_scale:
+                self.env.dm_term_scale = new_scale
+                self._dm_terminal_scale_history.append((episode_count, new_scale))
+                print(f"🔧 Adaptive Scheduler: Reduced terminal_reward_scale: {current_scale:.4f} → {new_scale:.4f} (Progress: {progress_rate:.2f})")
+            
+            # Reset consecutive counter after applying decay
+            self._dm_consecutive_good_windows = 0
+    
+    def _collect_and_process_episode(self, episode_count: int) -> Tuple:
+        """Helper function to collect an episode and add it to the buffer."""
+        self.trajectory_buffer.start_episode()
+        
+        states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode(episode_count)
+        
+        if not rewards:
+            return [], [], [], [], [], None, False, False
+        
+        for i in range(len(states)):
+            self.trajectory_buffer.add_step(
+                states[i], actions[i], rewards[i], values[i], log_probs[i], values[i]
+            )
+        
+        self.trajectory_buffer.finish_episode(final_values, terminated, success)
+        
+        self.update_component_stats(rewards)
+        
+        episode_total_reward = sum(r.get('total_reward', 0.0) for r in rewards)
+        self.episode_rewards['total_reward'].append(episode_total_reward)
+        for component in self.component_names:
+            component_reward = sum(r.get(component, 0.0) for r in rewards)
+            self.episode_rewards[component].append(component_reward)
+        
+        window = self.moving_avg_window
+        robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
+        self.smoothed_rewards.append(robust_ma)
+        
+        self.scheduler.step()
+        self.save_spawn_statistics(episode_count)
+        self.save_reward_statistics(episode_count)
+        
+        # Track episode data for model selection
+        if states:  # Only track if episode had valid data
+            # Get final centroid position from last state
+            final_state = states[-1] if states else None
+            final_centroid_x = 0.0
+            if final_state is not None and hasattr(self.env, 'topology'):
+                try:
+                    # Extract centroid from topology
+                    from state import TopologyState
+                    state_ext = TopologyState()
+                    state_ext.set_topology(self.env.topology)
+                    state_features = state_ext.get_state_features(include_substrate=False)
+                    if state_features['num_nodes'] > 0:
+                        graph_features = state_features.get('graph_features', [0, 0, 0, 0])
+                        final_centroid_x = graph_features[3].item() if hasattr(graph_features[3], 'item') else graph_features[3]
+                except:
+                    final_centroid_x = 0.0
+            
+            episode_data = {
+                'success': bool(success),
+                'final_centroid_x': float(final_centroid_x),
+                'goal_x': float(getattr(self.env, 'goal_x', 1.0)),
+                'return': float(episode_total_reward)
+            }
+            self.episode_history.append(episode_data)
+            
+            # Keep only recent window to avoid memory bloat
+            if len(self.episode_history) > self.model_sel_window_episodes * 2:
+                self.episode_history = self.episode_history[-self.model_sel_window_episodes:]
+        
+        # Update adaptive terminal scale scheduler (distance mode optimization)
+        self._update_terminal_scale_scheduler(episode_count)
+        
+        if self.enable_detailed_logging and self.detailed_node_logs:
+            self.save_detailed_node_logs(episode_count)
+            
+        latest_loss = self.losses['total_loss'][-1] if self.losses['total_loss'] else 0.0
+        smoothed_reward = self.smoothed_rewards[-1] if self.smoothed_rewards else episode_total_reward
+        milestone_bonus = sum(r.get('milestone_bonus', 0.0) for r in rewards)
+        print(f"Episode {episode_count:4d}: R={episode_total_reward:7.3f} (Smooth={smoothed_reward:6.2f}) | MB={milestone_bonus:4.1f} | Steps={len(states):3d} | Success={success} | Loss={latest_loss:7.4f}")
+
+        return states, actions, rewards, values, log_probs, final_values, terminated, success
     
     def train(self):
         """Main training loop with batch updates"""
@@ -3007,7 +3517,11 @@ class DurotaxisTrainer:
         if self.start_episode > 0:
             print(f"🔄 Resuming from episode {self.start_episode}")
         print(f"📁 Saving to: {self.run_dir}")
-        print(f"📊 Batch Training: {self.rollout_batch_size} episodes per batch, {self.update_epochs} update epochs, {self.minibatch_size} minibatch size")
+        if self.rollout_collection_mode == 'steps':
+            print(f"📊 Batch Mode: Collecting ~{self.rollout_steps} steps per batch.")
+        else:
+            print(f"📊 Batch Mode: Collecting {self.rollout_batch_size} episodes per batch.")
+        print(f"   Update Details: {self.update_epochs} update epochs, {self.minibatch_size} minibatch size")
         print(f"📊 Progress format: Batch | R: Current (MA: MovingAvg, Best: Best) | Loss | Entropy | LR: Learning Rate | Episodes | Success Rate | Focus: Component(Weight)")
         
         episode_count = self.start_episode
@@ -3021,80 +3535,39 @@ class DurotaxisTrainer:
             batch_episode_rewards = []
             batch_successes = []
             
-            # Collect rollout_batch_size episodes
-            for batch_episode in range(self.rollout_batch_size):
-                if episode_count >= self.total_episodes:
-                    break
+            # --- Step-based or Episode-based collection logic ---
+            if self.rollout_collection_mode == 'steps':
+                # Collect episodes until we have enough steps
+                total_steps_in_batch = 0
+                while total_steps_in_batch < self.rollout_steps:
+                    if episode_count >= self.total_episodes:
+                        break
                     
-                # Start new episode in buffer
-                self.trajectory_buffer.start_episode()
-                
-                # Collect episode using existing method
-                states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode(episode_count)
-                
-                if not rewards:
-                    continue
-                
-                # Add episode data to buffer
-                for i in range(len(states)):
-                    self.trajectory_buffer.add_step(
-                        states[i], actions[i], rewards[i], values[i], log_probs[i], values[i]  # old_values = values for first collection
-                    )
-                
-                # Finish episode in buffer
-                self.trajectory_buffer.finish_episode(final_values, terminated, success)
-                
-                # Update component statistics for adaptive scaling
-                self.update_component_stats(rewards)
-                
-                # Track episode rewards and success
-                episode_total_reward = sum(r.get('total_reward', 0.0) for r in rewards)
-                batch_episode_rewards.append(episode_total_reward)
-                batch_successes.append(success)
-                
-                # Update episode tracking
-                self.episode_rewards['total_reward'].append(episode_total_reward)
-                for component in self.component_names:
-                    component_reward = sum(r.get(component, 0.0) for r in rewards)
-                    self.episode_rewards[component].append(component_reward)
-                
-                # Enhanced reward smoothing with multiple methods
-                window = self.moving_avg_window if hasattr(self, 'moving_avg_window') else 20
-                simple_ma = moving_average(self.episode_rewards['total_reward'], window)
-                robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
-                ema = exponential_moving_average(self.episode_rewards['total_reward'])
-                
-                # Use robust moving average as primary smoothed metric
-                self.smoothed_rewards.append(robust_ma)
-                
-                # Track smoothed rewards for milestone_bonus component too
-                if 'milestone_bonus' in self.episode_rewards:
-                    milestone_smoothed = robust_moving_average(self.episode_rewards['milestone_bonus'], window//2)
-                else:
-                    milestone_rewards = [sum(r.get('milestone_bonus', 0.0) for r in rewards)]
-                    self.episode_rewards['milestone_bonus'] = self.episode_rewards.get('milestone_bonus', []) + milestone_rewards
-                    milestone_smoothed = milestone_rewards[0]
-                
-                # Update learning rate schedule
-                self.scheduler.step()
-                
-                # Compute and save spawn parameter statistics
-                self.save_spawn_statistics(episode_count)
-                
-                # Compute and save reward component statistics
-                self.save_reward_statistics(episode_count)
-                
-                # Save detailed node logs for this episode
-                if self.enable_detailed_logging and self.detailed_node_logs:
-                    self.save_detailed_node_logs(episode_count)
-                
-                # Enhanced episode progress print with smoothed metrics
-                latest_loss = self.losses['total_loss'][-1] if self.losses['total_loss'] else 0.0
-                smoothed_reward = self.smoothed_rewards[-1] if self.smoothed_rewards else episode_total_reward
-                milestone_bonus = sum(r.get('milestone_bonus', 0.0) for r in rewards)
-                print(f"Episode {episode_count:4d}: R={episode_total_reward:7.3f} (Smooth={smoothed_reward:6.2f}) | MB={milestone_bonus:4.1f} | Steps={len(states):3d} | Success={success} | Loss={latest_loss:7.4f}")
-                
-                episode_count += 1
+                    # Collect one full episode
+                    states, _, rewards, _, _, _, _, success = self._collect_and_process_episode(episode_count)
+                    if not states:
+                        episode_count += 1
+                        continue
+                    
+                    total_steps_in_batch += len(states)
+                    batch_episode_rewards.append(sum(r.get('total_reward', 0.0) for r in rewards))
+                    batch_successes.append(success)
+                    episode_count += 1
+            else:
+                # Original episode-based collection
+                for batch_episode in range(self.rollout_batch_size):
+                    if episode_count >= self.total_episodes:
+                        break
+                    
+                    # Collect one full episode
+                    states, _, rewards, _, _, _, _, success = self._collect_and_process_episode(episode_count)
+                    if not states:
+                        episode_count += 1
+                        continue
+
+                    batch_episode_rewards.append(sum(r.get('total_reward', 0.0) for r in rewards))
+                    batch_successes.append(success)
+                    episode_count += 1
             
             # ==========================================
             # PHASE 2: COMPUTE RETURNS AND ADVANTAGES
@@ -3193,8 +3666,11 @@ class DurotaxisTrainer:
                     smoothed_loss = moving_average(self.losses['total_loss'], window)
                     self.smoothed_losses.append(smoothed_loss)
 
-                # ---- Update per-episode JSON entries with computed episode loss ----
-                self.save_loss_statistics(episode_count)
+                # Calculate best reward for current batch
+                best_batch_reward = max(batch_episode_rewards) if batch_episode_rewards else None
+                
+                # ---- Update per-batch JSON entries with computed batch loss and best reward ----
+                self.save_loss_statistics(episode_count, batch_num=batch_count, best_reward=best_batch_reward)
                 try:
                     episode_loss_value = float(final_losses.get('total_policy_loss', None)) if final_losses else None
                     num_episodes_in_batch = len(batch_episode_rewards)
@@ -3334,11 +3810,36 @@ class DurotaxisTrainer:
                           f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
                           f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
                 
-                # Save best model (check against best episode in this batch)
-                best_batch_reward = max(batch_episode_rewards) if batch_episode_rewards else 0.0
-                if best_batch_reward > self.best_total_reward:
+                # ==========================================
+                # PHASE 5: MODEL SELECTION & CHECKPOINTING
+                # ==========================================
+                
+                # Compute model selection KPIs and composite score
+                kpis = self._compute_model_selection_kpis()
+                composite_score = self._compute_composite_score(kpis)
+                
+                # Check if this is a new best model
+                if self._should_save_best_model(kpis, composite_score):
+                    prev_score = self.best_model_score
+                    self.best_model_score = composite_score
+                    self.best_model_metrics = kpis.copy()
+                    self.best_model_filename = f"best_model_batch{batch_count}.pt"
+                    
+                    # Save the best model
+                    self.save_model(self.best_model_filename, episode_count)
+                    
+                    # Print detailed improvement message
+                    if prev_score is None:
+                        print(f"💾 Best model saved (initial): {self.best_model_filename}")
+                    else:
+                        improvement_pct = ((composite_score - prev_score) / max(abs(prev_score), 1e-6)) * 100
+                        print(f"💾 NEW BEST model saved: {self.best_model_filename} (score: {composite_score:.2f}, +{improvement_pct:.1f}%)")
+                    
+                    print(f"   📊 Metrics: success_rate={kpis['success_rate']:.3f}, progress={kpis['progress']:.3f}, return_mean={kpis['return_mean']:.2f}")
+                
+                # Keep old best_total_reward for backward compatibility
+                if best_batch_reward is not None and best_batch_reward > self.best_total_reward:
                     self.best_total_reward = best_batch_reward
-                    self.save_model(f"best_model_batch{batch_count}.pt", episode_count)
                 
                 # Periodic saves (only if checkpoint_every is configured)
                 if self.checkpoint_every is not None and batch_count % (self.checkpoint_every // self.rollout_batch_size) == 0 and batch_count > 0:
@@ -3613,13 +4114,34 @@ class DurotaxisTrainer:
         
         return stats
     
-    def save_loss_statistics(self, episode: int) -> None:
-        """Save per-episode and smoothed losses to JSON file for analysis"""
+    def save_loss_statistics(self, episode: int, batch_num: int = None, best_reward: float = None) -> None:
+        """Save per-batch losses and best reward to JSON file for analysis"""
         metrics_path = os.path.join(self.run_dir, 'loss_metrics.json')
+        
+        # Compute current model selection KPIs
+        kpis = self._compute_model_selection_kpis()
+        composite_score = self._compute_composite_score(kpis)
+        
         metrics = {
             'episode': episode,
+            'batch': batch_num,
             'loss': self.losses['total_loss'][-1] if self.losses['total_loss'] else None,
-            'smoothed_loss': self.smoothed_losses[-1] if self.smoothed_losses else None
+            'smoothed_loss': self.smoothed_losses[-1] if self.smoothed_losses else None,
+            'best_reward': float(best_reward) if best_reward is not None else None,
+            'checkpoint_filename': self.last_checkpoint_filename,  # Track which checkpoint contains this episode
+            
+            # Model selection metrics (NEW)
+            'model_selection': {
+                'composite_score': float(composite_score),
+                'best_composite_score': float(self.best_model_score) if self.best_model_score is not None else None,
+                'best_model_filename': self.best_model_filename,
+                'kpis': {
+                    'success_rate': float(kpis['success_rate']),
+                    'progress': float(kpis['progress']),
+                    'return_mean': float(kpis['return_mean'])
+                },
+                'best_kpis': self.best_model_metrics.copy() if self.best_model_metrics else None
+            }
         }
         # Append to file
         if os.path.exists(metrics_path):
@@ -3668,7 +4190,10 @@ class DurotaxisTrainer:
             'learning_rate': float(self.optimizer.param_groups[0]['lr']) if hasattr(self, 'optimizer') else None,
             'component_weights_snapshot': dict(self.component_weights) if hasattr(self, 'component_weights') else None,
             'spawn_summary': dict(self.current_spawn_summary) if hasattr(self, 'current_spawn_summary') else None,
-            'success': None
+            'success': None,
+            # Distance mode scheduler history
+            'dm_terminal_scale': self.env.dm_term_scale if hasattr(self.env, 'dm_term_scale') else None,
+            'dm_progress_rate': self._dm_rightward_progress_history[-1][1] if self._dm_rightward_progress_history else None
         }
 
         # Load existing data if file exists, otherwise start with empty list
@@ -3734,13 +4259,22 @@ class DurotaxisTrainer:
             'best_reward': self.best_total_reward,
             'component_weights': self.component_weights,
             'run_number': self.run_number,
-            'episode_count': episode_count,  # Track episode progress
+            'episode_count': episode_count,  # Next episode to run (episodes 0 to episode_count-1 are completed)
             'smoothed_rewards': self.smoothed_rewards,
             'smoothed_losses': self.smoothed_losses,
+            # Model selection metrics (for preserving across restarts)
+            'best_model_score': self.best_model_score,
+            'best_model_metrics': self.best_model_metrics.copy() if self.best_model_metrics else {},
+            'best_model_filename': self.best_model_filename,
+            'episode_history': self.episode_history.copy() if self.episode_history else [],
         }
         
         filepath = os.path.join(self.run_dir, filename)
         torch.save(checkpoint, filepath)
+        
+        # Track last checkpoint for loss metrics logging
+        self.last_checkpoint_filename = filename
+        
         print(f"💾 Saved: {filename} (Run #{self.run_number}, Episode {episode_count})")
     
     def _load_checkpoint_for_resume(self, resume_config: dict):
@@ -3800,10 +4334,12 @@ class DurotaxisTrainer:
                 print(f"   ⚠️ Optimizer state reset (as configured)")
             
             # Conditionally load episode count
+            # NOTE: episode_count in checkpoint represents the NEXT episode to run
+            # (it's incremented after each episode completes, so it's always "ready for next")
             if not resume_config.get('reset_episode_count', False):
                 if 'episode_count' in checkpoint:
                     self.start_episode = checkpoint['episode_count']
-                    print(f"   ✅ Resuming from episode {self.start_episode}")
+                    print(f"   ✅ Resuming from episode {self.start_episode} (next episode to run)")
             else:
                 self.start_episode = 0
                 print(f"   ⚠️ Episode count reset to 0 (as configured)")
@@ -3832,6 +4368,27 @@ class DurotaxisTrainer:
             if 'smoothed_losses' in checkpoint:
                 self.smoothed_losses = checkpoint['smoothed_losses']
                 print(f"   ✅ Loaded smoothed losses")
+            
+            # Load model selection metrics (if available)
+            if 'best_model_score' in checkpoint:
+                self.best_model_score = checkpoint['best_model_score']
+                print(f"   ✅ Loaded best model score: {self.best_model_score:.2f}" if self.best_model_score is not None else "   ✅ Loaded best model score: None")
+            
+            if 'best_model_metrics' in checkpoint:
+                self.best_model_metrics = checkpoint['best_model_metrics']
+                if self.best_model_metrics:
+                    print(f"   ✅ Loaded best model metrics: success_rate={self.best_model_metrics.get('success_rate', 0):.3f}, "
+                          f"progress={self.best_model_metrics.get('progress', 0):.3f}")
+            
+            if 'best_model_filename' in checkpoint:
+                self.best_model_filename = checkpoint['best_model_filename']
+                if self.best_model_filename:
+                    print(f"   ✅ Loaded best model filename: {self.best_model_filename}")
+            
+            if 'episode_history' in checkpoint:
+                self.episode_history = checkpoint['episode_history']
+                if self.episode_history:
+                    print(f"   ✅ Loaded episode history: {len(self.episode_history)} episodes")
             
             print(f"✅ Resume checkpoint loaded successfully!")
             
