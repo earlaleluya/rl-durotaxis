@@ -2631,14 +2631,13 @@ class DurotaxisTrainer:
         # STAGE 2: Learn all 5 continuous parameters [delete_ratio, gamma, alpha, noise, theta]
         if ('continuous' in old_log_probs_dict and 
             'continuous_log_probs' in eval_output and 
-            len(old_log_probs_dict['continuous']) > 0 and 
-            len(eval_output['continuous_log_probs']) > 0):
+            old_log_probs_dict['continuous'].numel() > 0 and 
+            eval_output['continuous_log_probs'].numel() > 0):
             
-            # For hybrid action spaces with varying graph sizes, we need to aggregate first
-            # This is because the number of nodes (and thus log_probs) can change between
-            # action collection and re-evaluation. We use .mean() for numerical stability.
-            old_continuous_log_prob = old_log_probs_dict['continuous'].mean()
-            new_continuous_log_prob = eval_output['continuous_log_probs'].mean()
+            # For delete ratio architecture, log_probs are scalars (0-d tensors)
+            # Use .item() to get the scalar value, or keep as tensor for autograd
+            old_continuous_log_prob = old_log_probs_dict['continuous']
+            new_continuous_log_prob = eval_output['continuous_log_probs']
             
             # Approximate KL divergence: KL ≈ E[log π_old - log π_new] (device-agnostic)
             approx_kl_continuous = (old_continuous_log_prob - new_continuous_log_prob).clamp_min(0.0)
