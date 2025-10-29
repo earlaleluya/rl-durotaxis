@@ -1258,20 +1258,25 @@ class DurotaxisTrainer:
             else:
                 node_end = node_start + num_nodes
                 
-                # Extract node-level outputs for this graph
+                # Extract outputs for this graph
                 output = {}
                 
-                # Node-level tensors (continuous actions and log probs)
-                for key in ['continuous_actions', 'continuous_log_probs', 'total_log_probs']:
-                    if key in batched_output and batched_output[key].shape[0] > 0:
-                        output[key] = batched_output[key][node_start:node_end]
+                # DELETE RATIO ARCHITECTURE:
+                # - continuous_actions: [batch_size, 5] -> extract [5] for this graph
+                # - continuous_log_probs: [batch_size] -> extract scalar for this graph (NOT per-node!)
+                # - total_log_probs: [batch_size] -> extract scalar for this graph
+                
+                if 'continuous_actions' in batched_output and batched_output['continuous_actions'].shape[0] > i:
+                    output['continuous_actions'] = batched_output['continuous_actions'][i]
+                else:
+                    output['continuous_actions'] = torch.empty(0, 5, device=self.device)
+                
+                # Log probs are per-graph (scalars), not per-node!
+                for key in ['continuous_log_probs', 'total_log_probs']:
+                    if key in batched_output and batched_output[key].shape[0] > i:
+                        output[key] = batched_output[key][i]  # Extract scalar for this graph
                     else:
-                        # Handle missing keys
-                        if 'actions' in key:
-                            # Continuous actions only (delete ratio architecture)
-                            output[key] = torch.empty(0, 5, device=self.device)
-                        else:
-                            output[key] = torch.empty(0, device=self.device)
+                        output[key] = torch.tensor(0.0, device=self.device)
                 
                 # Graph-level value predictions (one per graph)
                 if 'value_predictions' in batched_output:
