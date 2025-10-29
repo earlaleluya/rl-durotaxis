@@ -2175,9 +2175,9 @@ class DurotaxisEnv(gym.Env):
 
         # 5. Terminate if one node from the graph reaches the rightmost area ('success termination')
         if state['num_nodes'] > 0:
-            # Get substrate width to determine success threshold (last 5% of width)
+            # Get substrate width to determine success threshold (last 1% of width)
             substrate_width = self.substrate.width
-            success_threshold = substrate_width * 0.95  # Success when reaching 95% of width (last 5% area)
+            success_threshold = substrate_width * 0.99  # Success when reaching 99% of width (last 1% area)
             
             # Check each node's x-position (first element of node_features)
             node_features = state['node_features']
