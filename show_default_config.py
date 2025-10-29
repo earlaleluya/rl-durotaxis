@@ -9,7 +9,7 @@ def display_default_config():
     """Display the current default configuration from config.yaml"""
     
     print("=" * 80)
-    print("📋 DEFAULT CONFIGURATION SUMMARY")
+    print("📋 DEFAULT CONFIGURATION SUMMARY (Delete Ratio Architecture)")
     print("=" * 80)
     
     # Load configuration
@@ -23,47 +23,36 @@ def display_default_config():
     
     pretrained_weights = actor_critic_config.get('pretrained_weights', 'not set')
     print(f"  Pretrained Weights: {pretrained_weights}")
+    print(f"  Action Space: Delete Ratio (5D continuous)")
+    print(f"    - [delete_ratio, gamma, alpha, noise, theta]")
     
-    wsa_config = actor_critic_config.get('wsa', {})
-    wsa_enabled = wsa_config.get('enabled', False)
-    print(f"  WSA Enabled: {wsa_enabled}")
-    
-    sem_config = actor_critic_config.get('simplicial_embedding', {})
+    # Get encoder config for SEM
+    encoder_config = config_loader.get_encoder_config()
+    sem_config = encoder_config.get('simplicial_embedding', {})
     sem_enabled = sem_config.get('enabled', False)
     print(f"  SEM Enabled: {sem_enabled}")
+    if sem_enabled:
+        print(f"    - Num Groups: {sem_config.get('num_groups', 'not set')}")
+        print(f"    - Temperature: {sem_config.get('temperature', 'not set')}")
     
-    # Determine which ablation configuration this matches
+    # Determine ablation configuration (simplified for delete ratio)
     print("\n🎯 ABLATION CONFIGURATION:")
     print("-" * 80)
     
-    if not wsa_enabled and not sem_enabled:
+    if not sem_enabled:
         if pretrained_weights == 'imagenet':
-            config_name = "a1"
-            description = "Baseline - ImageNet + No WSA + No SEM"
+            config_name = "baseline"
+            description = "Baseline - ImageNet + No SEM"
         else:
-            config_name = "a2"
-            description = "Baseline - Random + No WSA + No SEM"
-    elif wsa_enabled and not sem_enabled:
+            config_name = "random_baseline"
+            description = "Baseline - Random Weights + No SEM"
+    else:
         if pretrained_weights == 'imagenet':
-            config_name = "b1"
-            description = "WSA Enhancement - ImageNet + WSA + No SEM"
+            config_name = "sem_enhanced"
+            description = "SEM Enhanced - ImageNet + SEM"
         else:
-            config_name = "b2"
-            description = "WSA Enhancement - Random + WSA + No SEM"
-    elif not wsa_enabled and sem_enabled:
-        if pretrained_weights == 'imagenet':
-            config_name = "c1"
-            description = "SEM Enhancement - ImageNet + No WSA + SEM"
-        else:
-            config_name = "c2"
-            description = "SEM Enhancement - Random + No WSA + SEM"
-    else:  # both enabled
-        if pretrained_weights == 'imagenet':
-            config_name = "d1"
-            description = "Full Stack - ImageNet + WSA + SEM"
-        else:
-            config_name = "d2"
-            description = "Full Stack - Random + WSA + SEM"
+            config_name = "random_sem"
+            description = "SEM Enhanced - Random Weights + SEM"
     
     print(f"  Configuration: {config_name}")
     print(f"  Description: {description}")
@@ -124,7 +113,8 @@ def display_default_config():
     # Summary
     print("📝 QUICK SUMMARY:")
     print(f"  • Running 'python train.py' will use configuration {config_name}")
-    print(f"  • Pretrained: {pretrained_weights}, WSA: {wsa_enabled}, SEM: {sem_enabled}")
+    print(f"  • Architecture: Delete Ratio (5D continuous action)")
+    print(f"  • Pretrained: {pretrained_weights}, SEM: {sem_enabled}")
     print(f"  • Training for {trainer_config.get('total_episodes')} episodes")
     print(f"  • Max {env_config.get('max_steps')} steps per episode")
     print("")

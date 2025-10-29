@@ -1,15 +1,22 @@
 """
-Hybrid Actor-Critic Network for Durotaxis Environment
+Delete Ratio Actor-Critic Network for Durotaxis Environment
 
 This module implements a decoupled actor-critic architecture that handles:
-1. Discrete actions: spawn/delete decisions per node
-2. Continuous actions: spawn parameters (gamma, alpha, noise, theta)
-3. Multi-component value estimation for different reward components
-4. Graph neural network integration via GraphInputEncoder
-5. Pre-trained ResNet backbone for enhanced feature extraction and stability.
+1. Single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+   - delete_ratio: fraction of leftmost nodes to delete (0.0 to 0.5)
+   - gamma, alpha, noise, theta: spawn parameters applied to all non-deleted nodes
+2. Multi-component value estimation for different reward components
+3. Graph neural network integration via GraphInputEncoder
+4. Pre-trained ResNet backbone for enhanced feature extraction and stability
 
 The architecture is designed to work with the durotaxis environment's
 reward component dictionary structure for flexible learning updates.
+
+Architecture Strategy:
+- Processes all nodes through ResNet backbone
+- Aggregates node features via mean pooling
+- Outputs single global action vector (not per-node actions)
+- Delete ratio determines which nodes to delete based on x-position sorting
 """
 
 import torch
@@ -78,10 +85,19 @@ def _safe_masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor
 class Actor(nn.Module):
     """
     The Actor network for the Hybrid Actor-Critic agent.
-    It takes node and graph features and outputs action distributions.
+    Outputs a SINGLE GLOBAL continuous action vector: [delete_ratio, gamma, alpha, noise, theta]
+    
+    Architecture:
+    - Processes all nodes through ResNet backbone
+    - Aggregates node features (mean pooling)
+    - Outputs single continuous action for the entire graph
+    
+    Delete Ratio Strategy:
+    - delete_ratio ∈ [0.0, 0.5]: fraction of leftmost nodes to delete
+    - Remaining nodes spawn with parameters (gamma, alpha, noise, theta)
     """
-    def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate, 
-                 pretrained_weights='imagenet', spawn_bias_init: float = 0.0,
+    def __init__(self, encoder_out_dim, hidden_dim, continuous_dim, dropout_rate,
+                 pretrained_weights='imagenet',
                  backbone_cfg: Optional[dict] = None):
         super().__init__()
         backbone_cfg = backbone_cfg or {}
@@ -108,16 +124,18 @@ class Actor(nn.Module):
         # Optional freezing strategy
         self._apply_freeze(self.resnet_body, self.freeze_mode)
 
+        # Global action MLP: aggregates per-node features into single graph-level action
         self.action_mlp = nn.Sequential(
             nn.Linear(512, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout_rate)
         )
-        self.discrete_head = nn.Linear(hidden_dim, num_discrete_actions)
+        
+        # Single continuous action head for global parameters
+        # Output: [delete_ratio, gamma, alpha, noise, theta]
         self.continuous_mu_head = nn.Linear(hidden_dim, continuous_dim)
         self.continuous_logstd_head = nn.Linear(hidden_dim, continuous_dim)
-        self.discrete_bias = nn.Parameter(torch.tensor([float(spawn_bias_init), 0.0], dtype=torch.float32), requires_grad=True)
 
     def _apply_freeze(self, backbone: nn.Module, mode: str):
         # mode: 'all' | 'until_layer3' | 'last_block' | 'none'
@@ -189,39 +207,41 @@ class Actor(nn.Module):
             
             shared_features = torch.cat(resnet_outputs, dim=0)
 
-        # Pass through final MLP (stays on original device)
-        shared_features = self.action_mlp(shared_features)
+        # Aggregate per-node features into single graph-level representation
+        # Use mean pooling to get a global context from all nodes
+        aggregated_features = shared_features.mean(dim=0, keepdim=True)  # [1, 512]
         
-        # Aggressive NaN/Inf check on shared features (critical failure point)
-        if torch.isnan(shared_features).any() or torch.isinf(shared_features).any():
-            print("⚠️  WARNING: NaN/Inf detected in Actor shared_features! Sanitizing...")
-            shared_features = torch.nan_to_num(shared_features, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Pass through final MLP
+        global_features = self.action_mlp(aggregated_features)  # [1, hidden_dim]
+        
+        # Aggressive NaN/Inf check on global features (critical failure point)
+        if torch.isnan(global_features).any() or torch.isinf(global_features).any():
+            print("⚠️  WARNING: NaN/Inf detected in Actor global_features! Sanitizing...")
+            global_features = torch.nan_to_num(global_features, nan=0.0, posinf=10.0, neginf=-10.0)
 
-        # --- Action Heads ---
-        discrete_logits = self.discrete_head(shared_features)
-        # Apply optional spawn bias to encourage growth; broadcast to all nodes
-        if self.discrete_bias is not None:
-            discrete_logits = discrete_logits + self.discrete_bias.unsqueeze(0).expand_as(discrete_logits)
-        continuous_mu = self.continuous_mu_head(shared_features)
-        continuous_logstd = self.continuous_logstd_head(shared_features)
+        # --- Single Global Continuous Action ---
+        # Output: [delete_ratio, gamma, alpha, noise, theta]
+        continuous_mu = self.continuous_mu_head(global_features).squeeze(0)  # [continuous_dim]
+        continuous_logstd = self.continuous_logstd_head(global_features).squeeze(0)  # [continuous_dim]
         
         # Tighter clamping for numerical stability (prevent exp overflow in distributions)
-        discrete_logits = torch.clamp(discrete_logits, -30.0, 30.0)  # Tightened from -20/20
         continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
         continuous_logstd = torch.clamp(continuous_logstd, -10.0, 5.0)
         
         # Final NaN check before returning (defensive programming)
-        discrete_logits = torch.nan_to_num(discrete_logits, nan=0.0)
         continuous_mu = torch.nan_to_num(continuous_mu, nan=0.0)
         continuous_logstd = torch.nan_to_num(continuous_logstd, nan=0.0)
 
-        return discrete_logits, continuous_mu, continuous_logstd
+        return continuous_mu, continuous_logstd
 
 
 class Critic(nn.Module):
     """
-    The Critic network for the Hybrid Actor-Critic agent.
-    It takes node and graph features and outputs state values for different reward components.
+    The Critic network for the Delete Ratio Actor-Critic agent.
+    
+    Processes graph-level features through ResNet backbone to estimate state values
+    for different reward components. Works with the delete ratio architecture where
+    actions are global (not per-node).
     """
     def __init__(self, encoder_out_dim, hidden_dim, value_components: List[str], dropout_rate,
                  pretrained_weights='imagenet', backbone_cfg: Optional[dict] = None):
@@ -299,9 +319,16 @@ class Critic(nn.Module):
 
 class HybridActorCritic(nn.Module):
     """
-    Decoupled Hybrid Actor-Critic network for the durotaxis environment.
+    Delete Ratio Actor-Critic network for the durotaxis environment.
     
-    This class orchestrates the GraphInputEncoder, Actor, and Critic modules.
+    This class orchestrates the GraphInputEncoder, Actor, and Critic modules
+    to produce a single global continuous action vector: [delete_ratio, gamma, alpha, noise, theta].
+    
+    Delete Ratio Strategy:
+    - Actor outputs one action for the entire graph (not per-node)
+    - delete_ratio determines fraction of leftmost nodes to delete
+    - Remaining nodes spawn with global parameters (gamma, alpha, noise, theta)
+    - Critic evaluates graph-level state values
     """
     
     def __init__(self, 
@@ -309,7 +336,12 @@ class HybridActorCritic(nn.Module):
                  config_path: str = "config.yaml",
                  **overrides):
         """
-        Initialize HybridActorCritic with configuration from YAML file
+        Initialize HybridActorCritic with configuration from YAML file.
+        
+        Args:
+            encoder: GraphInputEncoder for processing graph state
+            config_path: Path to config.yaml
+            **overrides: Configuration overrides
         """
         super().__init__()
         
@@ -322,8 +354,7 @@ class HybridActorCritic(nn.Module):
         
         self.encoder = encoder
         self.hidden_dim = config.get('hidden_dim', 128)
-        self.num_discrete_actions = config.get('num_discrete_actions', 2)
-        self.continuous_dim = config.get('continuous_dim', 4)
+        self.continuous_dim = config.get('continuous_dim', 5)  # [delete_ratio, gamma, alpha, noise, theta]
         self.dropout_rate = config.get('dropout_rate', 0.1)
 
         # Value components configuration
@@ -339,62 +370,15 @@ class HybridActorCritic(nn.Module):
         # Backbone configuration for freezing and input adaptation
         backbone_cfg = config.get('backbone', {})
         
-        # Check if WSA (Weight Sharing Attention) is enabled
-        wsa_config = config.get('wsa', {})
-        self.use_wsa = wsa_config.get('enabled', False)
-
-        # Spawn bias configuration (optional, low-risk exploration boost)
-        self.spawn_bias_init = float(config.get('spawn_bias_init', 0.0))
-
-        # Decoupled Actor and Critic
-        if self.use_wsa:
-            print("\n" + "="*60)
-            print("🔄 WSA (Weight Sharing Attention) ENABLED")
-            print("="*60)
-            
-            # Import WSA-enhanced actor
-            try:
-                from pretrained_fusion import WSAEnhancedActor
-                
-                self.actor = WSAEnhancedActor(
-                    encoder_out_dim=self.encoder.out_dim,
-                    hidden_dim=self.hidden_dim,
-                    num_discrete_actions=self.num_discrete_actions,
-                    continuous_dim=self.continuous_dim,
-                    dropout_rate=self.dropout_rate,
-                    wsa_config=wsa_config,
-                    use_wsa=True
-                )
-                
-                print("✅ WSA-Enhanced Actor initialized successfully")
-                print("="*60 + "\n")
-                
-            except ImportError as e:
-                print(f"❌ Failed to import WSA module: {e}")
-                print("⚠️  Falling back to standard Actor")
-                self.use_wsa = False
-                
-                self.actor = Actor(
-                    encoder_out_dim=self.encoder.out_dim,
-                    hidden_dim=self.hidden_dim,
-                    num_discrete_actions=self.num_discrete_actions,
-                    continuous_dim=self.continuous_dim,
-                    dropout_rate=self.dropout_rate,
-                    pretrained_weights=pretrained_weights,
-                    spawn_bias_init=self.spawn_bias_init
-                )
-        else:
-            print("\n🔧 Using standard Actor (WSA disabled)")
-            self.actor = Actor(
-                encoder_out_dim=self.encoder.out_dim,
-                hidden_dim=self.hidden_dim,
-                num_discrete_actions=self.num_discrete_actions,
-                continuous_dim=self.continuous_dim,
-                dropout_rate=self.dropout_rate,
-                pretrained_weights=pretrained_weights,
-                spawn_bias_init=self.spawn_bias_init,
-                backbone_cfg=backbone_cfg
-            )
+        print("\n🔧 Using standard Actor with delete_ratio action space")
+        self.actor = Actor(
+            encoder_out_dim=self.encoder.out_dim,
+            hidden_dim=self.hidden_dim,
+            continuous_dim=self.continuous_dim,
+            dropout_rate=self.dropout_rate,
+            pretrained_weights=pretrained_weights,
+            backbone_cfg=backbone_cfg
+        )
         self.critic = Critic(
             encoder_out_dim=self.encoder.out_dim,
             hidden_dim=self.hidden_dim,
@@ -405,19 +389,22 @@ class HybridActorCritic(nn.Module):
         )
         
         # Parameter bounds for continuous actions from config
-        spawn_bounds = config.get('spawn_parameter_bounds', {
-            'gamma': [0.1, 10.0],
-            'alpha': [0.1, 5.0],
-            'noise': [0.0, 2.0],
-            'theta': [-math.pi, math.pi]
+        # New action space: [delete_ratio, gamma, alpha, noise, theta]
+        action_bounds_config = config.get('action_parameter_bounds', {
+            'delete_ratio': [0.0, 0.5],
+            'gamma': [0.5, 15.0],
+            'alpha': [0.5, 4.0],
+            'noise': [0.05, 0.5],
+            'theta': [-0.5236, 0.5236]
         })
         
         # Create action_bounds with explicit float32 dtype for device consistency
         bounds_list = [
-            spawn_bounds.get('gamma', [0.1, 10.0]),
-            spawn_bounds.get('alpha', [0.1, 5.0]),
-            spawn_bounds.get('noise', [0.0, 2.0]),
-            spawn_bounds.get('theta', [-math.pi, math.pi])
+            action_bounds_config.get('delete_ratio', [0.0, 0.5]),
+            action_bounds_config.get('gamma', [0.5, 15.0]),
+            action_bounds_config.get('alpha', [0.5, 4.0]),
+            action_bounds_config.get('noise', [0.05, 0.5]),
+            action_bounds_config.get('theta', [-0.5236, 0.5236])
         ]
         self.register_buffer('action_bounds', torch.tensor(bounds_list, dtype=torch.float32))
         
@@ -462,24 +449,23 @@ class HybridActorCritic(nn.Module):
         print(f"  ✅ Trainable Parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
         print(f"  ❄️  Frozen Parameters: {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
         
-        # Break down by component
-        if not self.use_wsa:
-            actor_backbone_params = sum(p.numel() for p in self.actor.resnet_body.parameters())
-            actor_backbone_trainable = sum(p.numel() for p in self.actor.resnet_body.parameters() if p.requires_grad)
-            
-            critic_backbone_params = sum(p.numel() for p in self.critic.resnet_body.parameters())
-            critic_backbone_trainable = sum(p.numel() for p in self.critic.resnet_body.parameters() if p.requires_grad)
-            
-            actor_head_params = sum(p.numel() for p in self.actor.parameters()) - actor_backbone_params
-            critic_head_params = sum(p.numel() for p in self.critic.parameters()) - critic_backbone_params
-            
-            print(f"\n  🎭 Actor Breakdown:")
-            print(f"      Backbone: {actor_backbone_params:,} ({actor_backbone_trainable:,} trainable)")
-            print(f"      Heads: {actor_head_params:,} (all trainable)")
-            
-            print(f"  🎯 Critic Breakdown:")
-            print(f"      Backbone: {critic_backbone_params:,} ({critic_backbone_trainable:,} trainable)")
-            print(f"      Heads: {critic_head_params:,} (all trainable)")
+        # Break down by component (standard Actor-Critic only, WSA removed)
+        actor_backbone_params = sum(p.numel() for p in self.actor.resnet_body.parameters())
+        actor_backbone_trainable = sum(p.numel() for p in self.actor.resnet_body.parameters() if p.requires_grad)
+        
+        critic_backbone_params = sum(p.numel() for p in self.critic.resnet_body.parameters())
+        critic_backbone_trainable = sum(p.numel() for p in self.critic.resnet_body.parameters() if p.requires_grad)
+        
+        actor_head_params = sum(p.numel() for p in self.actor.parameters()) - actor_backbone_params
+        critic_head_params = sum(p.numel() for p in self.critic.parameters()) - critic_backbone_params
+        
+        print(f"\n  🎭 Actor Breakdown:")
+        print(f"      Backbone: {actor_backbone_params:,} ({actor_backbone_trainable:,} trainable)")
+        print(f"      Heads: {actor_head_params:,} (all trainable)")
+        
+        print(f"  🎯 Critic Breakdown:")
+        print(f"      Backbone: {critic_backbone_params:,} ({critic_backbone_trainable:,} trainable)")
+        print(f"      Heads: {critic_head_params:,} (all trainable)")
         
         # Learning rate information
         backbone_lr = backbone_cfg.get('backbone_lr', 1e-4)
@@ -503,11 +489,6 @@ class HybridActorCritic(nn.Module):
             self.actor.resnet_body.eval()
         if self.critic and hasattr(self.critic, 'resnet_body'):
             self.critic.resnet_body.eval()
-        # Also handle WSA feature extractors
-        if self.use_wsa and hasattr(self.actor, 'feature_extractor'):
-            for ptm in self.actor.feature_extractor.ptms:
-                if hasattr(ptm, 'backbone'):
-                    ptm.backbone.eval()
         return self
 
     def _init_weights(self, module):
@@ -521,7 +502,20 @@ class HybridActorCritic(nn.Module):
                 deterministic: bool = False,
                 action_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through the hybrid actor-critic network.
+        Forward pass through the delete ratio actor-critic network.
+        
+        Args:
+            state_dict: Graph state containing node_features, graph_features, edge_attr, edge_index
+            deterministic: If True, return mean actions; if False, sample from distributions
+            action_mask: Unused in delete ratio architecture (kept for API compatibility)
+        
+        Returns:
+            Dictionary containing:
+            - continuous_mu: Mean of continuous action distribution [5]
+            - continuous_std: Std of continuous action distribution [5]
+            - continuous_actions: Sampled or deterministic actions [delete_ratio, gamma, alpha, noise, theta]
+            - value_predictions: Dict of value estimates for each component
+            - encoder_out: Graph and node embeddings
         """
         # Extract components from state
         node_features = state_dict['node_features']
@@ -551,16 +545,11 @@ class HybridActorCritic(nn.Module):
         node_tokens = encoder_out[1:]
         
         # === ACTOR and CRITIC FORWARD PASS ===
-        discrete_logits, continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
+        # Actor now outputs SINGLE GLOBAL continuous action: [delete_ratio, gamma, alpha, noise, theta]
+        continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
         value_predictions, graph_value_features = self.critic(graph_token)
 
         # --- Post-processing and Sanitization ---
-        # Clamp logits before masking to prevent extreme values
-        discrete_logits = torch.clamp(discrete_logits, min=-30.0, max=30.0)
-        
-        # Apply numerically stable masking and get safe logits
-        stable_logits = _safe_masked_logits(discrete_logits, action_mask)
-        
         # Clean continuous parameters
         continuous_mu = torch.nan_to_num(continuous_mu, nan=0.0)
         continuous_logstd = torch.nan_to_num(continuous_logstd, nan=0.0)
@@ -572,7 +561,6 @@ class HybridActorCritic(nn.Module):
         # === OUTPUT PREPARATION ===
         output = {
             'encoder_out': encoder_out,
-            'discrete_logits': stable_logits,  # Return stabilized logits
             'continuous_mu': continuous_mu_bounded,
             'continuous_std': continuous_std,
             'value_predictions': value_predictions,
@@ -580,11 +568,6 @@ class HybridActorCritic(nn.Module):
         }
         
         if not deterministic:
-            # Use Categorical(logits=...) for numerical stability (PyTorch handles softmax internally)
-            discrete_dist = torch.distributions.Categorical(logits=stable_logits)
-            discrete_actions = discrete_dist.sample()
-            discrete_log_probs = discrete_dist.log_prob(discrete_actions)
-            
             continuous_dist = torch.distributions.Normal(continuous_mu, continuous_std)
             continuous_actions_raw = continuous_dist.sample()
             continuous_log_probs = continuous_dist.log_prob(continuous_actions_raw).sum(dim=-1)
@@ -592,29 +575,29 @@ class HybridActorCritic(nn.Module):
             continuous_actions = self._apply_bounds(continuous_actions_raw)
             
             output.update({
-                'discrete_actions': discrete_actions,
                 'continuous_actions': continuous_actions,
-                'discrete_log_probs': discrete_log_probs,
                 'continuous_log_probs': continuous_log_probs,
-                'total_log_probs': discrete_log_probs + continuous_log_probs
+                'total_log_probs': continuous_log_probs  # Only continuous actions now
             })
         else:
             output.update({
-                'discrete_actions': torch.argmax(stable_logits, dim=-1),
                 'continuous_actions': continuous_mu_bounded
             })
         
         return output
     
     def _apply_bounds(self, actions: torch.Tensor) -> torch.Tensor:
-        """Apply parameter bounds to continuous actions."""
+        """
+        Apply parameter bounds to continuous actions.
+        Action space: [delete_ratio, gamma, alpha, noise, theta]
+        """
         bounded_actions = actions.clone()
         
         for i, (min_val, max_val) in enumerate(self.action_bounds):
             if i < actions.shape[-1]:
-                if i == 3:  # theta: use tanh for circular bounds
-                    bounded_actions[..., i] = torch.tanh(actions[..., i]) * math.pi
-                else:  # gamma, alpha, noise: use sigmoid scaling
+                if i == 4:  # theta (index 4): use tanh for circular bounds [-π/4, π/4]
+                    bounded_actions[..., i] = torch.tanh(actions[..., i]) * (max_val - min_val) / 2.0 + (max_val + min_val) / 2.0
+                else:  # delete_ratio, gamma, alpha, noise: use sigmoid scaling
                     bounded_actions[..., i] = torch.sigmoid(actions[..., i]) * (max_val - min_val) + min_val
         
         return bounded_actions
@@ -628,36 +611,32 @@ class HybridActorCritic(nn.Module):
         
         return {
             'encoder_out': torch.empty(1, self.encoder.out_dim, device=device),
-            'discrete_logits': torch.empty(0, self.num_discrete_actions, device=device),
-            'discrete_probs': torch.empty(0, self.num_discrete_actions, device=device),
-            'continuous_mu': torch.empty(0, self.continuous_dim, device=device),
-            'continuous_std': torch.empty(0, self.continuous_dim, device=device),
+            'continuous_mu': torch.zeros(self.continuous_dim, device=device),
+            'continuous_std': torch.ones(self.continuous_dim, device=device),
             'value_predictions': value_predictions,
-            'discrete_actions': torch.empty(0, dtype=torch.long, device=device),
-            'continuous_actions': torch.empty(0, self.continuous_dim, device=device),
-            'discrete_log_probs': torch.empty(0, device=device),
-            'continuous_log_probs': torch.empty(0, device=device),
-            'total_log_probs': torch.empty(0, device=device)
+            'continuous_actions': torch.zeros(self.continuous_dim, device=device),
+            'continuous_log_probs': torch.tensor(0.0, device=device),
+            'total_log_probs': torch.tensor(0.0, device=device)
         }
     
     def evaluate_actions(self, state_dict: Dict[str, torch.Tensor], 
-                        discrete_actions: torch.Tensor,
                         continuous_actions: torch.Tensor,
                         cached_output: Optional[Dict[str, torch.Tensor]] = None,
                         action_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        Evaluate given actions (used for policy updates).
+        Evaluate given continuous actions (used for policy updates).
+        Delete ratio architecture: Only continuous actions [delete_ratio, gamma, alpha, noise, theta]
         """
         if cached_output is not None:
             output = cached_output
         else:
             output = self.forward(state_dict, deterministic=True, action_mask=action_mask)
         
-        if output['discrete_logits'].shape[0] == 0:
-            # Get device from action_bounds
+        # Check if we have valid output
+        num_nodes = state_dict['node_features'].shape[0]
+        if num_nodes == 0:
             device = self.action_bounds.device
             return {
-                'discrete_log_probs': torch.empty(0, device=device),
                 'continuous_log_probs': torch.empty(0, device=device),
                 'total_log_probs': torch.empty(0, device=device),
                 'value_predictions': output['value_predictions'],
@@ -667,10 +646,9 @@ class HybridActorCritic(nn.Module):
         # Re-run actor forward pass to get distributions for entropy calculation
         node_tokens = output['encoder_out'][1:]
         graph_token = output['encoder_out'][0]
-        discrete_logits, continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
+        continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
         
-        # Clamp logits to prevent overflow/underflow (tighter bounds)
-        discrete_logits = torch.clamp(discrete_logits, min=-30.0, max=30.0)
+        # Clamp to prevent overflow/underflow
         continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
         continuous_logstd = torch.clamp(continuous_logstd, -10.0, 5.0)
         continuous_std = torch.exp(continuous_logstd)
@@ -678,17 +656,7 @@ class HybridActorCritic(nn.Module):
         # Ensure std is not too small (avoid division by zero or extreme log-probs)
         continuous_std = torch.clamp(continuous_std, min=1e-6, max=10.0)
         
-        # Apply numerically stable masking and get safe logits
-        stable_logits = _safe_masked_logits(discrete_logits, action_mask)
-        
-        # Use Categorical(logits=...) for numerical stability (PyTorch handles softmax internally)
-        discrete_dist = torch.distributions.Categorical(logits=stable_logits)
-        discrete_log_probs = discrete_dist.log_prob(discrete_actions)
-        discrete_entropy = discrete_dist.entropy()
-        
         # Evaluate continuous actions with safety checks
-        # Note: This is an approximation, as continuous_actions are bounded.
-        # A proper implementation would include the log-derivative of the bounding function.
         continuous_dist = torch.distributions.Normal(continuous_mu, continuous_std)
         
         # Clamp continuous_actions to reasonable range before log_prob
@@ -697,52 +665,95 @@ class HybridActorCritic(nn.Module):
         continuous_entropy = continuous_dist.entropy().sum(dim=-1)
         
         # Safety: Clamp log_probs to prevent extreme values
-        discrete_log_probs = torch.clamp(discrete_log_probs, -20.0, 20.0)
         continuous_log_probs = torch.clamp(continuous_log_probs, -20.0, 20.0)
         
         # Final NaN check
-        discrete_log_probs = torch.nan_to_num(discrete_log_probs, nan=0.0)
         continuous_log_probs = torch.nan_to_num(continuous_log_probs, nan=0.0)
-        
-        total_log_probs = discrete_log_probs + continuous_log_probs
-        total_entropy = discrete_entropy + continuous_entropy
+        continuous_entropy = torch.nan_to_num(continuous_entropy, nan=0.0)
         
         return {
-            'discrete_log_probs': discrete_log_probs,
             'continuous_log_probs': continuous_log_probs,
-            'total_log_probs': total_log_probs,
+            'total_log_probs': continuous_log_probs,  # Only continuous actions
             'value_predictions': output['value_predictions'],
-            'entropy': total_entropy.mean()
+            'entropy': continuous_entropy.mean(),
+            'continuous_entropy': continuous_entropy.mean()
         }
     
-    def get_topology_actions(self, output: Dict[str, torch.Tensor]) -> Dict[int, str]:
+    def get_topology_actions(self, output: Dict[str, torch.Tensor], node_positions: List[Tuple[int, float]]) -> Dict[int, str]:
         """
-        Convert network output to topology-compatible action format.
+        Convert network output to topology-compatible action format using delete ratio strategy.
+        
+        Args:
+            output: Network output containing continuous_actions [delete_ratio, gamma, alpha, noise, theta]
+            node_positions: List of (node_id, is_leftmost_marker) tuples where:
+                - is_leftmost_marker = 1.0 means node should be deleted (is in leftmost k positions)
+                - is_leftmost_marker = 0.0 means node should spawn (not in leftmost k positions)
+                This is a binary flag used for efficient O(n) selection, NOT the delete_ratio value itself.
+        
+        Returns:
+            Dict mapping node_id to action ('spawn' or 'delete')
         """
-        if 'discrete_actions' not in output or output['discrete_actions'].shape[0] == 0:
+        if 'continuous_actions' not in output:
             return {}
         
+        continuous_actions = output['continuous_actions']
+        delete_ratio = continuous_actions[0].item()  # First element is delete_ratio
+        
+        num_nodes = len(node_positions)
+        if num_nodes == 0:
+            return {}
+        
+        # Calculate number of nodes to delete (leftmost nodes)
+        num_to_delete = int(delete_ratio * num_nodes)
+        num_to_delete = min(num_to_delete, num_nodes)  # Clamp to valid range
+        
+        # OPTIMIZATION 1: node_positions now contains pre-computed deletion info
+        # Format: (node_id, is_leftmost) where is_leftmost is a binary marker:
+        #   - is_leftmost = 1.0 means node should be deleted
+        #   - is_leftmost = 0.0 means node should spawn
+        # The threshold 0.5 below is just checking which value it's closer to (NOT related to delete_ratio bounds)
         actions = {}
-        for node_id, action in enumerate(output['discrete_actions']):
-            actions[node_id] = 'spawn' if action.item() == 0 else 'delete'
+        if num_to_delete == 0:
+            # No deletion
+            for node_id, _ in node_positions:
+                actions[node_id] = 'spawn'
+        elif num_to_delete >= num_nodes:
+            # Delete all
+            for node_id, _ in node_positions:
+                actions[node_id] = 'delete'
+        else:
+            # Use pre-computed leftmost marker (threshold 0.5 = midpoint between 0.0 and 1.0)
+            for node_id, is_leftmost in node_positions:
+                actions[node_id] = 'delete' if is_leftmost > 0.5 else 'spawn'
         
         return actions
     
-    def get_spawn_parameters(self, output: Dict[str, torch.Tensor], 
-                           node_id: int) -> Tuple[float, float, float, float]:
+    def get_spawn_parameters(self, output: Dict[str, torch.Tensor]) -> Tuple[float, float, float, float]:
         """
-        Get spawn parameters for a specific node.
+        Get spawn parameters from global action vector.
+        
+        Args:
+            output: Network output containing continuous_actions [delete_ratio, gamma, alpha, noise, theta]
+        
+        Returns:
+            Tuple of (gamma, alpha, noise, theta) for spawning
         """
-        if 'continuous_actions' not in output or node_id >= output['continuous_actions'].shape[0]:
+        if 'continuous_actions' not in output:
             return (1.0, 1.0, 0.5, 0.0)
         
-        params = output['continuous_actions'][node_id]
-        return (params[0].item(), params[1].item(), params[2].item(), params[3].item())
+        params = output['continuous_actions']
+        # Extract spawn parameters: indices [1, 2, 3, 4] = [gamma, alpha, noise, theta]
+        return (params[1].item(), params[2].item(), params[3].item(), params[4].item())
 
 
 class HybridPolicyAgent:
     """
-    Agent wrapper for the HybridActorCritic network.
+    Agent wrapper for the Delete Ratio Actor-Critic network.
+    
+    Converts network output (single global action) into topology operations:
+    - Sorts nodes by x-position
+    - Deletes leftmost nodes based on delete_ratio
+    - Spawns from remaining nodes using global spawn parameters
     """
     
     def __init__(self, topology, state_extractor, hybrid_network: HybridActorCritic):
@@ -753,10 +764,15 @@ class HybridPolicyAgent:
     @torch.no_grad()
     def get_actions_and_values(self, deterministic: bool = False,
                               action_mask: Optional[torch.Tensor] = None) -> Tuple[Dict[int, str], 
-                                                                         Dict[int, Tuple[float, float, float, float]], 
+                                                                         Tuple[float, float, float, float], 
                                                                          Dict[str, torch.Tensor]]:
         """
-        Get actions, spawn parameters, and value predictions.
+        Get actions, spawn parameters, and value predictions using delete ratio strategy.
+        
+        Returns:
+            - actions: Dict mapping node_id to action ('spawn' or 'delete')
+            - spawn_params: Single tuple (gamma, alpha, noise, theta) used for ALL spawns
+            - value_predictions: Dict of value predictions
         """
         state = self.state_extractor.get_state_features(include_substrate=True)
         
@@ -764,15 +780,47 @@ class HybridPolicyAgent:
             # Get device from network's action_bounds
             device = self.network.action_bounds.device
             empty_values = {component: torch.tensor(0.0, device=device) for component in self.network.value_components}
-            return {}, {}, empty_values
+            return {}, (1.0, 1.0, 0.5, 0.0), empty_values
         
         output = self.network(state, deterministic=deterministic, action_mask=action_mask)
         
-        actions = self.network.get_topology_actions(output)
+        # OPTIMIZATION 1: Use argpartition for O(n) selection instead of O(n log n) sort
+        # Get node x-positions directly from node features
+        node_features = state['node_features']
+        num_nodes = state['num_nodes']
         
-        spawn_params = {}
-        for node_id in range(state['num_nodes']):
-            spawn_params[node_id] = self.network.get_spawn_parameters(output, node_id)
+        # Extract delete_ratio to determine k (number of nodes to delete)
+        delete_ratio = output['continuous_actions'][0].item()
+        num_to_delete = int(delete_ratio * num_nodes)
+        num_to_delete = min(max(num_to_delete, 0), num_nodes)  # Clamp to [0, num_nodes]
+        
+        # Build node_positions efficiently based on num_to_delete
+        if num_to_delete == 0:
+            # No deletion needed - all nodes spawn
+            node_positions = [(i, 0.0) for i in range(num_nodes)]  # x-position irrelevant
+        elif num_to_delete >= num_nodes:
+            # Delete all - positions don't matter, mark all for deletion
+            node_positions = [(i, 0.0) for i in range(num_nodes)]
+        else:
+            # Use argpartition to find k leftmost nodes in O(n) time
+            import numpy as np
+            x_positions = np.array([node_features[i][0].item() for i in range(num_nodes)], dtype=np.float32)
+            
+            # Partition: indices of k smallest x-positions
+            partition_indices = np.argpartition(x_positions, num_to_delete - 1)
+            leftmost_k_indices = set(partition_indices[:num_to_delete].tolist())
+            
+            # Build node_positions with deletion info embedded in the tuple structure
+            # Format: (node_id, is_leftmost_marker) where:
+            #   - marker = 1.0 means node is in leftmost k positions (delete)
+            #   - marker = 0.0 means node is not in leftmost k (spawn)
+            # This is a binary flag, NOT related to delete_ratio parameter value
+            node_positions = [(i, 1.0 if i in leftmost_k_indices else 0.0) for i in range(num_nodes)]
+        
+        actions = self.network.get_topology_actions(output, node_positions)
+        
+        # Get single global spawn parameters (same for all spawning nodes)
+        spawn_params = self.network.get_spawn_parameters(output)
         
         return actions, spawn_params, output['value_predictions']
     
@@ -780,9 +828,9 @@ class HybridPolicyAgent:
     def act_with_policy(self, deterministic: bool = False,
                        action_mask: Optional[torch.Tensor] = None) -> Dict[int, str]:
         """
-        Execute actions using the hybrid network.
+        Execute actions using the hybrid network with delete ratio strategy.
         """
-        actions, spawn_params, _ = self.get_actions_and_values(deterministic, action_mask)
+        actions, spawn_params_global, _ = self.get_actions_and_values(deterministic, action_mask)
         
         spawn_actions = {node_id: action for node_id, action in actions.items() if action == 'spawn'}
         delete_actions = {node_id: action for node_id, action in actions.items() if action == 'delete'}
@@ -798,9 +846,9 @@ class HybridPolicyAgent:
                 if node_id < self.topology.graph.num_nodes():
                     self.topology.graph.ndata['to_delete'][node_id] = 1.0
         
-        # Execute spawn actions
+        # Execute spawn actions (ALL use the same global spawn parameters)
+        gamma, alpha, noise, theta = spawn_params_global
         for node_id in spawn_actions:
-            gamma, alpha, noise, theta = spawn_params[node_id]
             try:
                 self.topology.spawn(node_id, gamma=gamma, alpha=alpha, noise=noise, theta=theta)
             except Exception as e:
@@ -848,7 +896,6 @@ if __name__ == '__main__':
         
         output_stochastic = network(state_dict, deterministic=False)
         print(f"Stochastic forward pass works: ✅")
-        print(f"Discrete actions shape: {output_stochastic['discrete_actions'].shape}")
         print(f"Continuous actions shape: {output_stochastic['continuous_actions'].shape}")
         print(f"Value predictions: {list(output_stochastic['value_predictions'].keys())}")
         
@@ -857,21 +904,20 @@ if __name__ == '__main__':
         
         eval_output = network.evaluate_actions(
             state_dict,
-            output_stochastic['discrete_actions'],
             output_stochastic['continuous_actions']
         )
         print(f"Action evaluation works: ✅")
         print(f"Entropy: {eval_output['entropy']:.4f}")
         
-        topology_actions = network.get_topology_actions(output_stochastic)
-        print(f"Topology actions: {topology_actions}")
+        # Delete ratio architecture: Single global continuous action
+        print(f"Delete ratio action: {output_stochastic['continuous_actions']}")
+        print(f"  - delete_ratio: {output_stochastic['continuous_actions'][0]:.3f}")
+        print(f"  - gamma: {output_stochastic['continuous_actions'][1]:.3f}")
+        print(f"  - alpha: {output_stochastic['continuous_actions'][2]:.3f}")
+        print(f"  - noise: {output_stochastic['continuous_actions'][3]:.3f}")
+        print(f"  - theta: {output_stochastic['continuous_actions'][4]:.3f}")
         
-        if len(topology_actions) > 0:
-            node_id = list(topology_actions.keys())[0]
-            spawn_params = network.get_spawn_parameters(output_stochastic, node_id)
-            print(f"Spawn params for node {node_id}: gamma={spawn_params[0]:.3f}, alpha={spawn_params[1]:.3f}, noise={spawn_params[2]:.3f}, theta={spawn_params[3]:.3f}")
-        
-        print("\n✅ All tests passed! Decoupled ResNet-based HybridActorCritic is ready.")
+        print("\n✅ All tests passed! Delete ratio architecture HybridActorCritic is ready.")
         
     except Exception as e:
         print(f"❌ Test failed: {e}")

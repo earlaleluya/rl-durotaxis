@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Deployment script for trained Durotaxis RL agent
+Deployment script for trained Durotaxis RL agent (Delete Ratio Architecture)
 
-This script allows you to load a trained model and run it on custom substrates
-with configurable parameters for evaluation and demonstration purposes.
+This script allows you to load a trained delete ratio model and run it on custom 
+substrates with configurable parameters for evaluation and demonstration purposes.
+
+Delete Ratio Architecture:
+- Single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+- Sorts nodes by x-position, deletes leftmost fraction
+- Applies global spawn parameters to remaining nodes
 
 Usage:
     python deploy.py --model_path ./training_results/run0014/best_model_batch11.pt \
@@ -36,14 +41,21 @@ from config_loader import ConfigLoader
 
 
 class DurotaxisDeployment:
-    """Deployment class for running trained Durotaxis agents"""
+    """
+    Deployment class for running trained Delete Ratio Durotaxis agents.
+    
+    Loads a trained model and executes the delete ratio strategy:
+    - Sorts nodes by x-position
+    - Deletes leftmost fraction based on delete_ratio
+    - Spawns from remaining nodes with global parameters
+    """
     
     def __init__(self, 
                  model_path: str,
                  config_path: str = "config.yaml",
                  device: Optional[str] = None):
         """
-        Initialize deployment with trained model
+        Initialize deployment with trained model.
         
         Args:
             model_path: Path to saved model (.pt file)
@@ -140,19 +152,13 @@ class DurotaxisDeployment:
         self.network.eval()
     
     def create_action_mask(self, state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
-        """Create action mask to prevent invalid topology operations"""
-        num_nodes = state_dict.get('num_nodes', 0)
-        if num_nodes == 0:
-            return None
+        """
+        Create action mask (unused in delete ratio architecture, kept for API compatibility).
         
-        # Basic action masking rules
-        mask = torch.ones(num_nodes, 2, dtype=torch.bool, device=self.device)  # [spawn, delete]
-        
-        # Don't delete if too few nodes (prevent disconnection)
-        if num_nodes <= 2:
-            mask[:, 1] = False  # No deletion allowed
-        
-        return mask
+        Note: Delete ratio architecture uses global actions, not per-node masks.
+        """
+        # Action masking not used in delete ratio architecture
+        return None
     
     def run_episode(self, 
                    env: DurotaxisEnv,
@@ -222,28 +228,33 @@ class DurotaxisDeployment:
             # Store predictions
             episode_values.append(output['value_predictions'])
             
-            # Extract and execute actions
-            if len(output.get('discrete_actions', [])) > 0:
-                discrete_actions = output['discrete_actions']
+            # Extract and execute delete ratio actions
+            if 'continuous_actions' in output:
                 continuous_actions = output['continuous_actions']
                 
                 episode_actions.append({
-                    'discrete': discrete_actions.cpu().numpy(),
                     'continuous': continuous_actions.cpu().numpy(),
                     'num_nodes': state_dict['num_nodes']
                 })
                 
-                # Execute topology actions
-                topology_actions = self.network.get_topology_actions(output)
+                # Get node positions for sorting (delete ratio strategy)
+                node_features = state_dict['node_features']
+                node_positions = [(i, node_features[i][0].item()) for i in range(state_dict['num_nodes'])]
+                node_positions.sort(key=lambda x: x[1])  # Sort by x-position (ascending)
+                
+                # Execute topology actions using delete ratio strategy
+                topology_actions = self.network.get_topology_actions(output, node_positions)
+                
+                # Get single global spawn parameters
+                spawn_params = self.network.get_spawn_parameters(output)
                 
                 for node_id, action_type in topology_actions.items():
                     try:
                         if action_type == 'spawn':
-                            params = self.network.get_spawn_parameters(output, node_id)
-                            env.topology.spawn(node_id, gamma=params[0], alpha=params[1], 
-                                             noise=params[2], theta=params[3])
+                            env.topology.spawn(node_id, gamma=spawn_params[0], alpha=spawn_params[1], 
+                                             noise=spawn_params[2], theta=spawn_params[3])
                             if verbose:
-                                print(f"   Step {step_count+1}: Spawned from node {node_id} (γ={params[0]:.3f}, α={params[1]:.3f})")
+                                print(f"   Step {step_count+1}: Spawned from node {node_id} (γ={spawn_params[0]:.3f}, α={spawn_params[1]:.3f})")
                         elif action_type == 'delete':
                             env.topology.delete(node_id)
                             if verbose:

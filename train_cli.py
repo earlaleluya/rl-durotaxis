@@ -2,13 +2,18 @@
 """
 Command-line interface wrapper for train.py with argument parsing
 
-This script provides command-line argument support for the DurotaxisTrainer.
+This script provides command-line argument support for the Delete Ratio DurotaxisTrainer.
 It parses arguments and passes them as overrides to the trainer.
+
+Delete Ratio Architecture:
+- Single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+- No discrete per-node actions
+- Two-stage training supported
 
 Usage:
     python train_cli.py --help
-    python train_cli.py --pretrained-weights imagenet --wsa-enabled
-    python train_cli.py --seed 42 --experiment baseline_seed42
+    python train_cli.py --pretrained-weights imagenet --sem-enabled
+    python train_cli.py --seed 42 --experiment delete_ratio_baseline
 """
 
 import argparse
@@ -24,30 +29,30 @@ from train import DurotaxisTrainer
 def parse_args():
     """Parse command-line arguments for training configuration"""
     parser = argparse.ArgumentParser(
-        description='Train Durotaxis RL Agent with Hybrid Actor-Critic',
+        description='Train Durotaxis RL Agent with Delete Ratio Actor-Critic',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Train with default config
+  # Train with default config (delete ratio architecture)
   python train_cli.py
   
   # Override total episodes and learning rate
   python train_cli.py --total-episodes 2000 --learning-rate 0.0005
   
-  # Use random pretrained weights with WSA enabled
-  python train_cli.py --pretrained-weights random --wsa-enabled
+  # Use ImageNet pretrained weights with SEM enabled
+  python train_cli.py --pretrained-weights imagenet --sem-enabled
   
   # Disable SEM and use custom experiment name
   python train_cli.py --no-sem --experiment my_ablation_test
   
   # Run specific seed for reproducibility
-  python train_cli.py --seed 42 --experiment baseline_seed42
+  python train_cli.py --seed 42 --experiment delete_ratio_seed42
   
-  # Full ablation configuration (d1)
-  python train_cli.py --pretrained-weights imagenet --wsa-enabled --sem-enabled --experiment d1_full_stack --seed 1
+  # SEM ablation configuration
+  python train_cli.py --pretrained-weights imagenet --sem-enabled --experiment sem_enabled --seed 1
   
-  # Baseline ablation configuration (a1)
-  python train_cli.py --pretrained-weights imagenet --no-wsa --no-sem --experiment a1_baseline --seed 1
+  # Baseline (no SEM)
+  python train_cli.py --pretrained-weights imagenet --no-sem --experiment baseline --seed 1
   
   # Simple delete-only mode (Rule 0, 1, 2) with termination rewards
   python train_cli.py --simple-delete-only --include-termination-rewards --experiment delete_only_with_term
@@ -55,8 +60,11 @@ Examples:
   # Centroid distance-only mode (pure distance learning)
   python train_cli.py --centroid-distance-only --experiment pure_distance
   
-  # Centroid distance mode with success rewards enabled
-  python train_cli.py --centroid-distance-only --include-termination-rewards --experiment distance_with_success
+  # Combined mode (distance + delete penalties)
+  python train_cli.py --simple-delete-only --centroid-distance-only --experiment combined_mode
+  
+  # Normal mode with all reward components
+  python train_cli.py --no-simple-delete-only --no-centroid-distance-only --experiment normal_mode
         """
     )
     
@@ -80,13 +88,9 @@ Examples:
     
     # Architecture configuration
     parser.add_argument('--pretrained-weights', type=str, choices=['imagenet', 'random'], default=None,
-                        help='Pretrained weights for Actor/Critic (imagenet or random)')
-    parser.add_argument('--wsa-enabled', action='store_true', default=None,
-                        help='Enable Weight Sharing Attention (WSA)')
-    parser.add_argument('--no-wsa', dest='wsa_enabled', action='store_false',
-                        help='Disable Weight Sharing Attention (WSA)')
+                        help='Pretrained weights for Actor/Critic ResNet backbone (imagenet or random)')
     parser.add_argument('--sem-enabled', action='store_true', default=None,
-                        help='Enable Simplicial Embedding (SEM)')
+                        help='Enable Simplicial Embedding (SEM) in encoder')
     parser.add_argument('--no-sem', dest='sem_enabled', action='store_false',
                         help='Disable Simplicial Embedding (SEM)')
     
@@ -229,12 +233,8 @@ def main():
         architecture_changes.append(f"actor_critic.pretrained_weights: '{args.pretrained_weights}'")
         print(f"   Pretrained weights: {args.pretrained_weights}")
     
-    if args.wsa_enabled is not None:
-        architecture_changes.append(f"actor_critic.wsa.enabled: {str(args.wsa_enabled).lower()}")
-        print(f"   WSA enabled: {args.wsa_enabled}")
-    
     if args.sem_enabled is not None:
-        architecture_changes.append(f"actor_critic.simplicial_embedding.enabled: {str(args.sem_enabled).lower()}")
+        architecture_changes.append(f"encoder.simplicial_embedding.enabled: {str(args.sem_enabled).lower()}")
         print(f"   SEM enabled: {args.sem_enabled}")
     
     # Experiment name

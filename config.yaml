@@ -18,8 +18,8 @@ trainer:
   
   # Resume training configuration
   resume_training:
-    enabled: true                      # Set to true to resume from checkpoint
-    checkpoint_path: "training_results/run0007/best_model_batch3.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
+    enabled: false                      # Set to true to resume from checkpoint
+    checkpoint_path: ""               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
     reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
     reset_episode_count: true          # If true, restart episode counter from 0
@@ -249,13 +249,12 @@ trainer:
     edge_reward: 0.2
     total_node_reward: 0.3
   
-  # Hybrid policy loss weights with gradient scaling
+  # Policy loss weights (continuous actions only)
   policy_loss_weights:
-    discrete_weight: 0.7     # Weight for discrete actions (spawn/delete)
-    continuous_weight: 0.3   # Weight for continuous parameters
+    continuous_weight: 1.0   # Weight for continuous actions (delete_ratio architecture)
     entropy_weight: 0.01     # Exploration bonus weight
   
-  # Adaptive gradient scaling for hybrid action spaces
+  # Adaptive gradient scaling (continuous-only action space)
   gradient_scaling:
     enable_adaptive_scaling: true    # Enable intelligent gradient balancing
     gradient_norm_target: 1.0        # Target gradient norm for balancing
@@ -283,15 +282,14 @@ trainer:
     weight_learning_rate: 0.01        # Learning rate for component weights
     weight_regularization: 0.001      # L2 regularization for weight stability
     
-  # Enhanced entropy regularization system 
+  # Enhanced entropy regularization system (continuous actions only)
   entropy_regularization:
     enable_adaptive_entropy: true     # Enable adaptive entropy scheduling
-    entropy_coeff_start: 0.25         # Reduced for faster policy commitment (was 0.8)
-    entropy_coeff_end: 0.05           # Reduced to allow exploitation sooner (was 0.15)
-    entropy_decay_episodes: 300       # Faster decay for quicker convergence (was 500)
-    discrete_entropy_weight: 1.5      # Reduced for clearer action selection (was 3.0)
-    continuous_entropy_weight: 1.0    # Reduced for more focused parameters (was 2.0)
-    min_entropy_threshold: 0.1        # Lower floor for better exploitation (was 0.3)
+    entropy_coeff_start: 0.25         # Starting entropy coefficient (high exploration)
+    entropy_coeff_end: 0.05           # Ending entropy coefficient (low exploration)
+    entropy_decay_episodes: 300       # Episodes over which to decay entropy
+    continuous_entropy_weight: 1.0    # Weight for continuous action entropy
+    min_entropy_threshold: 0.1        # Minimum entropy to maintain exploration
 
 # ============================================================================
 # DurotaxisEnv Configuration
@@ -355,10 +353,10 @@ environment:
   #   - If simple_delete_only_mode=True OR centroid_distance_only_mode=True (special modes):
   #     Set this to True to include termination rewards, False to exclude them
   # Default: false (special modes exclude termination rewards by default for pure learning)
-  include_termination_rewards: false  # ENABLED to help agent learn goal achievement
+  include_termination_rewards: true  # ENABLED to help agent learn goal achievement
   
   # Basic environment parameters - EXPANDED for successful migration
-  substrate_size: [200, 400]  # Much larger substrate (3x width)
+  substrate_size: [400, 400]  # Much larger substrate (3x width)
   substrate_type: 'linear'
   substrate_params:
     m: 0.01
@@ -366,8 +364,8 @@ environment:
   
   # Node and topology parameters - RELAXED for learning
   init_num_nodes: 5              # Start with more nodes for stability
-  max_critical_nodes: 75         # Allow more nodes
-  threshold_critical_nodes: 500  # GREATLY INCREASED: Allow agent to explore without premature termination
+  max_critical_nodes: 50         # Allow more nodes
+  threshold_critical_nodes: 100  # GREATLY INCREASED: Allow agent to explore without premature termination
   max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
@@ -531,22 +529,20 @@ actor_critic:
     head_lr: 3.0e-4               # LR for heads (action/value MLP + heads)
   
   hidden_dim: 128               # Hidden dimension for final MLPs after ResNet
-  num_discrete_actions: 2       # Number of discrete actions (spawn/delete)
-  continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)
-  dropout_rate: 0.2             # Increased dropout for regularization with a larger network
-  spawn_bias_init: 0.0          # Small positive bias towards 'spawn' to encourage growth early on
+  continuous_dim: 5             # Dimension of continuous action space (delete_ratio, gamma, alpha, noise, theta)
+  dropout_rate: 0.2             # Dropout for regularization
   
-  # Pretrained weights configuration for standard Actor/Critic (non-WSA)
+  # Pretrained weights configuration
   # Options: 'imagenet', 'random', or null (same as 'random')
-  # This is used ONLY when WSA is disabled
   pretrained_weights: 'imagenet'  # Default: ImageNet pre-trained weights
   
-  # Spawn parameter bounds [min, max]
-  spawn_parameter_bounds:
-    gamma: [0.5, 15.0]          # WIDENED from [2.0, 8.0] for more expressive control
-    alpha: [0.5, 4.0]           # Directional bias strength
-    noise: [0.05, 0.5]          # Stochastic noise level
-    theta: [-0.7854, 0.7854]    # Migration direction angle (-π/4 to π/4, -45° to +45°, biased toward rightward)
+  # Action parameter bounds [min, max]
+  action_parameter_bounds:
+    delete_ratio: [0.0, 0.5]    # Fraction of nodes to delete (sorted leftmost first)
+    gamma: [0.5, 15.0]          # Spawn: WIDENED from [2.0, 8.0] for more expressive control
+    alpha: [0.5, 4.0]           # Spawn: Directional bias strength
+    noise: [0.05, 0.5]          # Spawn: Stochastic noise level
+    theta: [-0.5236, 0.5236]    # Spawn: Migration direction angle (-π/6 to π/6, -30° to +30°, biased toward rightward)
   
   # Value function components (list of reward components to predict)
   value_components:
@@ -557,48 +553,16 @@ actor_critic:
     - 'edge_reward'
     - 'total_node_reward'
   
+  # ============================================================================
+  # Simplicial Embedding (SEM) Configuration
+  # ============================================================================
+  # SEM constrains node embeddings to lie on product of simplices via group-wise softmax.
+  # This is ACTION-AGNOSTIC and works with any action space (discrete, continuous, hybrid).
+  # For ablation studies, toggle 'enabled' between true/false.
   simplicial_embedding:
-    enabled: true
-    num_groups: 16
-    temperature: 1.0
-  
-  # Weight Sharing Attention (WSA) Configuration
-  # Enable this to use multiple pre-trained models with dynamic attention
-  wsa:
-    enabled: false                # Set to true to enable WSA (for ablation studies)
-    embedding_dim: 256           # Common embedding dimension for all PTMs
-    context_dim: 128             # State encoder context dimension
-    
-    # Pre-trained models configuration
-    # Each model provides a different perspective on the graph state
-    pretrained_models:
-      # Model 1: ResNet18 pre-trained on ImageNet
-      - name: 'resnet18_imagenet'
-        model_type: 'resnet18'
-        weights: 'imagenet'      # Options: 'imagenet', 'random', null
-        freeze_backbone: true    # Freeze to save memory and use as feature extractor
-        
-      # Model 2: Graph-specific CNN (trained from scratch)
-      - name: 'graph_cnn'
-        model_type: 'graph_cnn'
-        weights: null            # Train from scratch
-        freeze_backbone: false
-        
-      # Model 3: ResNet18 with random initialization
-      - name: 'resnet18_random'
-        model_type: 'resnet18'
-        weights: 'random'        # Random initialization for diversity
-        freeze_backbone: false
-    
-    # WSA attention mechanism parameters
-    attention:
-      shared_mlp_layers: [256, 128]  # Hidden layers in shared MLP
-      temperature: 1.0           # Softmax temperature (lower = sharper attention)
-      learnable_temperature: true  # Allow model to learn temperature
-    
-    # Logging and monitoring
-    log_attention_weights: true  # Log attention weights during training
-    log_frequency: 50            # Log every N episodes
+    enabled: true                # Toggle for ablation: true (with SEM) / false (without SEM)
+    num_groups: 16               # Number of simplex groups (must divide hidden_dim evenly)
+    temperature: 1.0             # Softmax temperature for simplex constraints
 
 # ============================================================================
 # Training Algorithm Configuration
@@ -613,19 +577,19 @@ algorithm:
   clip_epsilon: 0.1             # PPO clipping parameter
   value_loss_coeff: 0.5         # Increased from 0.5 for better value estimation
   
-  # NEW: Two-Stage Training Curriculum
-  # Stage 1: Discrete-only training (spawn/delete). Ignores continuous parameters.
-  # Stage 2: Fine-tuning. Learns continuous spawn parameters.
+  # NEW: Two-Stage Training Curriculum with Delete Ratio
+  # Stage 1: Learn delete_ratio only. Spawn params are fixed constants.
+  # Stage 2: Learn delete_ratio + spawn parameters (gamma, alpha, noise, theta).
   two_stage_curriculum:
-    stage: 1  # Set to 1 for discrete-only, 2 for fine-tuning
+    stage: 1  # Set to 1 for delete-ratio-only, 2 for full continuous
     
     # Fixed spawn parameters used during Stage 1.
-    # These are reasonable defaults that encourage stable growth.
+    # Stage 1 learns ONLY delete_ratio, spawn params are constants.
     stage_1_fixed_spawn_params:
-      gamma: 5.0
-      alpha: 2.0
-      noise: 0.1
-      theta: 0.0
+      gamma: 0.5      # Conservative growth rate for stable exploration
+      alpha: 2.0      # Directional bias
+      noise: 0.1      # Low noise for predictable spawning
+      theta: 0.0      # No angular bias (pure rightward)
   
   # Optimization parameters
   max_grad_norm: 0.5            # Increased from 0.5 for less aggressive clipping
