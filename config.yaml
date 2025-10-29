@@ -11,7 +11,7 @@ trainer:
   # automatically scale curriculum stage durations to this value. If you change
   # this number (for example to 10000), the curriculum stages will be resized
   # proportionally so the curriculum covers the full training run.
-  total_episodes: 10000
+  total_episodes: 1000
   max_steps: 1000
   learning_rate: 0.0001   
   save_dir: "./training_results"
@@ -356,7 +356,7 @@ environment:
   include_termination_rewards: true  # ENABLED to help agent learn goal achievement
   
   # Basic environment parameters - EXPANDED for successful migration
-  substrate_size: [400, 400]  # Much larger substrate (3x width)
+  substrate_size: [600, 400]  # Much larger substrate (3x width)
   substrate_type: 'linear'
   substrate_params:
     m: 0.01
