@@ -18,8 +18,8 @@ trainer:
   
   # Resume training configuration
   resume_training:
-    enabled: false                      # Set to true to resume from checkpoint
-    checkpoint_path: ""               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
+    enabled: true                      # Set to true to resume from checkpoint
+    checkpoint_path: "training_results/run0007/best_model_batch3.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
     reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
     reset_episode_count: true          # If true, restart episode counter from 0
@@ -329,7 +329,7 @@ environment:
   # ============================================================================
   distance_mode:
     # Dense delta-based reward shaping (potential-based, keeps optimal policy)
-    use_delta_distance: false              # Reward ∝ (cx_t - cx_{t-1}) / goal_x (dense directional signal)
+    use_delta_distance: true              # Reward ∝ (cx_t - cx_{t-1}) / goal_x (dense directional signal)
     distance_reward_scale: 5.0            # Scale up dense signal for better learning
     
     # Termination reward handling in distance-only mode
