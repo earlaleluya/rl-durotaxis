@@ -1454,21 +1454,20 @@ class DurotaxisEnv(gym.Env):
             total_node_reward = 0.0
             survival_reward = 0.0
         
-        # Create detailed reward information dictionary
-        reward_breakdown = {
-            'total_reward': total_reward,
-            'graph_reward': graph_reward,
-            'spawn_reward': spawn_reward,
-            'delete_reward': delete_reward,
-            'deletion_efficiency_reward': efficiency_reward if 'efficiency_reward' in locals() else 0.0,
-            'edge_reward': edge_reward,
-            'centroid_reward': centroid_reward if 'centroid_reward' in locals() else 0.0,
-            'milestone_reward': milestone_reward,
-            'node_rewards': node_rewards,
-            'total_node_reward': total_node_reward,
-            'survival_reward': survival_reward,
-            'num_nodes': num_nodes
-        }
+        # OPTIMIZATION 2: Use preallocated template for faster dict creation
+        reward_breakdown = dict(self._reward_components_template)
+        reward_breakdown['total_reward'] = total_reward
+        reward_breakdown['graph_reward'] = graph_reward
+        reward_breakdown['spawn_reward'] = spawn_reward
+        reward_breakdown['delete_reward'] = delete_reward
+        reward_breakdown['deletion_efficiency_reward'] = efficiency_reward if 'efficiency_reward' in locals() else 0.0
+        reward_breakdown['edge_reward'] = edge_reward
+        reward_breakdown['centroid_reward'] = centroid_reward if 'centroid_reward' in locals() else 0.0
+        reward_breakdown['milestone_reward'] = milestone_reward
+        reward_breakdown['node_rewards'] = node_rewards
+        reward_breakdown['total_node_reward'] = total_node_reward
+        reward_breakdown['survival_reward'] = survival_reward
+        reward_breakdown['num_nodes'] = num_nodes
         
         # Store for backward compatibility (some methods might still use this)
         self.last_reward_breakdown = reward_breakdown
@@ -2176,9 +2175,9 @@ class DurotaxisEnv(gym.Env):
 
         # 5. Terminate if one node from the graph reaches the rightmost area ('success termination')
         if state['num_nodes'] > 0:
-            # Get substrate width to determine success threshold (last 5% of width)
+            # Get substrate width to determine success threshold (last 1% of width)
             substrate_width = self.substrate.width
-            success_threshold = substrate_width * 0.95  # Success when reaching 95% of width (last 5% area)
+            success_threshold = substrate_width * 0.99  # Success when reaching 99% of width (last 1% area)
             
             # Check each node's x-position (first element of node_features)
             node_features = state['node_features']
@@ -2520,6 +2519,24 @@ class DurotaxisEnv(gym.Env):
         self.empty_graph_recovery_attempts = 0
         self.empty_graph_recoveries_this_episode = 0
         self.empty_graph_recovery_last_step = None
+        
+        # OPTIMIZATION 2: Preallocate reward dict template to reduce per-step allocations
+        self._reward_components_template = {
+            'total_reward': 0.0,
+            'graph_reward': 0.0,
+            'spawn_reward': 0.0,
+            'delete_reward': 0.0,
+            'deletion_efficiency_reward': 0.0,
+            'edge_reward': 0.0,
+            'centroid_reward': 0.0,
+            'milestone_reward': 0.0,
+            'node_rewards': [],
+            'total_node_reward': 0.0,
+            'survival_reward': 0.0,
+            'empty_graph_recovery_penalty': 0.0,
+            'termination_reward': 0.0,
+            'num_nodes': 0
+        }
         
         # Reset topology
         self.topology.reset(init_num_nodes=self.init_num_nodes)

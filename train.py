@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Practical Training Loop for Hybrid Actor-Critic with Multi-Component Rewards
+Training Loop for Delete Ratio Actor-Critic with Multi-Component Rewards
 
-A streamlined, runnable training implementation that demonstrates:
-1. Component-specific value learning with your reward system
-2. Action masking for topology constraints
+A streamlined training implementation for the delete ratio architecture:
+1. Single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+2. Component-specific value learning with reward system
 3. Efficient experience collection and policy updates
 4. Progressive learning with reward component weighting
+5. Two-stage training: delete_ratio only → all parameters
 
-This is designed to run immediately and show real training progress.
+Delete Ratio Strategy:
+- Stage 1: Train only delete_ratio (freeze spawn parameters)
+- Stage 2: Train all 5 parameters together
+- Delete leftmost nodes based on x-position sorting
+- Apply global spawn parameters to remaining nodes
 """
 
 import sys
@@ -200,7 +205,10 @@ class TrajectoryBuffer:
         return minibatches
     
     def compute_returns_and_advantages_for_all_episodes(self, gamma: float, gae_lambda: float):
-        """Compute returns and advantages for all episodes in the buffer"""
+        """
+        OPTIMIZATION 4: GPU-vectorized GAE computation for all episodes.
+        Preallocates tensors and keeps computation on device for better performance.
+        """
         for episode in self.episodes:
             rewards = episode['rewards']
             values = episode['values']
@@ -221,58 +229,101 @@ class TrajectoryBuffer:
                 else:
                     processed_values.append(v)
 
-            # Convert values to tensors for easier computation
-            # Ensure device consistency by using self.device
-            values_tensor = torch.stack(processed_values) if processed_values else torch.tensor([], device=self.device)
-            final_value = None
+            # Early exit for empty episodes
+            if not processed_values:
+                episode['returns'] = []
+                episode['advantages'] = []
+                continue
+
+            # OPTIMIZATION 4a: Convert everything to tensors on device immediately
+            T = len(rewards)
+            device = self.device
+            
+            # Preallocate tensors on device
+            values_tensor = torch.stack([v.to(device) if isinstance(v, torch.Tensor) else torch.tensor(v, device=device) 
+                                        for v in processed_values])
+            rewards_tensor = torch.tensor([r.get('total_reward', 0.0) if isinstance(r, dict) else r 
+                                          for r in rewards], device=device, dtype=torch.float32)
+            
+            # Handle final value
             if isinstance(final_values, dict):
                 if 'total_value' in final_values:
                     final_value = final_values['total_value']
                 elif 'total_reward' in final_values:
                     final_value = final_values['total_reward']
                 else:
-                    final_value = torch.tensor(0.0, device=self.device)
+                    final_value = torch.tensor(0.0, device=device)
             else:
-                final_value = final_values if final_values is not None else torch.tensor(0.0, device=self.device)
+                final_value = final_values if final_values is not None else torch.tensor(0.0, device=device)
+            
+            # Ensure final_value is on device
+            if isinstance(final_value, torch.Tensor):
+                final_value = final_value.to(device)
+            else:
+                final_value = torch.tensor(final_value, device=device, dtype=torch.float32)
+            
+            # Ensure final_value has the same shape as values_tensor entries
+            # If values_tensor is 2D [T, num_components], final_value should match
+            if values_tensor.dim() > 1:
+                # Multi-dimensional values - ensure final_value matches
+                if final_value.dim() == 0:  # Scalar
+                    final_value = final_value.unsqueeze(0).expand(values_tensor.shape[1])
+                elif final_value.dim() == 1 and final_value.shape[0] != values_tensor.shape[1]:
+                    # Wrong size - pad or truncate
+                    if final_value.shape[0] == 1:
+                        final_value = final_value.expand(values_tensor.shape[1])
+                    else:
+                        # This shouldn't happen, but handle gracefully
+                        final_value = final_value[:values_tensor.shape[1]]
+            else:
+                # 1D values - ensure final_value is scalar
+                if final_value.dim() > 0:
+                    final_value = final_value.mean()  # Collapse to scalar
 
-            # Compute GAE advantages and returns
-            returns = []
-            advantages = []
-            gae = 0
-
-            # Work backwards through the episode
-            for t in reversed(range(len(rewards))):
-                if t == len(rewards) - 1:
-                    next_value = final_value if not terminated else torch.tensor(0.0, device=self.device)
-                else:
-                    next_value = values_tensor[t + 1]
-
-                # Get reward components
-                reward_dict = rewards[t]
-                reward = reward_dict.get('total_reward', 0.0)
-
-                # TD error
-                delta = reward + gamma * next_value - values_tensor[t]
-
-                # GAE calculation
+            # OPTIMIZATION 4b: Vectorized GAE computation on GPU
+            # Preallocate output tensors
+            returns = torch.empty(T, device=device, dtype=torch.float32)
+            advantages = torch.empty(T, device=device, dtype=torch.float32)
+            
+            # Compute next values vector
+            # Handle both 1D and 2D values_tensor
+            if values_tensor.dim() == 1:
+                # Simple 1D case
+                next_values = torch.cat([values_tensor[1:], final_value.unsqueeze(0)])
+            else:
+                # 2D case: [T, num_components]
+                # Expand final_value to [1, num_components] to match
+                final_value_expanded = final_value.unsqueeze(0)
+                next_values = torch.cat([values_tensor[1:], final_value_expanded], dim=0)
+                # For GAE, we need scalar values, so take mean/sum across components
+                # Use the first component (total_value) or mean
+                values_tensor = values_tensor.mean(dim=1) if values_tensor.shape[1] > 1 else values_tensor.squeeze(1)
+                next_values = next_values.mean(dim=1) if next_values.shape[1] > 1 else next_values.squeeze(1)
+            
+            if terminated:
+                next_values[-1] = 0.0  # Zero out bootstrap if terminated
+            
+            # Vectorized backward pass for GAE
+            gae = torch.tensor(0.0, device=device, dtype=torch.float32)
+            for t in range(T - 1, -1, -1):
+                # TD error: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
+                delta = rewards_tensor[t] + gamma * next_values[t] - values_tensor[t]
+                
+                # GAE: A_t = δ_t + γλ * A_{t+1}
                 gae = delta + gamma * gae_lambda * gae
-                advantages.insert(0, gae)
-                returns.insert(0, gae + values_tensor[t])
+                advantages[t] = gae
+                returns[t] = gae + values_tensor[t]
 
-            # Convert to tensors for normalization
-            if len(advantages) > 0:
-                adv_tensor = torch.stack(advantages)
-                # Advantage normalization (standard PPO trick)
-                adv_mean = adv_tensor.mean()
-                adv_std = adv_tensor.std(unbiased=False)
-                adv_std = adv_std if adv_std > 1e-8 else torch.tensor(1.0, device=adv_tensor.device)
-                adv_norm = (adv_tensor - adv_mean) / adv_std
-                # Write back normalized advantages keeping list structure
-                advantages = [adv_norm[i] for i in range(adv_norm.shape[0])]
+            # OPTIMIZATION 4c: Normalize advantages on GPU
+            if T > 0:
+                adv_mean = advantages.mean()
+                adv_std = advantages.std(unbiased=False)
+                adv_std = torch.clamp(adv_std, min=1e-8)
+                advantages = (advantages - adv_mean) / adv_std
 
-            # Store computed values
-            episode['returns'] = returns
-            episode['advantages'] = advantages
+            # Convert to list for backward compatibility (but keep tensors)
+            episode['returns'] = [returns[i] for i in range(T)]
+            episode['advantages'] = [advantages[i] for i in range(T)]
     
     def clear(self):
         """Clear all episodes from the buffer"""
@@ -372,13 +423,21 @@ def robust_moving_average(data, window=20, outlier_threshold=2.0):
 
 
 class DurotaxisTrainer:
-    """Streamlined trainer for hybrid actor-critic with component rewards"""
+    """
+    Trainer for Delete Ratio Actor-Critic with component rewards.
+    
+    Implements two-stage training:
+    - Stage 1: Train delete_ratio only (freeze spawn parameters)
+    - Stage 2: Train all 5 parameters [delete_ratio, gamma, alpha, noise, theta]
+    
+    Uses PPO with multi-component value learning and reward weighting.
+    """
     
     def __init__(self, 
                  config_path: str = "config.yaml",
                  **overrides):
         """
-        Initialize trainer with configuration from YAML file
+        Initialize trainer with configuration from YAML file.
         
         Parameters
         ----------
@@ -451,8 +510,7 @@ class DurotaxisTrainer:
         })
         
         self.policy_loss_weights = config.get('policy_loss_weights', {
-            'discrete_weight': 0.7,
-            'continuous_weight': 0.3,
+            'continuous_weight': 1.0,  # Only continuous actions now
             'entropy_weight': 0.01
         })
         
@@ -497,8 +555,7 @@ class DurotaxisTrainer:
         self.entropy_coeff_start = entropy_config.get('entropy_coeff_start', 0.2)  # Start higher
         self.entropy_coeff_end = entropy_config.get('entropy_coeff_end', 0.01)    # End higher
         self.entropy_decay_episodes = entropy_config.get('entropy_decay_episodes', 800)  # Decay slower
-        self.discrete_entropy_weight = entropy_config.get('discrete_entropy_weight', 1.2) # Stronger for discrete
-        self.continuous_entropy_weight = entropy_config.get('continuous_entropy_weight', 0.7) # Stronger for continuous
+        self.continuous_entropy_weight = entropy_config.get('continuous_entropy_weight', 1.0) # Continuous-only (delete ratio)
         self.min_entropy_threshold = entropy_config.get('min_entropy_threshold', 0.15) # Higher threshold
         
         # Batch training configuration
@@ -521,11 +578,9 @@ class DurotaxisTrainer:
         self.max_scaling_factor = gradient_config.get('max_scaling_factor', 10.0)
         self.gradient_warmup_steps = gradient_config.get('warmup_steps', 100)
         
-        # Initialize gradient scaling state
+        # Initialize gradient scaling state (continuous-only)
         self.gradient_step_count = 0
-        self.discrete_grad_norm_ema = None
         self.continuous_grad_norm_ema = None
-        self.adaptive_discrete_weight = self.policy_loss_weights['discrete_weight']
         self.adaptive_continuous_weight = self.policy_loss_weights['continuous_weight']
         
         # Empty graph handling configuration
@@ -795,9 +850,9 @@ class DurotaxisTrainer:
             print(f"   └─ Max file size: {self.max_log_file_size_mb} MB")
         
         if self.training_stage == 1:
-            print(f"   ⭐️ Training Mode: Stage 1 (Discrete Actions Only)")
+            print(f"   ⭐️ Training Mode: Stage 1 (Delete Ratio Only)")
         else:
-            print(f"   ⭐️ Training Mode: Stage 2 (Fine-tuning Continuous Actions)")
+            print(f"   ⭐️ Training Mode: Stage 2 (Delete Ratio + Spawn Parameters)")
     
     def _initialize_learnable_weights(self):
         """Initialize the enhanced learnable component weighting system"""
@@ -848,48 +903,40 @@ class DurotaxisTrainer:
         # Separate parameters into backbone and head groups
         param_groups = []
         
-        if not self.network.use_wsa:
-            # Standard Actor-Critic with ResNet backbone
-            # Actor backbone parameters
-            actor_backbone_params = list(self.network.actor.resnet_body.parameters())
-            # Critic backbone parameters
-            critic_backbone_params = list(self.network.critic.resnet_body.parameters())
-            
-            # Actor head parameters (everything except backbone)
-            actor_head_params = (
-                list(self.network.actor.feature_proj.parameters()) +
-                list(self.network.actor.action_mlp.parameters()) +
-                list(self.network.actor.discrete_head.parameters()) +
-                list(self.network.actor.continuous_mu_head.parameters()) +
-                list(self.network.actor.continuous_logstd_head.parameters()) +
-                [self.network.actor.discrete_bias]
-            )
-            
-            # Critic head parameters (everything except backbone)
-            critic_head_params = (
-                list(self.network.critic.feature_proj.parameters()) +
-                list(self.network.critic.value_mlp.parameters()) +
-                list(self.network.critic.value_heads.parameters())
-            )
-            
-            # Filter to only trainable parameters
-            def only_trainable(params):
-                return [p for p in params if p.requires_grad]
-            
-            # Add backbone group if any parameters are trainable
-            bb_params = only_trainable(actor_backbone_params + critic_backbone_params)
-            if len(bb_params) > 0:
-                param_groups.append({'params': bb_params, 'lr': bb_lr, 'name': 'backbone'})
-            
-            # Add head group
-            head_params = only_trainable(actor_head_params + critic_head_params)
-            if len(head_params) > 0:
-                param_groups.append({'params': head_params, 'lr': hd_lr, 'name': 'heads'})
-        else:
-            # WSA mode - treat all as single group for now
-            all_params = [p for p in self.network.parameters() if p.requires_grad]
-            if len(all_params) > 0:
-                param_groups.append({'params': all_params, 'lr': self.learning_rate, 'name': 'all'})
+        # Standard Actor-Critic with ResNet backbone (WSA removed - not compatible with delete ratio)
+        # Actor backbone parameters
+        actor_backbone_params = list(self.network.actor.resnet_body.parameters())
+        # Critic backbone parameters
+        critic_backbone_params = list(self.network.critic.resnet_body.parameters())
+        
+        # Actor head parameters (everything except backbone)
+        actor_head_params = (
+            list(self.network.actor.feature_proj.parameters()) +
+            list(self.network.actor.action_mlp.parameters()) +
+            list(self.network.actor.continuous_mu_head.parameters()) +
+            list(self.network.actor.continuous_logstd_head.parameters())
+        )
+        
+        # Critic head parameters (everything except backbone)
+        critic_head_params = (
+            list(self.network.critic.feature_proj.parameters()) +
+            list(self.network.critic.value_mlp.parameters()) +
+            list(self.network.critic.value_heads.parameters())
+        )
+        
+        # Filter to only trainable parameters
+        def only_trainable(params):
+            return [p for p in params if p.requires_grad]
+        
+        # Add backbone group if any parameters are trainable
+        bb_params = only_trainable(actor_backbone_params + critic_backbone_params)
+        if len(bb_params) > 0:
+            param_groups.append({'params': bb_params, 'lr': bb_lr, 'name': 'backbone'})
+        
+        # Add head group
+        head_params = only_trainable(actor_head_params + critic_head_params)
+        if len(head_params) > 0:
+            param_groups.append({'params': head_params, 'lr': hd_lr, 'name': 'heads'})
         
         # Add encoder parameters
         encoder_params = [p for p in self.network.encoder.parameters() if p.requires_grad]
@@ -1188,9 +1235,7 @@ class DurotaxisTrainer:
         if not batched_output or sum(node_counts) == 0:
             # Handle empty batch case
             empty_output = {
-                'discrete_actions': torch.empty(0, dtype=torch.long, device=self.device),
-                'continuous_actions': torch.empty(0, 4, device=self.device),
-                'discrete_log_probs': torch.empty(0, device=self.device),
+                'continuous_actions': torch.empty(0, 5, device=self.device),
                 'continuous_log_probs': torch.empty(0, device=self.device),
                 'total_log_probs': torch.empty(0, device=self.device),
                 'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
@@ -1205,9 +1250,7 @@ class DurotaxisTrainer:
             if num_nodes == 0:
                 # Empty graph
                 output = {
-                    'discrete_actions': torch.empty(0, dtype=torch.long, device=self.device),
-                    'continuous_actions': torch.empty(0, 4, device=self.device),
-                    'discrete_log_probs': torch.empty(0, device=self.device),
+                    'continuous_actions': torch.empty(0, 5, device=self.device),
                     'continuous_log_probs': torch.empty(0, device=self.device),
                     'total_log_probs': torch.empty(0, device=self.device),
                     'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
@@ -1215,22 +1258,25 @@ class DurotaxisTrainer:
             else:
                 node_end = node_start + num_nodes
                 
-                # Extract node-level outputs for this graph
+                # Extract outputs for this graph
                 output = {}
                 
-                # Node-level tensors (discrete/continuous actions and log probs)
-                for key in ['discrete_actions', 'continuous_actions', 'discrete_log_probs', 'continuous_log_probs', 'total_log_probs']:
-                    if key in batched_output and batched_output[key].shape[0] > 0:
-                        output[key] = batched_output[key][node_start:node_end]
+                # DELETE RATIO ARCHITECTURE:
+                # - continuous_actions: [batch_size, 5] -> extract [5] for this graph
+                # - continuous_log_probs: [batch_size] -> extract scalar for this graph (NOT per-node!)
+                # - total_log_probs: [batch_size] -> extract scalar for this graph
+                
+                if 'continuous_actions' in batched_output and batched_output['continuous_actions'].shape[0] > i:
+                    output['continuous_actions'] = batched_output['continuous_actions'][i]
+                else:
+                    output['continuous_actions'] = torch.empty(0, 5, device=self.device)
+                
+                # Log probs are per-graph (scalars), not per-node!
+                for key in ['continuous_log_probs', 'total_log_probs']:
+                    if key in batched_output and batched_output[key].shape[0] > i:
+                        output[key] = batched_output[key][i]  # Extract scalar for this graph
                     else:
-                        # Handle missing keys
-                        if 'actions' in key:
-                            if 'discrete' in key:
-                                output[key] = torch.empty(0, dtype=torch.long, device=self.device)
-                            else:
-                                output[key] = torch.empty(0, 4, device=self.device)
-                        else:
-                            output[key] = torch.empty(0, device=self.device)
+                        output[key] = torch.tensor(0.0, device=self.device)
                 
                 # Graph-level value predictions (one per graph)
                 if 'value_predictions' in batched_output:
@@ -1401,38 +1447,24 @@ class DurotaxisTrainer:
         self.current_entropy_coeff = current_coeff
         return current_coeff
 
-    def compute_adaptive_gradient_scaling(self, discrete_loss: torch.Tensor, continuous_loss: torch.Tensor) -> Tuple[float, float]:
+    def compute_adaptive_gradient_scaling(self, continuous_loss: torch.Tensor) -> float:
         """
-        Compute adaptive gradient scaling weights to balance discrete and continuous learning
+        Compute adaptive gradient scaling for continuous actions (delete ratio architecture)
         
         Args:
-            discrete_loss: Policy loss for discrete actions
             continuous_loss: Policy loss for continuous actions
             
         Returns:
-            Tuple of (adaptive_discrete_weight, adaptive_continuous_weight)
+            Adaptive continuous weight
         """
         if not self.enable_gradient_scaling:
-            return self.policy_loss_weights['discrete_weight'], self.policy_loss_weights['continuous_weight']
+            return self.policy_loss_weights['continuous_weight']
         
-        # Compute gradients for each component separately (without applying them)
-        discrete_gradients = []
+        # Compute gradients for continuous loss
         continuous_gradients = []
         
-        # Ensure losses are scalars by taking mean if necessary
-        discrete_loss_scalar = discrete_loss.mean() if discrete_loss.numel() > 1 else discrete_loss
+        # Ensure loss is scalar by taking mean if necessary
         continuous_loss_scalar = continuous_loss.mean() if continuous_loss.numel() > 1 else continuous_loss
-        
-        # Get gradients for discrete loss
-        if discrete_loss_scalar.requires_grad:
-            discrete_grads = torch.autograd.grad(
-                discrete_loss_scalar, 
-                [p for p in self.network.parameters() if p.requires_grad], 
-                retain_graph=True, 
-                create_graph=False,
-                allow_unused=True
-            )
-            discrete_gradients = [g for g in discrete_grads if g is not None]
         
         # Get gradients for continuous loss  
         if continuous_loss_scalar.requires_grad:
@@ -1445,65 +1477,46 @@ class DurotaxisTrainer:
             )
             continuous_gradients = [g for g in continuous_grads if g is not None]
         
-        # Compute gradient norms
-        discrete_grad_norm = 0.0
-        if discrete_gradients:
-            discrete_grad_norm = torch.sqrt(sum(torch.sum(g**2) for g in discrete_gradients)).item()
-        
+        # Compute gradient norm
         continuous_grad_norm = 0.0
         if continuous_gradients:
             continuous_grad_norm = torch.sqrt(sum(torch.sum(g**2) for g in continuous_gradients)).item()
         
-        # Update EMA of gradient norms
-        if self.discrete_grad_norm_ema is None:
-            self.discrete_grad_norm_ema = discrete_grad_norm
+        # Update EMA of gradient norm
+        if self.continuous_grad_norm_ema is None:
             self.continuous_grad_norm_ema = continuous_grad_norm
         else:
-            self.discrete_grad_norm_ema = (self.scaling_momentum * self.discrete_grad_norm_ema + 
-                                         (1 - self.scaling_momentum) * discrete_grad_norm)
             self.continuous_grad_norm_ema = (self.scaling_momentum * self.continuous_grad_norm_ema + 
                                            (1 - self.scaling_momentum) * continuous_grad_norm)
         
         self.gradient_step_count += 1
         
-        # During warmup, use original weights
+        # During warmup, use original weight
         if self.gradient_step_count < self.gradient_warmup_steps:
-            return self.policy_loss_weights['discrete_weight'], self.policy_loss_weights['continuous_weight']
+            return self.policy_loss_weights['continuous_weight']
         
-        # Compute adaptive scaling factors
-        if self.discrete_grad_norm_ema > 0 and self.continuous_grad_norm_ema > 0:
-            # Target: both components should have similar gradient norms
-            discrete_scale = self.gradient_norm_target / self.discrete_grad_norm_ema
+        # Compute adaptive scaling factor
+        if self.continuous_grad_norm_ema > 0:
+            # Target: gradient norm should match target
             continuous_scale = self.gradient_norm_target / self.continuous_grad_norm_ema
             
-            # Clamp scaling factors to prevent extreme values
-            discrete_scale = max(self.min_scaling_factor, min(self.max_scaling_factor, discrete_scale))
+            # Clamp scaling factor to prevent extreme values
             continuous_scale = max(self.min_scaling_factor, min(self.max_scaling_factor, continuous_scale))
             
-            # Apply scaling to original weights
-            base_discrete = self.policy_loss_weights['discrete_weight']
+            # Apply scaling to original weight
             base_continuous = self.policy_loss_weights['continuous_weight']
-            
-            scaled_discrete = base_discrete * discrete_scale
-            scaled_continuous = base_continuous * continuous_scale
-            
-            # Normalize to maintain relative importance while balancing gradients
-            total_weight = scaled_discrete + scaled_continuous
-            if total_weight > 0:
-                self.adaptive_discrete_weight = scaled_discrete / total_weight
-                self.adaptive_continuous_weight = scaled_continuous / total_weight
+            self.adaptive_continuous_weight = base_continuous * continuous_scale
         
-        return self.adaptive_discrete_weight, self.adaptive_continuous_weight
+        return self.adaptive_continuous_weight
     
     def compute_enhanced_entropy_loss(self, eval_output: Dict[str, torch.Tensor], episode: int) -> Dict[str, torch.Tensor]:
         """
-        Enhanced entropy regularization for hybrid action spaces
+        Enhanced entropy regularization for continuous action space (delete ratio architecture)
         
-        Implements your core idea with improvements:
+        Implements:
         1. Adaptive entropy scheduling (high→low over training)
-        2. Separate handling for discrete vs continuous actions  
-        3. Minimum entropy protection against policy collapse
-        4. Action space specific weighting
+        2. Minimum entropy protection against policy collapse
+        3. Continuous action space specific weighting
         
         Args:
             eval_output: Network evaluation output containing entropy information
@@ -1518,7 +1531,7 @@ class DurotaxisTrainer:
         entropy_coeff = self.compute_adaptive_entropy_coefficient(episode)
         
         if 'entropy' in eval_output:
-            # Combined entropy (your original idea enhanced)
+            # Combined entropy for continuous actions
             total_entropy = eval_output['entropy'].mean()
             
             # Minimum entropy protection (prevent complete collapse)
@@ -1530,41 +1543,21 @@ class DurotaxisTrainer:
             # Main entropy regularization (encourage exploration)
             entropy_losses['total'] = -entropy_coeff * total_entropy
             
-        else:
-            # Separate discrete and continuous entropy handling
-            total_entropy_loss = torch.tensor(0.0, device=self.device)
+        elif 'continuous_entropy' in eval_output:
+            # Continuous entropy only (delete ratio architecture)
+            continuous_entropy = eval_output['continuous_entropy'].mean()
             
-            if 'discrete_entropy' in eval_output:
-                discrete_entropy = eval_output['discrete_entropy'].mean()
-                
-                # Discrete actions need strong entropy (topology decisions are critical)
-                discrete_loss = -entropy_coeff * self.discrete_entropy_weight * discrete_entropy
-                entropy_losses['discrete'] = discrete_loss
-                total_entropy_loss += discrete_loss
-                
-                # Monitor discrete entropy collapse
-                if discrete_entropy < self.min_entropy_threshold:
-                    discrete_penalty = (self.min_entropy_threshold - discrete_entropy) * 3.0
-                    entropy_losses['discrete_penalty'] = discrete_penalty
-                    total_entropy_loss += discrete_penalty
+            # Continuous actions benefit from moderate entropy for parameter tuning
+            continuous_loss = -entropy_coeff * self.continuous_entropy_weight * continuous_entropy
+            entropy_losses['continuous'] = continuous_loss
             
-            if 'continuous_entropy' in eval_output:
-                continuous_entropy = eval_output['continuous_entropy'].mean()
-                
-                # Continuous actions can be more focused (parameter fine-tuning)
-                continuous_loss = -entropy_coeff * self.continuous_entropy_weight * continuous_entropy
-                entropy_losses['continuous'] = continuous_loss
-                total_entropy_loss += continuous_loss
-                
-                # Monitor continuous entropy collapse
-                if continuous_entropy < self.min_entropy_threshold * 0.5:  # Lower threshold for continuous
-                    continuous_penalty = (self.min_entropy_threshold * 0.5 - continuous_entropy) * 1.5
-                    entropy_losses['continuous_penalty'] = continuous_penalty
-                    total_entropy_loss += continuous_penalty
-            
-            # Combined loss for backward compatibility
-            if total_entropy_loss.item() != 0:
-                entropy_losses['total'] = total_entropy_loss
+            # Monitor continuous entropy collapse
+            if continuous_entropy < self.min_entropy_threshold * 0.5:  # Lower threshold for continuous
+                continuous_penalty = (self.min_entropy_threshold * 0.5 - continuous_entropy) * 1.5
+                entropy_losses['continuous_penalty'] = continuous_penalty
+                entropy_losses['total'] = continuous_loss + continuous_penalty
+            else:
+                entropy_losses['total'] = continuous_loss
         
         return entropy_losses
     
@@ -2401,53 +2394,57 @@ class DurotaxisTrainer:
             states.append(state_dict)
             values.append(output['value_predictions'])
             
-            # Extract actions and log probs
-            if len(output.get('discrete_actions', [])) > 0:
-                discrete_actions = output['discrete_actions']
-                continuous_actions = output['continuous_actions']
-                log_probs = output['total_log_probs']
+            # Extract actions and log probs (DELETE RATIO ARCHITECTURE)
+            # Network now outputs single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+            if 'continuous_actions' in output:
+                continuous_actions = output['continuous_actions']  # Shape: [5]
+                log_probs = output['continuous_log_probs']  # Shape: scalar
                 
                 actions_taken.append({
-                    'discrete': discrete_actions,
                     'continuous': continuous_actions,
                     'mask': action_mask
                 })
                 
-                # Store separate log probs for hybrid policy loss
+                # Store log probs for policy loss computation
                 log_probs_list.append({
-                    'discrete': output['discrete_log_probs'],
-                    'continuous': output['continuous_log_probs'],
-                    'total': log_probs  # Keep for backward compatibility
+                    'continuous': log_probs,
+                    'total': log_probs
                 })
                 
-                # Execute actions in environment
-                topology_actions = self.network.get_topology_actions(output)
+                # Get node positions sorted by x-coordinate for delete ratio strategy
+                node_features = state_dict['node_features']
+                node_positions = [(i, node_features[i][0].item() if isinstance(node_features[i][0], torch.Tensor) else node_features[i][0]) 
+                                 for i in range(state_dict['num_nodes'])]
+                node_positions.sort(key=lambda x: x[1])  # Sort by x-position (leftmost first)
                 
+                # Execute actions using delete ratio
+                topology_actions = self.network.get_topology_actions(output, node_positions)
+                
+                # Get single global spawn parameters
+                # STAGE 1: Use fixed spawn parameters (learn delete_ratio only)
+                # STAGE 2: Use network's learned spawn parameters (learn all 5 params)
+                if self.training_stage == 1:
+                    # Use fixed default parameters from config
+                    gamma = self.stage_1_fixed_spawn_params['gamma']
+                    alpha = self.stage_1_fixed_spawn_params['alpha']
+                    noise = self.stage_1_fixed_spawn_params['noise']
+                    theta = self.stage_1_fixed_spawn_params['theta']
+                else:
+                    # Use network's continuous output (indices 1-4)
+                    gamma, alpha, noise, theta = self.network.get_spawn_parameters(output)
+                
+                # Execute spawn/delete actions
                 for node_id, action_type in topology_actions.items():
                     try:
                         if action_type == 'spawn':
-                            # STAGE 1: Use fixed spawn parameters (discrete actions only)
-                            # STAGE 2: Use network's learned continuous parameters
-                            if self.training_stage == 1:
-                                # Use fixed default parameters from config
-                                params = [
-                                    self.stage_1_fixed_spawn_params['gamma'],
-                                    self.stage_1_fixed_spawn_params['alpha'],
-                                    self.stage_1_fixed_spawn_params['noise'],
-                                    self.stage_1_fixed_spawn_params['theta']
-                                ]
-                            else:
-                                # Use network's continuous output
-                                params = self.network.get_spawn_parameters(output, node_id)
+                            # Track spawn parameters (same for all spawning nodes)
+                            self.current_episode_spawn_params['gamma'].append(gamma)
+                            self.current_episode_spawn_params['alpha'].append(alpha)
+                            self.current_episode_spawn_params['noise'].append(noise)
+                            self.current_episode_spawn_params['theta'].append(theta)
                             
-                            # Track spawn parameters for statistics
-                            self.current_episode_spawn_params['gamma'].append(params[0])
-                            self.current_episode_spawn_params['alpha'].append(params[1])
-                            self.current_episode_spawn_params['noise'].append(params[2])
-                            self.current_episode_spawn_params['theta'].append(params[3])
-                            
-                            self.env.topology.spawn(node_id, gamma=params[0], alpha=params[1], 
-                                                  noise=params[2], theta=params[3])
+                            self.env.topology.spawn(node_id, gamma=gamma, alpha=alpha, 
+                                                  noise=noise, theta=theta)
                         elif action_type == 'delete':
                             self.env.topology.delete(node_id)
                     except Exception as e:
@@ -2618,7 +2615,7 @@ class DurotaxisTrainer:
     def compute_hybrid_policy_loss(self, old_log_probs_dict: Dict[str, torch.Tensor], 
                                   eval_output: Dict[str, torch.Tensor], 
                                   advantage: float, episode: int = 0) -> Dict[str, torch.Tensor]:
-        """Compute balanced policy loss for hybrid discrete+continuous actions with adaptive gradient scaling"""
+        """Compute policy loss for continuous actions (delete ratio architecture) with PPO clipping"""
         policy_losses = {}
         
         # Extract base weights and clipping
@@ -2628,73 +2625,24 @@ class DurotaxisTrainer:
         if not isinstance(advantage, torch.Tensor):
             advantage = torch.tensor(advantage, device=self.device)
         
-        # === DISCRETE POLICY LOSS ===
-        discrete_loss_raw = torch.tensor(0.0, device=self.device)
-        approx_kl_discrete = torch.tensor(0.0, device=self.device)
-        ratio_discrete = torch.tensor(1.0, device=self.device)
-        clip_fraction_discrete = torch.tensor(0.0, device=self.device)
-        
-        if ('discrete' in old_log_probs_dict and 
-            'discrete_log_probs' in eval_output and 
-            len(old_log_probs_dict['discrete']) > 0 and 
-            len(eval_output['discrete_log_probs']) > 0):
-            
-            # For hybrid action spaces with varying graph sizes, we need to aggregate first
-            # This is because the number of nodes (and thus log_probs) can change between
-            # action collection and re-evaluation. We use .mean() for numerical stability.
-            old_discrete_log_prob = old_log_probs_dict['discrete'].mean()
-            new_discrete_log_prob = eval_output['discrete_log_probs'].mean()
-            
-            # Approximate KL divergence: KL ≈ E[log π_old - log π_new] (device-agnostic)
-            approx_kl_discrete = (old_discrete_log_prob - new_discrete_log_prob).clamp_min(0.0)
-            
-            # Clamp log prob difference to prevent exp overflow
-            log_prob_diff = torch.clamp(new_discrete_log_prob - old_discrete_log_prob, -20.0, 20.0)
-            
-            # Compute ratio with additional safety
-            ratio_discrete = torch.exp(log_prob_diff)
-            
-            # Guard against NaN/Inf in ratio (critical for numerical stability)
-            if not torch.isfinite(ratio_discrete).all():
-                ratio_discrete = torch.where(
-                    torch.isfinite(ratio_discrete),
-                    ratio_discrete,
-                    torch.tensor(1.0, device=self.device)
-                )
-            
-            # Additional safety: clamp ratio to reasonable range before PPO clipping
-            ratio_discrete = torch.clamp(ratio_discrete, 0.01, 100.0)
-            
-            # PPO clipping
-            clipped_ratio_discrete = torch.clamp(ratio_discrete, 1 - clip_eps, 1 + clip_eps)
-            
-            # Clip fraction: fraction of ratios that were clipped (device-agnostic)
-            clip_fraction_discrete = ((ratio_discrete - clipped_ratio_discrete).abs() > 1e-6).float()
-            
-            # PPO surrogate objective
-            surr1 = ratio_discrete * advantage
-            surr2 = clipped_ratio_discrete * advantage
-            
-            discrete_loss_raw = -torch.min(surr1, surr2)
-        
-        # === CONTINUOUS POLICY LOSS ===
+        # === CONTINUOUS POLICY LOSS (DELETE RATIO ARCHITECTURE) ===
+        # Note: We no longer have discrete actions - only continuous [delete_ratio, gamma, alpha, noise, theta]
         continuous_loss_raw = torch.tensor(0.0, device=self.device)
         approx_kl_continuous = torch.tensor(0.0, device=self.device)
         ratio_continuous = torch.tensor(1.0, device=self.device)
         clip_fraction_continuous = torch.tensor(0.0, device=self.device)
         
-        # STAGE 1: Skip continuous loss computation (discrete actions only)
-        # STAGE 2: Compute full continuous loss for fine-tuning
-        if self.training_stage == 2 and ('continuous' in old_log_probs_dict and 
+        # STAGE 1: Learn delete_ratio only (indices 0), spawn params fixed
+        # STAGE 2: Learn all 5 continuous parameters [delete_ratio, gamma, alpha, noise, theta]
+        if ('continuous' in old_log_probs_dict and 
             'continuous_log_probs' in eval_output and 
-            len(old_log_probs_dict['continuous']) > 0 and 
-            len(eval_output['continuous_log_probs']) > 0):
+            old_log_probs_dict['continuous'].numel() > 0 and 
+            eval_output['continuous_log_probs'].numel() > 0):
             
-            # For hybrid action spaces with varying graph sizes, we need to aggregate first
-            # This is because the number of nodes (and thus log_probs) can change between
-            # action collection and re-evaluation. We use .mean() for numerical stability.
-            old_continuous_log_prob = old_log_probs_dict['continuous'].mean()
-            new_continuous_log_prob = eval_output['continuous_log_probs'].mean()
+            # For delete ratio architecture, log_probs are scalars (0-d tensors)
+            # Use .item() to get the scalar value, or keep as tensor for autograd
+            old_continuous_log_prob = old_log_probs_dict['continuous']
+            new_continuous_log_prob = eval_output['continuous_log_probs']
             
             # Approximate KL divergence: KL ≈ E[log π_old - log π_new] (device-agnostic)
             approx_kl_continuous = (old_continuous_log_prob - new_continuous_log_prob).clamp_min(0.0)
@@ -2728,30 +2676,25 @@ class DurotaxisTrainer:
             
             continuous_loss_raw = -torch.min(surr1, surr2)
         
-        # === ADAPTIVE GRADIENT SCALING ===
-        # Compute adaptive weights based on gradient magnitudes
-        adaptive_discrete_weight, adaptive_continuous_weight = self.compute_adaptive_gradient_scaling(
-            discrete_loss_raw, continuous_loss_raw
-        )
+        # === POLICY LOSS (DELETE RATIO ARCHITECTURE - CONTINUOUS ONLY) ===
+        # No need for adaptive gradient scaling since we only have continuous actions now
+        adaptive_continuous_weight = 1.0  # Can be adjusted if needed
         
-        # Apply adaptive weights
-        policy_losses['discrete'] = adaptive_discrete_weight * discrete_loss_raw
+        # Apply weight (keep for consistency with existing code structure)
         policy_losses['continuous'] = adaptive_continuous_weight * continuous_loss_raw
         
         # === ENHANCED ENTROPY REGULARIZATION ===
         # Use enhanced entropy system instead of basic entropy handling
         entropy_losses = self.compute_enhanced_entropy_loss(eval_output, episode)
         
-        # Total policy loss
-        total_policy_loss = sum(policy_losses.values())
+        # Total policy loss (continuous-only)
+        total_policy_loss = policy_losses['continuous']
         
         # Guard against NaN/Inf in total policy loss (critical safety check)
         if not torch.isfinite(total_policy_loss).all():
             print(f"WARNING: Non-finite policy loss detected! Resetting to zero.")
-            print(f"  discrete_loss: {policy_losses['discrete']}")
             print(f"  continuous_loss: {policy_losses['continuous']}")
             total_policy_loss = torch.tensor(0.0, device=self.device)
-            policy_losses['discrete'] = torch.tensor(0.0, device=self.device)
             policy_losses['continuous'] = torch.tensor(0.0, device=self.device)
         
         # Ensure entropy loss is always a tensor
@@ -2770,21 +2713,14 @@ class DurotaxisTrainer:
             total_entropy_loss = torch.tensor(0.0, device=self.device)
         
         return {
-            'policy_loss_discrete': policy_losses['discrete'],
             'policy_loss_continuous': policy_losses['continuous'],
             'total_policy_loss': total_policy_loss,
             'entropy_loss': total_entropy_loss,
-            'discrete_weight_used': adaptive_discrete_weight,
             'continuous_weight_used': adaptive_continuous_weight,
-            'discrete_grad_norm': getattr(self, 'discrete_grad_norm_ema', 0.0),
             'continuous_grad_norm': getattr(self, 'continuous_grad_norm_ema', 0.0),
-            'gradient_scaling_active': self.enable_gradient_scaling and self.gradient_step_count >= self.gradient_warmup_steps,
-            # PPO health metrics (device-agnostic)
-            'approx_kl_discrete': approx_kl_discrete,
+            # PPO health metrics (device-agnostic, continuous-only)
             'approx_kl_continuous': approx_kl_continuous,
-            'ratio_discrete': ratio_discrete,
             'ratio_continuous': ratio_continuous,
-            'clip_fraction_discrete': clip_fraction_discrete,
             'clip_fraction_continuous': clip_fraction_continuous,
         }
     
@@ -2812,7 +2748,7 @@ class DurotaxisTrainer:
             if 'mask' in action_dict and action_dict['mask'] is not None:
                 action_masks.append(action_dict['mask'])
             elif states[i].get('num_nodes', 0) > 0:
-                # Create default mask if not provided
+                # Create default mask if not provided (no longer needed for delete ratio, but keep for compatibility)
                 num_nodes = states[i]['num_nodes']
                 default_mask = torch.ones(num_nodes, 2, dtype=torch.bool, device=self.device)
                 action_masks.append(default_mask)
@@ -2829,35 +2765,29 @@ class DurotaxisTrainer:
         else:
             batched_action_mask = None
         
-        # Step 3: Collate discrete and continuous actions
-        all_discrete_actions = []
+        # Step 3: Collate continuous actions (DELETE RATIO ARCHITECTURE)
         all_continuous_actions = []
         
         for action_dict in actions:
-            if 'discrete' in action_dict and action_dict['discrete'].shape[0] > 0:
-                all_discrete_actions.append(action_dict['discrete'])
+            if 'continuous' in action_dict and action_dict['continuous'].shape[0] > 0:
                 all_continuous_actions.append(action_dict['continuous'])
         
-        if all_discrete_actions:
-            batched_discrete_actions = torch.cat(all_discrete_actions, dim=0)
-            batched_continuous_actions = torch.cat(all_continuous_actions, dim=0)
+        if all_continuous_actions:
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
         else:
             # Handle empty actions case
-            batched_discrete_actions = torch.empty(0, dtype=torch.long, device=self.device)
-            batched_continuous_actions = torch.empty(0, 4, device=self.device)
+            batched_continuous_actions = torch.empty(0, 5, device=self.device)
         
         # Step 4: Single batched re-evaluation (🚀 MUCH FASTER!)
         if batched_states['num_nodes'] > 0:
             batched_eval_output = self.network.evaluate_actions(
                 batched_states,
-                batched_discrete_actions,
                 batched_continuous_actions,
                 action_mask=batched_action_mask
             )
         else:
             # Handle empty batch
             batched_eval_output = {
-                'discrete_log_probs': torch.empty(0, device=self.device),
                 'continuous_log_probs': torch.empty(0, device=self.device),
                 'total_log_probs': torch.empty(0, device=self.device),
                 'value_predictions': {k: torch.empty(0, device=self.device) for k in self.component_names},
@@ -2874,13 +2804,13 @@ class DurotaxisTrainer:
         value_losses = {component: [] for component in self.component_names}
         
         for i, (eval_output, old_log_probs_dict) in enumerate(zip(individual_eval_outputs, old_log_probs)):
-            if i >= len(actions) or 'discrete' not in actions[i]:
+            if i >= len(actions) or 'continuous' not in actions[i]:
                 continue
             
-            # === HYBRID POLICY LOSS ===
+            # === HYBRID POLICY LOSS (DELETE RATIO ARCHITECTURE) ===
             advantage = total_advantages[i]
             
-            # Compute hybrid policy loss with separate discrete/continuous handling
+            # Compute hybrid policy loss with continuous-only handling
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
                 old_log_probs_dict, eval_output, advantage, episode
             )
@@ -2899,8 +2829,7 @@ class DurotaxisTrainer:
         
         # Policy losses
         if hybrid_policy_losses:
-            # Average across batch
-            avg_discrete_loss = torch.stack([h['policy_loss_discrete'] for h in hybrid_policy_losses]).mean()
+            # Average across batch (continuous-only, no discrete)
             avg_continuous_loss = torch.stack([h['policy_loss_continuous'] for h in hybrid_policy_losses]).mean()
             avg_total_policy_loss = torch.stack([h['total_policy_loss'] for h in hybrid_policy_losses]).mean()
             # Handle entropy loss - ensure all are tensors
@@ -2912,13 +2841,11 @@ class DurotaxisTrainer:
                 entropy_losses_list.append(entropy_loss)
             avg_entropy_loss = torch.stack(entropy_losses_list).mean()
             
-            losses['policy_loss_discrete'] = avg_discrete_loss.item()
             losses['policy_loss_continuous'] = avg_continuous_loss.item()
             losses['total_policy_loss'] = avg_total_policy_loss.item()
             losses['entropy_loss'] = avg_entropy_loss.item()
             
-            # Show weight usage
-            losses['discrete_weight'] = hybrid_policy_losses[0]['discrete_weight_used']
+            # Show weight usage (continuous-only now)
             losses['continuous_weight'] = hybrid_policy_losses[0]['continuous_weight_used']
         else:
             avg_total_policy_loss = torch.tensor(0.0, device=self.device)
@@ -3051,7 +2978,7 @@ class DurotaxisTrainer:
             if 'mask' in action_dict and action_dict['mask'] is not None:
                 action_masks.append(action_dict['mask'])
             elif states[i].get('num_nodes', 0) > 0:
-                # Create default mask if not provided
+                # Create default mask if not provided (no longer needed for delete ratio, but keep for compatibility)
                 num_nodes = states[i]['num_nodes']
                 default_mask = torch.ones(num_nodes, 2, dtype=torch.bool, device=self.device)
                 action_masks.append(default_mask)
@@ -3068,35 +2995,29 @@ class DurotaxisTrainer:
         else:
             batched_action_mask = None
         
-        # Step 3: Collate discrete and continuous actions
-        all_discrete_actions = []
+        # Step 3: Collate continuous actions (DELETE RATIO ARCHITECTURE)
         all_continuous_actions = []
         
         for action_dict in actions:
-            if 'discrete' in action_dict and action_dict['discrete'].shape[0] > 0:
-                all_discrete_actions.append(action_dict['discrete'])
+            if 'continuous' in action_dict and action_dict['continuous'].shape[0] > 0:
                 all_continuous_actions.append(action_dict['continuous'])
         
-        if all_discrete_actions:
-            batched_discrete_actions = torch.cat(all_discrete_actions, dim=0)
-            batched_continuous_actions = torch.cat(all_continuous_actions, dim=0)
+        if all_continuous_actions:
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
         else:
             # Handle empty actions case
-            batched_discrete_actions = torch.empty(0, dtype=torch.long, device=self.device)
-            batched_continuous_actions = torch.empty(0, 4, device=self.device)
+            batched_continuous_actions = torch.empty(0, 5, device=self.device)
         
         # Step 4: Single batched re-evaluation (🚀 MUCH FASTER!)
         if batched_states['num_nodes'] > 0:
             batched_eval_output = self.network.evaluate_actions(
                 batched_states,
-                batched_discrete_actions,
                 batched_continuous_actions,
                 action_mask=batched_action_mask
             )
         else:
             # Handle empty batch
             batched_eval_output = {
-                'discrete_log_probs': torch.empty(0, device=self.device),
                 'continuous_log_probs': torch.empty(0, device=self.device),
                 'total_log_probs': torch.empty(0, device=self.device),
                 'value_predictions': {k: torch.empty(0, device=self.device) for k in self.component_names},
@@ -3113,13 +3034,13 @@ class DurotaxisTrainer:
         value_losses = {component: [] for component in self.component_names}
         
         for i, (eval_output, old_log_probs_dict) in enumerate(zip(individual_eval_outputs, old_log_probs)):
-            if i >= len(actions) or 'discrete' not in actions[i]:
+            if i >= len(actions) or 'continuous' not in actions[i]:
                 continue
             
-            # === HYBRID POLICY LOSS ===
+            # === HYBRID POLICY LOSS (DELETE RATIO ARCHITECTURE) ===
             advantage = total_advantages[i]
             
-            # Compute hybrid policy loss with separate discrete/continuous handling
+            # Compute hybrid policy loss with continuous-only handling
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
                 old_log_probs_dict, eval_output, advantage, episode
             )
@@ -3157,8 +3078,7 @@ class DurotaxisTrainer:
         
         # Policy losses
         if hybrid_policy_losses:
-            # Average across batch
-            avg_discrete_loss = torch.stack([h['policy_loss_discrete'] for h in hybrid_policy_losses]).mean()
+            # Average across batch (continuous-only, no discrete)
             avg_continuous_loss = torch.stack([h['policy_loss_continuous'] for h in hybrid_policy_losses]).mean()
             avg_total_policy_loss = torch.stack([h['total_policy_loss'] for h in hybrid_policy_losses]).mean()
             # Handle entropy loss - ensure all are tensors
@@ -3170,29 +3090,21 @@ class DurotaxisTrainer:
                 entropy_losses_list.append(entropy_loss)
             avg_entropy_loss = torch.stack(entropy_losses_list).mean()
             
-            losses['policy_loss_discrete'] = avg_discrete_loss.item()
             losses['policy_loss_continuous'] = avg_continuous_loss.item()
             losses['total_policy_loss'] = avg_total_policy_loss.item()
             losses['entropy_loss'] = avg_entropy_loss.item()
             
-            # Show weight usage
-            losses['discrete_weight'] = hybrid_policy_losses[0]['discrete_weight_used']
+            # Show weight usage (continuous-only now)
             losses['continuous_weight'] = hybrid_policy_losses[0]['continuous_weight_used']
             
             # === AGGREGATE PPO HEALTH METRICS ===
-            # Average KL, ratios, and clip fractions across batch (device-agnostic)
-            avg_kl_discrete = torch.stack([h['approx_kl_discrete'] for h in hybrid_policy_losses]).mean()
+            # Average KL, ratios, and clip fractions across batch (device-agnostic, continuous-only)
             avg_kl_continuous = torch.stack([h['approx_kl_continuous'] for h in hybrid_policy_losses]).mean()
-            avg_ratio_discrete = torch.stack([h['ratio_discrete'] for h in hybrid_policy_losses]).mean()
             avg_ratio_continuous = torch.stack([h['ratio_continuous'] for h in hybrid_policy_losses]).mean()
-            avg_clip_frac_discrete = torch.stack([h['clip_fraction_discrete'] for h in hybrid_policy_losses]).mean()
             avg_clip_frac_continuous = torch.stack([h['clip_fraction_continuous'] for h in hybrid_policy_losses]).mean()
             
-            losses['approx_kl_discrete'] = avg_kl_discrete.item()
             losses['approx_kl_continuous'] = avg_kl_continuous.item()
-            losses['ratio_discrete'] = avg_ratio_discrete.item()
             losses['ratio_continuous'] = avg_ratio_continuous.item()
-            losses['clip_fraction_discrete'] = avg_clip_frac_discrete.item()
             losses['clip_fraction_continuous'] = avg_clip_frac_continuous.item()
         else:
             avg_total_policy_loss = torch.tensor(0.0, device=self.device)
@@ -3620,9 +3532,8 @@ class DurotaxisTrainer:
                     # === KL EARLY STOPPING ===
                     # Check if policy has moved too far (prevents instability)
                     if self.enable_kl_early_stop and epoch < self.update_epochs - 1:
-                        avg_kl_discrete = np.mean(epoch_losses.get('approx_kl_discrete', [0.0]))
                         avg_kl_continuous = np.mean(epoch_losses.get('approx_kl_continuous', [0.0]))
-                        avg_kl_total = avg_kl_discrete + avg_kl_continuous
+                        avg_kl_total = avg_kl_continuous  # Continuous-only (delete ratio)
                         
                         if avg_kl_total > self.target_kl:
                             if self.verbose:
@@ -3637,21 +3548,19 @@ class DurotaxisTrainer:
                 
                 # === LOG PPO HEALTH METRICS ===
                 if self.verbose and final_losses:
-                    # Extract PPO health signals
-                    approx_kl = final_losses.get('approx_kl_discrete', 0.0) + final_losses.get('approx_kl_continuous', 0.0)
-                    clip_frac_discrete = final_losses.get('clip_fraction_discrete', 0.0)
+                    # Extract PPO health signals (continuous-only)
+                    approx_kl = final_losses.get('approx_kl_continuous', 0.0)
                     clip_frac_continuous = final_losses.get('clip_fraction_continuous', 0.0)
-                    ratio_discrete = final_losses.get('ratio_discrete', 1.0)
                     ratio_continuous = final_losses.get('ratio_continuous', 1.0)
                     value_loss = final_losses.get('total_value_loss', 0.0)
                     policy_loss = final_losses.get('total_policy_loss', 0.0)
                     entropy = final_losses.get('entropy_bonus', 0.0)
                     explained_var = final_losses.get('explained_variance', 0.0)
                     
-                    print(f"   📊 PPO Health Metrics:")
+                    print(f"   📊 PPO Health Metrics (Delete Ratio Architecture):")
                     print(f"      KL: {approx_kl:.4f} (target: {self.target_kl:.4f}) {'⚠️ HIGH' if approx_kl > self.target_kl else '✓'}")
-                    print(f"      Clip Frac: D={clip_frac_discrete:.3f} C={clip_frac_continuous:.3f}")
-                    print(f"      Ratio: D={ratio_discrete:.3f} C={ratio_continuous:.3f}")
+                    print(f"      Clip Frac: {clip_frac_continuous:.3f}")
+                    print(f"      Ratio: {ratio_continuous:.3f}")
                     print(f"      Loss: Policy={policy_loss:.4f} Value={value_loss:.4f} Entropy={entropy:.4f}")
                     print(f"      Explained Var: {explained_var:.3f} {'✓' if explained_var > 0.5 else '⚠️ LOW'}")
                     if early_stopped:
