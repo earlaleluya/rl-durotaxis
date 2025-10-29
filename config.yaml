@@ -13,13 +13,13 @@ trainer:
   # proportionally so the curriculum covers the full training run.
   total_episodes: 10000
   max_steps: 1000
-  learning_rate: 0.0002   
+  learning_rate: 0.0001   
   save_dir: "./training_results"
   
   # Resume training configuration
   resume_training:
     enabled: true                      # Set to true to resume from checkpoint
-    checkpoint_path: "training_results/run0013/best_model_batch5.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
+    checkpoint_path: "training_results/run0014/best_model_batch11.pt"               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
     resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
     reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
     reset_episode_count: true          # If true, restart episode counter from 0
