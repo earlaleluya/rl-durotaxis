@@ -366,8 +366,8 @@ environment:
   
   # Node and topology parameters - RELAXED for learning
   init_num_nodes: 5              # Start with more nodes for stability
-  max_critical_nodes: 50         # Allow more nodes
-  threshold_critical_nodes: 100  # GREATLY INCREASED: Allow agent to explore without premature termination
+  max_critical_nodes: 75         # Allow more nodes
+  threshold_critical_nodes: 500  # GREATLY INCREASED: Allow agent to explore without premature termination
   max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
