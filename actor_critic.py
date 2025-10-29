@@ -81,61 +81,64 @@ class Actor(nn.Module):
     It takes node and graph features and outputs action distributions.
     """
     def __init__(self, encoder_out_dim, hidden_dim, num_discrete_actions, continuous_dim, dropout_rate, 
-                 pretrained_weights='imagenet', spawn_bias_init: float = 0.0):
-        """
-        Args:
-            pretrained_weights: 'imagenet', 'random', or None
-                - 'imagenet': Use ImageNet pre-trained weights
-                - 'random': Random initialization
-                - None: Same as 'random'
-        """
+                 pretrained_weights='imagenet', spawn_bias_init: float = 0.0,
+                 backbone_cfg: Optional[dict] = None):
         super().__init__()
-        
-        # Initial projection from GNN output to ResNet input size
+        backbone_cfg = backbone_cfg or {}
+        self.input_adapter = backbone_cfg.get('input_adapter', 'repeat3')  # 'repeat3' | '1ch_conv'
+        self.freeze_mode = backbone_cfg.get('freeze_mode', 'none')         # 'none'|'all'|'until_layer3'|'last_block'
+
         self.feature_proj = nn.Linear(encoder_out_dim * 2, 512)
 
-        # Use a ResNet18 as a powerful feature extractor
-        # Configure weights based on pretrained_weights parameter
         if pretrained_weights == 'imagenet':
             resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
             print("  🔧 Actor using ResNet18 with ImageNet weights")
         else:
             resnet = resnet18(weights=None)
             print(f"  🔧 Actor using ResNet18 with random initialization")
-        
-        # We'll use the body of the ResNet, excluding the final classification layer
         self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
-        
-        # Put ResNet in evaluation mode to use pre-trained batch norm stats
         self.resnet_body.eval()
 
-        # Adapt the first conv layer for our "image"
-        # ResNet18's first conv layer is conv1: Conv2d(3, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-        # We will replace it to accept a single channel input, representing our feature map
-        self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        # Input adaptation: prefer repeat3 to preserve pretrained conv1
+        if self.input_adapter == '1ch_conv':
+            # Replace first conv to accept 1 channel
+            self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        # else: keep original 3-channel conv1 and repeat input later
 
-        # Final MLP heads for actions, taking ResNet's output
+        # Optional freezing strategy
+        self._apply_freeze(self.resnet_body, self.freeze_mode)
+
         self.action_mlp = nn.Sequential(
-            nn.Linear(512, hidden_dim), # ResNet18 output is 512
+            nn.Linear(512, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout_rate)
         )
-
-        # Discrete action head
         self.discrete_head = nn.Linear(hidden_dim, num_discrete_actions)
-        
-        # Continuous action heads
         self.continuous_mu_head = nn.Linear(hidden_dim, continuous_dim)
         self.continuous_logstd_head = nn.Linear(hidden_dim, continuous_dim)
+        self.discrete_bias = nn.Parameter(torch.tensor([float(spawn_bias_init), 0.0], dtype=torch.float32), requires_grad=True)
 
-        # Optional learnable bias to gently encourage spawning early in training
-        # Shape [2]: [spawn_bias, delete_bias]
-        # Create as parameter directly - PyTorch will handle device placement when model is moved
-        self.discrete_bias = nn.Parameter(
-            torch.tensor([float(spawn_bias_init), 0.0], dtype=torch.float32), 
-            requires_grad=True
-        )
+    def _apply_freeze(self, backbone: nn.Module, mode: str):
+        # mode: 'all' | 'until_layer3' | 'last_block' | 'none'
+        if mode == 'none':
+            return
+        def set_requires(m, flag):
+            for p in m.parameters():
+                p.requires_grad = flag
+        if mode == 'all':
+            set_requires(backbone, False)
+        elif mode == 'until_layer3':
+            # Freeze conv1, bn1, layer1, layer2, layer3
+            modules_to_freeze = ['0', '1', '4', '5', '6']  # conv1, bn1, layer1, layer2, layer3 in resnet_body indices
+            for name, m in backbone._modules.items():
+                if name in modules_to_freeze:
+                    set_requires(m, False)
+        elif mode == 'last_block':
+            # Freeze everything except layer4
+            for name, m in backbone._modules.items():
+                if name != '7':  # '7' is layer4 in the body sequence
+                    set_requires(m, False)
 
     def forward(self, node_tokens, graph_token):
         num_nodes = node_tokens.shape[0]
@@ -152,11 +155,14 @@ class Actor(nn.Module):
         # [num_nodes, 512] -> [num_nodes, 1, H, W]
         # We need to find H, W such that H*W is close to 512. Let's use sqrt.
         # A 22x23 image is close. Let's pad to 24x24=576 for simplicity with conv strides.
-        projected_features = self.feature_proj(combined_features) # [num_nodes, 512]
-        
-        # Pad to 576 and reshape
-        padded_features = F.pad(projected_features, (0, 576 - 512)) # [num_nodes, 576]
-        image_like_features = padded_features.view(-1, 1, 24, 24) # [num_nodes, 1, 24, 24]
+        projected_features = self.feature_proj(torch.cat([node_tokens, graph_token.unsqueeze(0).repeat(node_tokens.size(0), 1)], dim=-1))
+        padded_features = F.pad(projected_features, (0, 576 - 512))
+        image_like_features = padded_features.view(-1, 1, 24, 24)
+
+        # Adapt channels for ResNet input
+        if self.input_adapter == 'repeat3':
+            image_like_features = image_like_features.repeat(1, 3, 1, 1)
+        # elif '1ch_conv': keep as 1 channel
 
         # Pass through ResNet body in batches to avoid OOM with large graphs
         batch_size = 64  # Small batch size for 4GB GPU
@@ -218,61 +224,63 @@ class Critic(nn.Module):
     It takes node and graph features and outputs state values for different reward components.
     """
     def __init__(self, encoder_out_dim, hidden_dim, value_components: List[str], dropout_rate,
-                 pretrained_weights='imagenet'):
-        """
-        Args:
-            pretrained_weights: 'imagenet', 'random', or None
-                - 'imagenet': Use ImageNet pre-trained weights
-                - 'random': Random initialization
-                - None: Same as 'random'
-        """
+                 pretrained_weights='imagenet', backbone_cfg: Optional[dict] = None):
         super().__init__()
-        self.value_components = value_components
+        backbone_cfg = backbone_cfg or {}
+        self.input_adapter = backbone_cfg.get('input_adapter', 'repeat3')
+        self.freeze_mode = backbone_cfg.get('freeze_mode', 'none')
 
-        # Initial projection from GNN output to ResNet input size
+        self.value_components = value_components
         self.feature_proj = nn.Linear(encoder_out_dim, 512)
 
-        # Use a ResNet18 as a powerful feature extractor
-        # Configure weights based on pretrained_weights parameter
         if pretrained_weights == 'imagenet':
             resnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
             print("  🔧 Critic using ResNet18 with ImageNet weights")
         else:
             resnet = resnet18(weights=None)
             print(f"  🔧 Critic using ResNet18 with random initialization")
-        
-        # We'll use the body of the ResNet, excluding the final classification layer
         self.resnet_body = nn.Sequential(*list(resnet.children())[:-1])
-        
-        # Put ResNet in evaluation mode to use pre-trained batch norm stats
         self.resnet_body.eval()
 
-        # Adapt the first conv layer for our "image"
-        self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        if self.input_adapter == '1ch_conv':
+            self.resnet_body[0] = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
-        # Final MLP heads for value prediction, taking ResNet's output
+        self._apply_freeze(self.resnet_body, self.freeze_mode)
+
         self.value_mlp = nn.Sequential(
-            nn.Linear(512, hidden_dim),  # ResNet18 output is 512
+            nn.Linear(512, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout_rate)
         )
+        self.value_heads = nn.ModuleDict({component: nn.Linear(hidden_dim, 1) for component in self.value_components})
 
-        # Value heads - one per component
-        self.value_heads = nn.ModuleDict({
-            component: nn.Linear(hidden_dim, 1) for component in value_components
-        })
+    def _apply_freeze(self, backbone: nn.Module, mode: str):
+        # Same as in Actor
+        if mode == 'none': return
+        def set_requires(m, flag):
+            for p in m.parameters():
+                p.requires_grad = flag
+        if mode == 'all':
+            set_requires(backbone, False)
+        elif mode == 'until_layer3':
+            modules_to_freeze = ['0', '1', '4', '5', '6']
+            for name, m in backbone._modules.items():
+                if name in modules_to_freeze:
+                    set_requires(m, False)
+        elif mode == 'last_block':
+            for name, m in backbone._modules.items():
+                if name != '7':
+                    set_requires(m, False)
 
     def forward(self, graph_token):
         device = graph_token.device
         
         # Project and reshape to be "image-like" for ResNet
-        projected_features = self.feature_proj(graph_token)  # [batch_size, 512]
-        
-        # Pad to 576 and reshape
-        padded_features = F.pad(projected_features.unsqueeze(0), (0, 576 - 512))  # [1, 576]
-        image_like_features = padded_features.view(-1, 1, 24, 24)  # [1, 1, 24, 24]
-
+        padded_features = F.pad(self.feature_proj(graph_token).unsqueeze(0), (0, 576 - 512))
+        image_like_features = padded_features.view(-1, 1, 24, 24)
+        if self.input_adapter == 'repeat3':
+            image_like_features = image_like_features.repeat(1, 3, 1, 1)
         # Pass through ResNet body
         resnet_out = self.resnet_body(image_like_features)
         shared_features = resnet_out.view(1, -1)  # [1, 512]
@@ -328,6 +336,9 @@ class HybridActorCritic(nn.Module):
         pretrained_weights = config.get('pretrained_weights', 'imagenet')
         print(f"\n📦 Loading Actor-Critic with pretrained weights: {pretrained_weights}")
         
+        # Backbone configuration for freezing and input adaptation
+        backbone_cfg = config.get('backbone', {})
+        
         # Check if WSA (Weight Sharing Attention) is enabled
         wsa_config = config.get('wsa', {})
         self.use_wsa = wsa_config.get('enabled', False)
@@ -381,15 +392,16 @@ class HybridActorCritic(nn.Module):
                 continuous_dim=self.continuous_dim,
                 dropout_rate=self.dropout_rate,
                 pretrained_weights=pretrained_weights,
-                spawn_bias_init=self.spawn_bias_init
+                spawn_bias_init=self.spawn_bias_init,
+                backbone_cfg=backbone_cfg
             )
-        
         self.critic = Critic(
             encoder_out_dim=self.encoder.out_dim,
             hidden_dim=self.hidden_dim,
             value_components=self.value_components,
             dropout_rate=self.dropout_rate,
-            pretrained_weights=pretrained_weights
+            pretrained_weights=pretrained_weights,
+            backbone_cfg=backbone_cfg
         )
         
         # Parameter bounds for continuous actions from config
@@ -410,6 +422,75 @@ class HybridActorCritic(nn.Module):
         self.register_buffer('action_bounds', torch.tensor(bounds_list, dtype=torch.float32))
         
         self.apply(self._init_weights)
+        
+        # Print parameter information for verification
+        self._print_parameter_info(backbone_cfg)
+    
+    def _print_parameter_info(self, backbone_cfg: dict):
+        """Print detailed parameter information for debugging and verification."""
+        print("\n" + "="*70)
+        print("📊 NETWORK PARAMETER INFORMATION")
+        print("="*70)
+        
+        # Input adapter information
+        input_adapter = backbone_cfg.get('input_adapter', 'repeat3')
+        freeze_mode = backbone_cfg.get('freeze_mode', 'none')
+        
+        if input_adapter == 'repeat3':
+            print("  🖼️  Input Adapter: repeat3 (conv1 PRESERVED from pretrained)")
+        else:
+            print("  🖼️  Input Adapter: 1ch_conv (conv1 REPLACED for single channel)")
+        
+        print(f"  ❄️  Freeze Mode: {freeze_mode}")
+        if freeze_mode == 'none':
+            print("      → All backbone layers are trainable")
+        elif freeze_mode == 'all':
+            print("      → All backbone layers are frozen")
+        elif freeze_mode == 'until_layer3':
+            print("      → Frozen: conv1, bn1, layer1, layer2, layer3")
+            print("      → Trainable: layer4")
+        elif freeze_mode == 'last_block':
+            print("      → Frozen: conv1, bn1, layer1, layer2, layer3")
+            print("      → Trainable: layer4 only")
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        
+        print(f"\n  📈 Total Parameters: {total_params:,}")
+        print(f"  ✅ Trainable Parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        print(f"  ❄️  Frozen Parameters: {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+        
+        # Break down by component
+        if not self.use_wsa:
+            actor_backbone_params = sum(p.numel() for p in self.actor.resnet_body.parameters())
+            actor_backbone_trainable = sum(p.numel() for p in self.actor.resnet_body.parameters() if p.requires_grad)
+            
+            critic_backbone_params = sum(p.numel() for p in self.critic.resnet_body.parameters())
+            critic_backbone_trainable = sum(p.numel() for p in self.critic.resnet_body.parameters() if p.requires_grad)
+            
+            actor_head_params = sum(p.numel() for p in self.actor.parameters()) - actor_backbone_params
+            critic_head_params = sum(p.numel() for p in self.critic.parameters()) - critic_backbone_params
+            
+            print(f"\n  🎭 Actor Breakdown:")
+            print(f"      Backbone: {actor_backbone_params:,} ({actor_backbone_trainable:,} trainable)")
+            print(f"      Heads: {actor_head_params:,} (all trainable)")
+            
+            print(f"  🎯 Critic Breakdown:")
+            print(f"      Backbone: {critic_backbone_params:,} ({critic_backbone_trainable:,} trainable)")
+            print(f"      Heads: {critic_head_params:,} (all trainable)")
+        
+        # Learning rate information
+        backbone_lr = backbone_cfg.get('backbone_lr', 1e-4)
+        head_lr = backbone_cfg.get('head_lr', 3e-4)
+        
+        print(f"\n  🎓 Learning Rate Configuration:")
+        print(f"      Backbone LR: {backbone_lr:.6f}")
+        print(f"      Head LR: {head_lr:.6f}")
+        print(f"      LR Ratio (head/backbone): {head_lr/backbone_lr:.1f}x")
+        
+        print("="*70 + "\n")
     
     def train(self, mode: bool = True):
         """

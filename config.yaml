@@ -366,8 +366,8 @@ environment:
   
   # Node and topology parameters - RELAXED for learning
   init_num_nodes: 5              # Start with more nodes for stability
-  max_critical_nodes: 50         # Allow more nodes
-  threshold_critical_nodes: 100  # GREATLY INCREASED: Allow agent to explore without premature termination
+  max_critical_nodes: 75         # Allow more nodes
+  threshold_critical_nodes: 500  # GREATLY INCREASED: Allow agent to explore without premature termination
   max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
@@ -522,6 +522,14 @@ encoder:
 # HybridActorCritic Configuration
 # ============================================================================
 actor_critic:
+  pretrained_weights: imagenet
+  # Backbone options for both Actor and Critic
+  backbone:
+    input_adapter: repeat3        # repeat3 | 1ch_conv
+    freeze_mode: all              # none | all | until_layer3 | last_block
+    backbone_lr: 1.0e-4           # LR for unfrozen backbone params
+    head_lr: 3.0e-4               # LR for heads (action/value MLP + heads)
+  
   hidden_dim: 128               # Hidden dimension for final MLPs after ResNet
   num_discrete_actions: 2       # Number of discrete actions (spawn/delete)
   continuous_dim: 4             # Dimension of continuous action space (gamma, alpha, noise, theta)

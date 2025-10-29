@@ -645,8 +645,7 @@ class DurotaxisTrainer:
         
         # Optimizer (includes learnable weights)
         self.learning_rate = config.get('learning_rate', 3e-4)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
-        self.weight_optimizer = optim.Adam(self.learnable_component_weights.parameters(), lr=self.weight_learning_rate)
+        self._build_optimizer()
         
         # Learning rate scheduler for long runs
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=500)
@@ -837,6 +836,90 @@ class DurotaxisTrainer:
         
         # Move to device
         self.learnable_component_weights = self.learnable_component_weights.to(self.device)
+    
+    def _build_optimizer(self):
+        """Build optimizer with parameter groups for different learning rates."""
+        # Get backbone config for LR settings
+        ac_config = self.config_loader.get_actor_critic_config()
+        backbone_cfg = ac_config.get('backbone', {})
+        bb_lr = float(backbone_cfg.get('backbone_lr', 1e-4))
+        hd_lr = float(backbone_cfg.get('head_lr', self.learning_rate))
+        
+        # Separate parameters into backbone and head groups
+        param_groups = []
+        
+        if not self.network.use_wsa:
+            # Standard Actor-Critic with ResNet backbone
+            # Actor backbone parameters
+            actor_backbone_params = list(self.network.actor.resnet_body.parameters())
+            # Critic backbone parameters
+            critic_backbone_params = list(self.network.critic.resnet_body.parameters())
+            
+            # Actor head parameters (everything except backbone)
+            actor_head_params = (
+                list(self.network.actor.feature_proj.parameters()) +
+                list(self.network.actor.action_mlp.parameters()) +
+                list(self.network.actor.discrete_head.parameters()) +
+                list(self.network.actor.continuous_mu_head.parameters()) +
+                list(self.network.actor.continuous_logstd_head.parameters()) +
+                [self.network.actor.discrete_bias]
+            )
+            
+            # Critic head parameters (everything except backbone)
+            critic_head_params = (
+                list(self.network.critic.feature_proj.parameters()) +
+                list(self.network.critic.value_mlp.parameters()) +
+                list(self.network.critic.value_heads.parameters())
+            )
+            
+            # Filter to only trainable parameters
+            def only_trainable(params):
+                return [p for p in params if p.requires_grad]
+            
+            # Add backbone group if any parameters are trainable
+            bb_params = only_trainable(actor_backbone_params + critic_backbone_params)
+            if len(bb_params) > 0:
+                param_groups.append({'params': bb_params, 'lr': bb_lr, 'name': 'backbone'})
+            
+            # Add head group
+            head_params = only_trainable(actor_head_params + critic_head_params)
+            if len(head_params) > 0:
+                param_groups.append({'params': head_params, 'lr': hd_lr, 'name': 'heads'})
+        else:
+            # WSA mode - treat all as single group for now
+            all_params = [p for p in self.network.parameters() if p.requires_grad]
+            if len(all_params) > 0:
+                param_groups.append({'params': all_params, 'lr': self.learning_rate, 'name': 'all'})
+        
+        # Add encoder parameters
+        encoder_params = [p for p in self.network.encoder.parameters() if p.requires_grad]
+        if len(encoder_params) > 0:
+            param_groups.append({'params': encoder_params, 'lr': hd_lr, 'name': 'encoder'})
+        
+        # Add learnable weights if enabled
+        if self.enable_learnable_weights:
+            weight_params = [p for p in self.learnable_component_weights.parameters() if p.requires_grad]
+            if len(weight_params) > 0:
+                self.weight_optimizer = torch.optim.Adam(weight_params, lr=self.weight_learning_rate)
+        
+        if len(param_groups) == 0:
+            raise RuntimeError("No trainable parameters found. Check freeze_mode configuration.")
+        
+        # Create main optimizer with parameter groups
+        self.optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), weight_decay=0.0)
+        
+        # Print optimizer configuration
+        print("\n" + "="*70)
+        print("🎓 OPTIMIZER CONFIGURATION")
+        print("="*70)
+        for i, group in enumerate(param_groups):
+            group_name = group.get('name', f'group_{i}')
+            group_lr = group['lr']
+            group_params = sum(p.numel() for p in group['params'])
+            print(f"  Group: {group_name}")
+            print(f"    LR: {group_lr:.6f}")
+            print(f"    Parameters: {group_params:,}")
+        print("="*70 + "\n")
     
     def create_action_mask(self, state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         """Create action mask to prevent invalid topology operations"""
@@ -1719,6 +1802,7 @@ class DurotaxisTrainer:
                                 valid_position_count += 1
                         elif 'x' in node_data and 'y' in node_data:
                             node_info['position']['x'] = float(node_data['x'][node_id])
+                            node_info['position']['y'] = float(node_data
                             node_info['position']['y'] = float(node_data['y'][node_id])
                             # Accumulate for centroid calculation
                             centroid_x_sum += node_info['position']['x']
