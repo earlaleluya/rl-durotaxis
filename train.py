@@ -2769,7 +2769,7 @@ class DurotaxisTrainer:
                 all_continuous_actions.append(action_dict['continuous'])
         
         if all_continuous_actions:
-            batched_continuous_actions = torch.cat(all_continuous_actions, dim=0)
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
         else:
             # Handle empty actions case
             batched_continuous_actions = torch.empty(0, 5, device=self.device)
@@ -2999,7 +2999,7 @@ class DurotaxisTrainer:
                 all_continuous_actions.append(action_dict['continuous'])
         
         if all_continuous_actions:
-            batched_continuous_actions = torch.cat(all_continuous_actions, dim=0)
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
         else:
             # Handle empty actions case
             batched_continuous_actions = torch.empty(0, 5, device=self.device)
