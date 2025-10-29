@@ -1802,7 +1802,6 @@ class DurotaxisTrainer:
                                 valid_position_count += 1
                         elif 'x' in node_data and 'y' in node_data:
                             node_info['position']['x'] = float(node_data['x'][node_id])
-                            node_info['position']['y'] = float(node_data
                             node_info['position']['y'] = float(node_data['y'][node_id])
                             # Accumulate for centroid calculation
                             centroid_x_sum += node_info['position']['x']
