@@ -525,7 +525,7 @@ actor_critic:
   pretrained_weights: imagenet
   # Backbone options for both Actor and Critic
   backbone:
-    input_adapter: repeat3        # repeat3 | 1ch_conv
+    input_adapter: 1ch_conv       # repeat3 | 1ch_conv (CHANGED to match checkpoint)
     freeze_mode: all              # none | all | until_layer3 | last_block
     backbone_lr: 1.0e-4           # LR for unfrozen backbone params
     head_lr: 3.0e-4               # LR for heads (action/value MLP + heads)
