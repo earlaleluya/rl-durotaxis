@@ -1,0 +1,23 @@
+Episode    7: R=4264.646 (Smooth=4286.48) | MB=4251.0 | Steps=264 | Success=True | Loss= 0.0000
+Traceback (most recent call last):
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 4474, in <module>
+    main()
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 4470, in main
+    trainer.train()
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 3506, in train
+    losses = self.update_policy_minibatch(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 2951, in update_policy_minibatch
+    return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, episode)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/c/GitHub/rl-durotaxis/train.py", line 3009, in update_policy_with_value_clipping
+    batched_eval_output = self.network.evaluate_actions(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/c/GitHub/rl-durotaxis/actor_critic.py", line 664, in evaluate_actions
+    continuous_log_probs = continuous_dist.log_prob(continuous_actions_clamped).sum(dim=-1)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/distributions/normal.py", line 80, in log_prob
+    self._validate_sample(value)
+  File "/home/arlyan/miniconda3/envs/durotaxis/lib/python3.12/site-packages/torch/distributions/distribution.py", line 300, in _validate_sample
+    raise ValueError(
+ValueError: Value is not broadcastable with batch_shape+event_shape: torch.Size([320]) vs torch.Size([5]).

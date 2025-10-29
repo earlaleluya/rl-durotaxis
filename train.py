@@ -261,6 +261,24 @@ class TrajectoryBuffer:
                 final_value = final_value.to(device)
             else:
                 final_value = torch.tensor(final_value, device=device, dtype=torch.float32)
+            
+            # Ensure final_value has the same shape as values_tensor entries
+            # If values_tensor is 2D [T, num_components], final_value should match
+            if values_tensor.dim() > 1:
+                # Multi-dimensional values - ensure final_value matches
+                if final_value.dim() == 0:  # Scalar
+                    final_value = final_value.unsqueeze(0).expand(values_tensor.shape[1])
+                elif final_value.dim() == 1 and final_value.shape[0] != values_tensor.shape[1]:
+                    # Wrong size - pad or truncate
+                    if final_value.shape[0] == 1:
+                        final_value = final_value.expand(values_tensor.shape[1])
+                    else:
+                        # This shouldn't happen, but handle gracefully
+                        final_value = final_value[:values_tensor.shape[1]]
+            else:
+                # 1D values - ensure final_value is scalar
+                if final_value.dim() > 0:
+                    final_value = final_value.mean()  # Collapse to scalar
 
             # OPTIMIZATION 4b: Vectorized GAE computation on GPU
             # Preallocate output tensors
@@ -268,7 +286,20 @@ class TrajectoryBuffer:
             advantages = torch.empty(T, device=device, dtype=torch.float32)
             
             # Compute next values vector
-            next_values = torch.cat([values_tensor[1:], final_value.unsqueeze(0)])
+            # Handle both 1D and 2D values_tensor
+            if values_tensor.dim() == 1:
+                # Simple 1D case
+                next_values = torch.cat([values_tensor[1:], final_value.unsqueeze(0)])
+            else:
+                # 2D case: [T, num_components]
+                # Expand final_value to [1, num_components] to match
+                final_value_expanded = final_value.unsqueeze(0)
+                next_values = torch.cat([values_tensor[1:], final_value_expanded], dim=0)
+                # For GAE, we need scalar values, so take mean/sum across components
+                # Use the first component (total_value) or mean
+                values_tensor = values_tensor.mean(dim=1) if values_tensor.shape[1] > 1 else values_tensor.squeeze(1)
+                next_values = next_values.mean(dim=1) if next_values.shape[1] > 1 else next_values.squeeze(1)
+            
             if terminated:
                 next_values[-1] = 0.0  # Zero out bootstrap if terminated
             
