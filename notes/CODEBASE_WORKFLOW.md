@@ -89,7 +89,305 @@ config.yaml
 
 ---
 
-### 2. **Training Loop Architecture**
+### 2. **Reinforcement Learning Loop Flowchart**
+
+This diagram shows the detailed RL interaction cycle between the environment, actor-critic network, and PPO training:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    REINFORCEMENT LEARNING LOOP                           │
+│            (One Step: t → t+1 in Episode Trajectory)                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────┐
+                    │   ENVIRONMENT STATE     │
+                    │   s_t (at time t)       │
+                    │                         │
+                    │ • graph_features [19]   │
+                    │ • node_features [N, 11] │
+                    │ • edge_features [E, 3]  │
+                    │ • edge_index [2, E]     │
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+        ┌────────────────────────────────────────────────────────┐
+        │            GRAPH INPUT ENCODER                         │
+        │         (encoder.py: GraphInputEncoder)                │
+        │                                                         │
+        │  1. Feature Projection (MLP)                           │
+        │     node_features [N, 11] → [N, 128]                   │
+        │     edge_features [E, 3] → [E, 128]                    │
+        │     graph_features [19] → [1, 128] (virtual node)      │
+        │                                                         │
+        │  2. Graph Transformer (4 layers, TransformerConv)      │
+        │     Multi-head attention with edge_attr                │
+        │     Residual connections + LayerNorm + GELU            │
+        │                                                         │
+        │  3. Simplicial Embedding (Optional)                    │
+        │     Group-wise softmax constraint                      │
+        │                                                         │
+        │  OUTPUT: embeddings [N+1, 128]                         │
+        │    - graph_token [1, 128]                              │
+        │    - node_tokens [N, 128]                              │
+        └────────┬───────────────────────────┬───────────────────┘
+                 │                           │
+                 ▼                           ▼
+    ┌────────────────────────┐  ┌───────────────────────────┐
+    │        ACTOR           │  │         CRITIC            │
+    │  (Policy Network)      │  │    (Value Network)        │
+    │                        │  │                           │
+    │  Input: node_tokens +  │  │  Input: graph_token       │
+    │         graph_token    │  │                           │
+    │         [N+1, 128]     │  │         [1, 128]          │
+    │                        │  │                           │
+    │  1. ResNet18 Backbone  │  │  1. ResNet18 Backbone     │
+    │     (ImageNet init)    │  │     (ImageNet init)       │
+    │                        │  │                           │
+    │  2. MLP Head           │  │  2. MLP Head              │
+    │                        │  │                           │
+    │  OUTPUT:               │  │  OUTPUT:                  │
+    │  • μ [N, 5]           │  │  • V(s_t) = {             │
+    │  • log_σ [N, 5]       │  │      'total_reward'       │
+    │                        │  │      'graph_reward'       │
+    │  Continuous params:    │  │      'spawn_reward'       │
+    │  [delete_ratio, γ,     │  │      'delete_reward'      │
+    │   α, noise, θ]        │  │      'edge_reward'        │
+    │                        │  │      'total_node_reward'  │
+    │                        │  │    }                      │
+    └───────────┬────────────┘  │  Multi-component values   │
+                │                │  [1, 6]                   │
+                │                └───────────┬───────────────┘
+                │                            │
+                ▼                            │
+    ┌────────────────────────┐              │
+    │   POLICY π(a_t|s_t)   │              │
+    │                        │              │
+    │  1. Build Normal Dist. │              │
+    │     N(μ, exp(log_σ))  │              │
+    │                        │              │
+    │  2. Sample Actions     │              │
+    │     a_t ~ π(·|s_t)    │              │
+    │     a_t = [delete_ratio│              │
+    │            γ, α,       │              │
+    │            noise, θ]   │              │
+    │     [N, 5]             │              │
+    │                        │              │
+    │  3. Compute Log Prob   │              │
+    │     log π(a_t|s_t)    │              │
+    │                        │              │
+    │  4. Compute Entropy    │              │
+    │     H(π) = 0.5*log(2πe│              │
+    │            * σ²)       │              │
+    │     (encourages        │              │
+    │      exploration)      │              │
+    └───────────┬────────────┘              │
+                │                            │
+                │  a_t, log π(a_t|s_t), H   │  V(s_t)
+                │                            │
+                └─────────────┬──────────────┘
+                              │
+                              ▼
+                    ┌──────────────────────┐
+                    │    ENVIRONMENT       │
+                    │  env.step(a_t)       │
+                    │                      │
+                    │  1. Apply delete_ratio│
+                    │     (remove leftmost) │
+                    │                      │
+                    │  2. Apply spawn      │
+                    │     (γ,α,noise,θ)    │
+                    │                      │
+                    │  3. Update physics   │
+                    │                      │
+                    │  4. Compute rewards  │
+                    │                      │
+                    │  5. Check done       │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+            ┌──────────────────────────────────────┐
+            │         ENVIRONMENT OUTPUTS          │
+            │                                      │
+            │  • s_{t+1}: Next state               │
+            │  • r_t: Reward (6 components)        │
+            │    {total_reward, graph_reward,      │
+            │     spawn_reward, delete_reward,     │
+            │     edge_reward, total_node_reward}  │
+            │  • done: Episode termination flag    │
+            │  • info: Additional metadata         │
+            └──────────────┬───────────────────────┘
+                           │
+                           ▼
+            ┌────────────────────────────────────────┐
+            │      STORE TRANSITION IN BUFFER        │
+            │                                        │
+            │  trajectory.add_step(                  │
+            │    state=s_t,                          │
+            │    action=a_t,                         │
+            │    reward=r_t,                         │
+            │    value=V(s_t),                       │
+            │    log_prob=log π(a_t|s_t),           │
+            │    done=done                           │
+            │  )                                     │
+            └────────────┬───────────────────────────┘
+                         │
+                         ▼
+        ┌─────────────────────────────────────────────┐
+        │  AFTER COLLECTING BATCH OF EPISODES         │
+        │  (Every rollout_batch_size episodes)        │
+        └─────────────────────────────────────────────┘
+                         │
+                         ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │         COMPUTE ADVANTAGES & RETURNS                     │
+        │         (Generalized Advantage Estimation - GAE)         │
+        │                                                           │
+        │  For each component c in {total, graph, spawn, ...}:     │
+        │                                                           │
+        │  1. Compute TD errors δ_t^c:                             │
+        │     δ_t^c = r_t^c + γ*V^c(s_{t+1}) - V^c(s_t)           │
+        │                                                           │
+        │  2. Compute GAE advantages A_t^c:                        │
+        │     A_t^c = Σ_{l=0}^∞ (γλ)^l * δ_{t+l}^c                │
+        │     (exponentially weighted sum of TD errors)            │
+        │                                                           │
+        │  3. Compute returns G_t^c:                               │
+        │     G_t^c = A_t^c + V^c(s_t)                             │
+        │     (advantage + baseline = target for value function)   │
+        │                                                           │
+        │  4. Normalize advantages (optional):                     │
+        │     A_t = (A_t - mean(A)) / (std(A) + ε)                │
+        │     (improves training stability)                        │
+        └─────────────────────────┬───────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              PPO POLICY UPDATE (4 epochs)                 │
+        │         For each minibatch in trajectory buffer:          │
+        └──────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │                 RE-EVALUATE ACTIONS                       │
+        │                                                            │
+        │  Feed s_t through network again:                          │
+        │    new_log_prob, new_values, entropy = network.evaluate_  │
+        │                                         actions(s_t, a_t)  │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              COMPUTE PPO POLICY LOSS                      │
+        │                                                            │
+        │  1. Compute probability ratio:                            │
+        │     ratio = exp(new_log_prob - old_log_prob)              │
+        │           = π_new(a_t|s_t) / π_old(a_t|s_t)              │
+        │                                                            │
+        │  2. Compute clipped surrogate objective:                  │
+        │     L_clip = min(                                         │
+        │       ratio * A_t,                    # Unclipped         │
+        │       clip(ratio, 1-ε, 1+ε) * A_t    # Clipped (ε=0.1)  │
+        │     )                                                     │
+        │                                                            │
+        │  3. Policy loss (negative to maximize):                   │
+        │     L_policy = -mean(L_clip)                              │
+        │                                                            │
+        │  (Clipping prevents too large policy updates)             │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │         COMPUTE VALUE LOSS (Multi-Component)              │
+        │                                                            │
+        │  For each reward component c:                             │
+        │                                                            │
+        │  1. Unclipped value loss:                                 │
+        │     L_v_unclipped^c = (G_t^c - V_new^c(s_t))²            │
+        │                                                            │
+        │  2. Clipped value loss:                                   │
+        │     V_clipped^c = V_old^c(s_t) +                          │
+        │                   clip(V_new^c - V_old^c, -ε_v, +ε_v)    │
+        │     L_v_clipped^c = (G_t^c - V_clipped^c)²               │
+        │                                                            │
+        │  3. Take maximum (conservative update):                   │
+        │     L_value^c = max(L_v_unclipped^c, L_v_clipped^c)      │
+        │                                                            │
+        │  4. Weighted sum across components:                       │
+        │     L_value = Σ_c weight_c * L_value^c                    │
+        │                                                            │
+        │  (Clipping stabilizes value function training)            │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              COMPUTE ENTROPY BONUS                        │
+        │                                                            │
+        │  L_entropy = -entropy_coeff * H(π)                        │
+        │                                                            │
+        │  (Negative entropy = encourages exploration)              │
+        │  (Higher entropy = more random actions)                   │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │               COMPUTE TOTAL LOSS                          │
+        │                                                            │
+        │  L_total = L_policy +                                     │
+        │            value_loss_coeff * L_value +                   │
+        │            entropy_coeff * L_entropy                      │
+        │                                                            │
+        │  Typical coefficients:                                    │
+        │    value_loss_coeff = 0.5                                 │
+        │    entropy_coeff = 0.01                                   │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │            BACKPROPAGATION & OPTIMIZATION                 │
+        │                                                            │
+        │  1. optimizer.zero_grad()                                 │
+        │                                                            │
+        │  2. L_total.backward()                                    │
+        │     (compute gradients ∇θ L_total)                        │
+        │                                                            │
+        │  3. Check for NaN/Inf in gradients                        │
+        │     (safety check, skip update if detected)               │
+        │                                                            │
+        │  4. Gradient clipping:                                    │
+        │     clip_grad_norm_(parameters, max_norm=0.5)             │
+        │     (prevents exploding gradients)                        │
+        │                                                            │
+        │  5. optimizer.step()                                      │
+        │     θ_new = θ_old - learning_rate * ∇θ L_total           │
+        │     (update network parameters)                           │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+                    ┌──────────────────────────┐
+                    │   UPDATED POLICY & VALUE │
+                    │      NETWORKS (θ_new)    │
+                    │                          │
+                    │   Ready for next episode │
+                    └──────────────────────────┘
+```
+
+**Key Notation:**
+- `s_t`: State at time t
+- `a_t`: Action at time t  
+- `r_t`: Reward at time t
+- `V(s_t)`: Value function (state value estimate)
+- `π(a_t|s_t)`: Policy (probability of action a_t given state s_t)
+- `A_t`: Advantage (how much better is action a_t compared to average)
+- `G_t`: Return (cumulative discounted future reward)
+- `H(π)`: Entropy (measure of policy randomness/exploration)
+- `γ`: Discount factor (0.99)
+- `λ`: GAE lambda (0.95)
+- `ε`: PPO clip epsilon (0.1)
+- `θ`: Network parameters
+
+---
+
+### 3. **Training Loop Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -186,7 +484,7 @@ config.yaml
 
 ---
 
-### 3. **Environment Workflow (DurotaxisEnv)**
+### 4. **Environment Workflow (DurotaxisEnv)**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -325,7 +623,7 @@ STEP FUNCTION WORKFLOW:
 
 ---
 
-### 4. **Neural Network Architecture**
+### 5. **Neural Network Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -392,15 +690,15 @@ INPUT: Graph State
 │       │         │  │       │         │    │  encoder output     │
 │       ▼         │  │       ▼         │    │  before Actor/Critic│
 │  ┌──────────┐  │  │  ┌──────────┐  │    │                     │
-│  │ ResNet18 │  │  │  │ ResNet18 │  │    │  WSA: Deprecated    │
-│  │ Backbone │  │  │  │ Backbone │  │    │  (not in current    │
-│  │(ImageNet)│  │  │  │(ImageNet)│  │    │   config)           │
-│  └────┬─────┘  │  │  └────┬─────┘  │    │                     │
-│       │         │  │       │         │    │  ResNet Freezing:   │
-│       ▼         │  │       ▼         │    │  - freeze_mode      │
-│  ┌──────────┐  │  │  ┌──────────┐  │    │    options: none,   │
-│  │   MLP    │  │  │  │   MLP    │  │    │    all, until_layer3│
-│  │(hidden=128)│  │  │ (hidden=128)│  │    │    last_block      │
+│  │ ResNet18 │  │  │  │ ResNet18 │  │    │  ResNet Freezing:   │
+│  │ Backbone │  │  │  │ Backbone │  │    │  - freeze_mode      │
+│  │(ImageNet)│  │  │  │(ImageNet)│  │    │    options: none,   │
+│  └────┬─────┘  │  │  └────┬─────┘  │    │    all, until_layer3│
+│       │         │  │       │         │    │    last_block       │
+│       ▼         │  │       ▼         │    │                     │
+│  ┌──────────┐  │  │  ┌──────────┐  │    │  Input Adapter:     │
+│  │   MLP    │  │  │  │   MLP    │  │    │  - repeat3: RGB     │
+│  │(hidden=128)│  │  │ (hidden=128)│  │    │  - 1ch_conv: Conv1x1│
 │  └────┬─────┘  │  │  └────┬─────┘  │    │                     │
 │       │         │  │       │         │    │  Input Adapter:     │
 │       ▼         │  │       ▼         │    │  - repeat3: RGB    │
@@ -439,7 +737,7 @@ CRITIC OUTPUT:
 
 ---
 
-### 5. **Policy Update (PPO with Value Clipping)**
+### 6. **Policy Update (PPO with Value Clipping)**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -543,7 +841,7 @@ INPUT: Minibatch of transitions
 
 ---
 
-### 6. **Curriculum Learning System**
+### 7. **Curriculum Learning System**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -644,7 +942,7 @@ PROGRESSION LOGIC:
 
 ---
 
-### 7. **Key Data Structures**
+### 8. **Key Data Structures**
 
 ```python
 # State Dictionary (observations)
@@ -695,7 +993,7 @@ value_predictions = {
 
 ---
 
-### 8. **File Organization & Responsibilities**
+### 9. **File Organization & Responsibilities**
 
 | File | Responsibility | Key Classes/Functions |
 |------|---------------|----------------------|
@@ -710,12 +1008,11 @@ value_predictions = {
 | **config.yaml** | Configuration parameters | N/A (YAML) |
 | **config_loader.py** | Configuration parsing | `ConfigLoader` |
 | **curriculum_learning.py** | Progressive difficulty stages | `CurriculumManager` |
-| **pretrained_fusion.py** | WSA multi-PTM fusion (optional) | `WeightSharingAttention` |
 | **plotter.py** | Visualization and plotting | Plotting utilities |
 
 ---
 
-### 9. **Training Execution Flow**
+### 10. **Training Execution Flow**
 
 ```bash
 # Command Line

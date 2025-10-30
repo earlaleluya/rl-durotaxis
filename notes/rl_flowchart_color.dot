@@ -1,0 +1,58 @@
+digraph PPO_Agent_Hierarchical {
+    rankdir=TB;
+    bgcolor="white";
+    node [shape=box, style="rounded,filled", color=black, fontname="Times New Roman", fontsize=11];
+    edge [fontname="Times New Roman", fontsize=10, color=black];
+
+    // ENVIRONMENT
+    subgraph cluster_env {
+        label="Environment";
+        color="#7a7a7a";
+        style="rounded,filled";
+        fillcolor="#e8ebf2"; // light bluish-gray
+    s_t [label=<State s<sub>t</sub>>, fillcolor="white"];
+    a_t [label=<Action a<sub>t</sub>>, fillcolor="white"];
+    r_t [label=<Reward r<sub>t</sub>>, fillcolor="white"];
+    s_tp1 [label=<Next State s<sub>t+1</sub>>, fillcolor="white"];
+        s_t -> a_t -> r_t -> s_tp1;
+    }
+
+    // AGENT BLOCK
+    subgraph cluster_agent {
+        label="Agent (Actor–Critic)";
+        color="#5a5a5a";
+        style="rounded,filled";
+        fillcolor="#f2f2f2"; // light gray
+        policy [label="Policy π(a|s)\n(stochastic mapping)", fillcolor="white"];
+        actor [label="Actor Network\n(outputs μ, logσ → Action Distribution)", fillcolor="#f9fafc"];
+        critic [label="Critic Network\n(estimates Value Function V(s))", fillcolor="#f9fafc"];
+        advantage [label="Advantage Estimator\nA(s,a) = Q(s,a) - V(s)", fillcolor="white"];
+        policy -> actor -> critic -> advantage;
+    }
+
+    // PPO TRAINING BLOCK
+    subgraph cluster_ppo {
+        label="PPO Optimization";
+        color="#5a5a5a";
+        style="rounded,filled";
+        fillcolor="#edf0f7"; // subtle bluish tint
+    gae [label=<Generalized Advantage Estimation (GAE)<br/>computes A<sub>t</sub>>, fillcolor="white"];
+    clip_obj [label=<Clipped Objective<br/>L<sup>clip</sup>(θ)>, fillcolor="#f9fafc"];
+    value_loss [label=<Value Function Loss<br/>L<sub>v</sub> = (G<sub>t</sub> - V(s<sub>t</sub>))<sup>2</sup>>, fillcolor="white"];
+        entropy [label="Entropy Bonus\nEncourages Exploration", fillcolor="white"];
+    total_loss [label=<Total PPO Loss<br/>L = L<sup>clip</sup> + c<sub>1</sub>L<sub>v</sub> - c<sub>2</sub>H(π)>, fillcolor="#f9fafc"];
+        gae -> clip_obj -> value_loss -> entropy -> total_loss;
+    }
+
+    // FLOW CONNECTIONS
+    s_t -> policy [label=<Observation s<sub>t</sub>>];
+    policy -> a_t [label=<Sample Action a<sub>t</sub>>];
+    a_t -> r_t [label="Execute Action"];
+    r_t -> advantage [label="Reward Feedback"];
+    advantage -> gae [label=<Compute A<sub>t</sub>>];
+    total_loss -> actor [label="Update Policy θ"];
+    total_loss -> critic [label=<Update Value θ<sub>v</sub>>];
+    s_tp1 -> s_t [style=dashed, color="gray40", label="Next timestep (t+1)"];
+
+    {rank=same; actor; critic;}
+}
