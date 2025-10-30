@@ -23,10 +23,10 @@ digraph PPO_Agent_Hierarchical {
         color="#5a5a5a";
         style="rounded,filled";
         fillcolor="#f2f2f2"; // light gray
-        policy [label="Policy π(a|s)\n(stochastic mapping)", fillcolor="white"];
-        actor [label="Actor Network\n(outputs μ, logσ → Action Distribution)", fillcolor="#f9fafc"];
-        critic [label="Critic Network\n(estimates Value Function V(s))", fillcolor="#f9fafc"];
-        advantage [label="Advantage Estimator\nA(s,a) = Q(s,a) - V(s)", fillcolor="white"];
+        policy [label=<Policy π(a|s)<br/>(stochastic mapping)>, fillcolor="white"];
+        actor [label=<Actor Network<br/>(outputs μ, logσ → Action Distribution)>, fillcolor="#f9fafc"];
+    critic [label=<Critic Network<br/>(estimates Value Function V(s))>, fillcolor="#f9fafc"];
+    advantage [label=<Advantage Estimator<br/>A(s<sub>t</sub>, a<sub>t</sub>) = G<sub>t</sub> - V(s<sub>t</sub>)>, fillcolor="white"];
         policy -> actor -> critic -> advantage;
     }
 
@@ -39,7 +39,7 @@ digraph PPO_Agent_Hierarchical {
     gae [label=<Generalized Advantage Estimation (GAE)<br/>computes A<sub>t</sub>>, fillcolor="white"];
     clip_obj [label=<Clipped Objective<br/>L<sup>clip</sup>(θ)>, fillcolor="#f9fafc"];
     value_loss [label=<Value Function Loss<br/>L<sub>v</sub> = (G<sub>t</sub> - V(s<sub>t</sub>))<sup>2</sup>>, fillcolor="white"];
-        entropy [label="Entropy Bonus\nEncourages Exploration", fillcolor="white"];
+    entropy [label=<Entropy Bonus<br/>H(π) = -E[log π(a|s)] ≈ 0.5 log(2πe σ<sup>2</sup>)<br/>(encourages exploration)>, fillcolor="white"];
     total_loss [label=<Total PPO Loss<br/>L = L<sup>clip</sup> + c<sub>1</sub>L<sub>v</sub> - c<sub>2</sub>H(π)>, fillcolor="#f9fafc"];
         gae -> clip_obj -> value_loss -> entropy -> total_loss;
     }
@@ -50,7 +50,7 @@ digraph PPO_Agent_Hierarchical {
     a_t -> r_t [label="Execute Action"];
     r_t -> advantage [label="Reward Feedback"];
     advantage -> gae [label=<Compute A<sub>t</sub>>];
-    total_loss -> actor [label="Update Policy θ"];
+    total_loss -> actor [label=<Update Policy θ>];
     total_loss -> critic [label=<Update Value θ<sub>v</sub>>];
     s_tp1 -> s_t [style=dashed, color="gray40", label="Next timestep (t+1)"];
 
