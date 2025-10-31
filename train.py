@@ -3776,7 +3776,9 @@ class DurotaxisTrainer:
                             minibatch['returns'], 
                             minibatch['advantages'], 
                             minibatch['log_probs'],
-                            minibatch['old_values'], 
+                            minibatch['old_values'],
+                            minibatch['continuous_mu'],
+                            minibatch['continuous_std'],
                             episode_count
                         )
                         
