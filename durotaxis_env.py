@@ -25,7 +25,7 @@ class DurotaxisEnv(gym.Env):
     
     The environment features a multi-component reward system that balances graph-level constraints (connectivity,
     growth control), node-level behaviors (movement, substrate interaction), edge directionality preferences,
-    and sophisticated termination conditions. It includes semantic pooling for handling variable graph sizes
+    and sophisticated termination conditions. It uses fast topk selection for handling variable graph sizes
     and run-based model organization for systematic experiment management.
     
     Key Features
@@ -33,7 +33,7 @@ class DurotaxisEnv(gym.Env):
     - **Dynamic Graph Topology**: Real-time node spawn/delete operations with persistent node tracking
     - **Substrate Gradients**: Configurable intensity fields (linear, exponential, custom) for durotaxis simulation
     - **Multi-Component Rewards**: Graph, node, edge, spawn, deletion, and termination reward components
-    - **Semantic Pooling**: Intelligent node selection for large graphs using spatial and feature clustering
+    - **Fast TopK Selection**: O(N log K) node selection for fixed-size observations when graphs exceed max_critical_nodes
     - **Termination Conditions**: Success (rightmost boundary), failure (node limits, drift), and timeout scenarios
     - **Run Organization**: Automatic model saving with run directories (run0001, run0002, etc.)
     - **Real-time Visualization**: Optional topology rendering with configurable update rates
@@ -136,7 +136,8 @@ class DurotaxisEnv(gym.Env):
     action_space : gym.Space
         Discrete action space (dummy - actual actions determined by policy network).
     observation_space : gym.Space
-        Box space for flattened graph embeddings with semantic pooling support.
+        Box space for flattened graph embeddings with fast topk selection.
+        Shape: [(max_critical_nodes + 1) * encoder_out_dim] - fixed size.
     
     Methods
     -------
@@ -149,9 +150,9 @@ class DurotaxisEnv(gym.Env):
     
     Notes
     -----
-    **Observation Space**: The environment uses semantic pooling when the number of nodes exceeds max_critical_nodes.
-    This intelligently selects representative nodes using spatial and feature clustering rather than arbitrary
-    truncation, preserving graph structure information for the policy network.
+    **Observation Space**: The environment uses fast topk selection when the number of nodes exceeds max_critical_nodes.
+    This efficiently selects representative nodes using O(N log K) torch.topk operation based on saliency scores,
+    ensuring fixed-size observations for neural network compatibility.
     
     **Reward System**: The multi-component reward system balances competing objectives:
     
@@ -267,6 +268,13 @@ class DurotaxisEnv(gym.Env):
         self.dm_delete_scale = float(dm.get('delete_penalty_scale', 1.0))
         # Scheduler knobs already wired in trainer (optional)
         self._prev_centroid_x = None
+        
+        # Observation selection parameters (fast topk approach)
+        sel_cfg = config.get('observation_selection', {})
+        self.obs_sel_method = sel_cfg.get('method', 'topk_x')  # topk_x (default), topk_mixed
+        self.obs_sel_w_x = float(sel_cfg.get('w_x', 1.0))  # weight for x-coordinate (rightward bias)
+        self.obs_sel_w_intensity = float(sel_cfg.get('w_intensity', 0.0))  # weight for intensity
+        self.obs_sel_w_norm = float(sel_cfg.get('w_norm', 0.0))  # weight for embedding norm
 
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
@@ -400,19 +408,11 @@ class DurotaxisEnv(gym.Env):
         self.centroid_history = []  # Store centroid x-coordinates
         self.consecutive_left_moves = 0  # Count consecutive leftward moves
         
-        # KMeans caching for performance optimization
-        self._kmeans_cache = {}  # Cache for fitted KMeans models
-        self._last_features_hash = None  # Hash of last features for cache invalidation
-        self._cache_hit_count = 0  # Statistics for cache performance
-        self._cache_miss_count = 0  # Statistics for cache performance
-        
         # Encoder observation optimization
         self._max_obs_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
-        self._pre_allocated_obs = np.zeros(self._max_obs_size, dtype=np.float32)  # Reusable zero array
+        self._pre_allocated_obs = np.zeros(self._max_obs_size, dtype=np.float32)  # Reusable zero array for fixed-size observations
         self._edge_index_cache = None  # Cache for edge_index tensor conversion
         self._last_edge_structure_hash = None  # Hash of edge structure for cache invalidation
-        self._edge_cache_hit_count = 0  # Statistics for edge cache performance
-        self._edge_cache_miss_count = 0  # Statistics for edge cache performance
         self.fail_threshold = 2 * self.delta_time  # Threshold for fail termination
 
         # Topology tracking for substrate intensity comparison
@@ -545,14 +545,13 @@ class DurotaxisEnv(gym.Env):
     def _get_cached_edge_index(self, edge_index):
         """
         Get cached edge_index tensor or create new one.
-        Returns (edge_index_tensor, is_cache_hit)
+        Returns edge_index_tensor.
         """
         structure_hash = self._get_edge_structure_hash(edge_index)
         
         if (self._last_edge_structure_hash == structure_hash and 
             self._edge_index_cache is not None):
-            self._edge_cache_hit_count += 1
-            return self._edge_index_cache, True
+            return self._edge_index_cache
         else:
             # Convert edge_index from DGL tuple format to PyG tensor format
             if isinstance(edge_index, tuple):
@@ -564,13 +563,13 @@ class DurotaxisEnv(gym.Env):
             # Cache the converted tensor
             self._edge_index_cache = edge_index_tensor
             self._last_edge_structure_hash = structure_hash
-            self._edge_cache_miss_count += 1
             
-            return edge_index_tensor, False
+            return edge_index_tensor
 
     def _get_encoder_observation(self, state):
         """
-        Get observation from GraphInputEncoder output with semantic pooling.
+        Get observation from GraphInputEncoder output with fast fixed-size selection.
+        Returns a fixed (max_critical_nodes+1) * encoder_out_dim flattened vector.
         
         Args:
             state: State dictionary from state_extractor.get_state_features()
@@ -579,279 +578,140 @@ class DurotaxisEnv(gym.Env):
             np.ndarray: Fixed-size observation vector from encoder output
             
         Note:
-            Uses semantic pooling when num_nodes > max_critical_nodes to preserve representative
-            nodes based on their features rather than arbitrary truncation.
+            - Uses fast topk selection (O(N log K)) instead of slow semantic pooling
+            - When num_nodes > max_critical_nodes: selects top-K nodes by saliency score
+            - When num_nodes <= max_critical_nodes: pads with zeros to fixed size
+            - Works with both SEM enabled and disabled
+            - Device-agnostic (works on CPU/GPU)
         """
         try:
             # Extract components from state
-            node_features = state['node_features']
-            graph_features = state['graph_features']
+            node_features = state['node_features']  # [N, F] torch tensor
+            graph_features = state['graph_features']  # [G] torch tensor
             edge_features = state['edge_attr']
             edge_index = state['edge_index']
             
             # Get cached edge_index tensor (avoids repeated conversions)
-            edge_index_tensor, edge_cache_hit = self._get_cached_edge_index(edge_index)
+            edge_index_tensor = self._get_cached_edge_index(edge_index)
             
-            # Handle empty graphs
+            # Handle empty graphs - return fixed-size zero observation
             if node_features.shape[0] == 0:
-                # Reuse pre-allocated array (avoid new allocation)
-                self._pre_allocated_obs.fill(0.0)  # Reset to zeros
-                return self._pre_allocated_obs.copy()  # Return copy to avoid mutation
+                self._pre_allocated_obs.fill(0.0)
+                return self._pre_allocated_obs.copy()
             
-            # Get encoder output directly
+            # Get encoder output (SEM is applied internally if enabled)
             encoder_out = self.observation_encoder(
                 graph_features=graph_features,
                 node_features=node_features,
                 edge_features=edge_features,
                 edge_index=edge_index_tensor
-            )  # Shape: [num_nodes+1, out_dim]
+            )  # Shape: [N+1, D] where row 0 is graph token, rows 1:N+1 are node embeddings
             
-            # ✅ SIMPLICIAL EMBEDDING HANDLES VARIABLE NODE COUNTS
-            # No pooling needed - Simplicial Embedding in encoder provides geometric structure
-            # that naturally handles variable graph sizes without information loss
-            actual_nodes = encoder_out.shape[0] - 1  # -1 for graph token
+            # Separate graph token from node embeddings
+            graph_token = encoder_out[0:1]  # [1, D]
+            node_embeddings = encoder_out[1:]  # [N, D]
+            N, D = node_embeddings.shape
+            K = int(self.max_critical_nodes)
             
-            # Flatten encoder output directly (no pooling)
-            encoder_flat = encoder_out.flatten().detach().cpu().numpy()
-            
-            # Dynamically handle variable-sized observations
-            if len(encoder_flat) > len(self._pre_allocated_obs):
-                # Resize pre-allocated array if needed
-                self._pre_allocated_obs = np.zeros(len(encoder_flat), dtype=np.float32)
-                self._max_obs_size = len(encoder_flat)
-            
-            # Use pre-allocated array (avoid new allocation for same-size or smaller obs)
-            self._pre_allocated_obs.fill(0.0)  # Reset to zeros
-            self._pre_allocated_obs[:len(encoder_flat)] = encoder_flat
-            return self._pre_allocated_obs[:len(encoder_flat)].copy()  # Return only the used portion
+            # Fast path: N <= K nodes → pad if needed and return fixed size
+            if N <= K:
+                if N < K:
+                    # Pad with zeros to reach K nodes
+                    pad_rows = K - N
+                    pad = node_embeddings.new_zeros((pad_rows, D))
+                    node_block = torch.cat([node_embeddings, pad], dim=0)  # [K, D]
+                else:
+                    node_block = node_embeddings  # [K, D]
                 
+                # Combine graph token with node block
+                fixed = torch.cat([graph_token, node_block], dim=0)  # [K+1, D]
+                flat = fixed.reshape(-1).detach().cpu().numpy()
+                
+                # Use pre-allocated buffer
+                expected_size = (K + 1) * D
+                if self._pre_allocated_obs.shape[0] != expected_size:
+                    self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
+                    self._max_obs_size = expected_size
+                
+                self._pre_allocated_obs[:len(flat)] = flat
+                return self._pre_allocated_obs.copy()
+            
+            # N > K: select top-K representative nodes using fast topk
+            # Build saliency score: s = w_x * x + w_intensity * I + w_norm * ||h||
+            with torch.no_grad():
+                device = node_embeddings.device
+                scores = torch.zeros((N,), dtype=node_embeddings.dtype, device=device)
+                
+                # Component 1: x-coordinate (rightward bias) - feature 0
+                if node_features.shape[1] >= 1 and self.obs_sel_w_x != 0.0:
+                    x = node_features[:, 0]
+                    # Normalize to [0, 1] for numerical stability
+                    x_min, x_max = x.min(), x.max()
+                    if x_max > x_min:
+                        x_norm = (x - x_min) / (x_max - x_min + 1e-6)
+                        scores.add_(self.obs_sel_w_x * x_norm)
+                
+                # Component 2: intensity - feature 2
+                if node_features.shape[1] >= 3 and self.obs_sel_w_intensity != 0.0:
+                    inten = node_features[:, 2]
+                    # Z-score normalization
+                    inten_mean, inten_std = inten.mean(), inten.std(unbiased=False)
+                    if inten_std > 1e-6:
+                        inten_norm = (inten - inten_mean) / (inten_std + 1e-6)
+                        scores.add_(self.obs_sel_w_intensity * inten_norm)
+                
+                # Component 3: embedding norm (representational importance)
+                if self.obs_sel_w_norm != 0.0:
+                    h_norm = node_embeddings.norm(p=2, dim=1)  # [N]
+                    # Z-score normalization
+                    h_mean, h_std = h_norm.mean(), h_norm.std(unbiased=False)
+                    if h_std > 1e-6:
+                        h_norm_z = (h_norm - h_mean) / (h_std + 1e-6)
+                        scores.add_(self.obs_sel_w_norm * h_norm_z)
+                
+                # Fallback: if all weights are zero, use rightmost x-coordinate
+                if torch.all(scores == 0):
+                    if node_features.shape[1] >= 1:
+                        scores = node_features[:, 0]  # x-coordinate
+                    else:
+                        scores = node_embeddings.norm(p=2, dim=1)  # embedding norm
+                
+                # Select top-K nodes by score (O(N log K)) - device-agnostic
+                topk_result = torch.topk(scores, k=K, largest=True, sorted=False)
+                sel_idx = topk_result.indices  # [K]
+                
+                # Optional: sort selected indices by x-coordinate for positional consistency
+                if node_features.shape[1] >= 1:
+                    x_sel = node_features[sel_idx, 0]
+                    order = torch.argsort(x_sel)  # left → right ordering
+                    sel_idx = sel_idx[order]
+                
+                # Extract selected node embeddings
+                selected = node_embeddings[sel_idx]  # [K, D]
+            
+            # Combine graph token with selected nodes
+            fixed = torch.cat([graph_token, selected], dim=0)  # [K+1, D]
+            flat = fixed.reshape(-1).detach().cpu().numpy()
+            
+            # Use pre-allocated buffer (constant size)
+            expected_size = (K + 1) * D
+            if self._pre_allocated_obs.shape[0] != expected_size:
+                self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
+                self._max_obs_size = expected_size
+            
+            self._pre_allocated_obs[:expected_size] = flat[:expected_size]
+            return self._pre_allocated_obs[:expected_size].copy()
+            
         except Exception as e:
             print(f"Error getting encoder observation: {e}")
             import traceback
             traceback.print_exc()
-            # Fallback to zero observation using pre-allocated array
+            # Fallback to zero observation with fixed size
+            expected_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
+            if self._pre_allocated_obs.shape[0] != expected_size:
+                self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
             self._pre_allocated_obs.fill(0.0)
             return self._pre_allocated_obs.copy()
-
-    def _get_features_cache_key(self, features_np, n_clusters):
-        """
-        Generate a cache key for KMeans based on feature characteristics.
-        Uses data shape, sample of values, and clustering parameters.
-        """
-        import hashlib
-        import numpy as np
-        
-        # Create a deterministic hash from feature characteristics
-        shape_str = str(features_np.shape)
-        
-        # Sample key points for hash (to avoid hashing entire array)
-        if features_np.size > 1000:
-            # For large arrays, sample strategically
-            indices = np.linspace(0, features_np.shape[0]-1, 20, dtype=int)
-            sample = features_np.flat[indices]
-        else:
-            # For small arrays, use statistical summary
-            sample = np.array([
-                features_np.mean(), features_np.std(), 
-                features_np.min(), features_np.max(),
-                np.median(features_np.flat)
-            ])
-        
-        # Combine shape, sample, and clustering params
-        key_data = f"{shape_str}_{n_clusters}_{sample.tobytes().hex()}"
-        return hashlib.md5(key_data.encode()).hexdigest()
-    
-    def _get_cached_kmeans(self, features_np, n_clusters, cache_prefix):
-        """
-        Get cached KMeans model or create new one.
-        Returns (kmeans_model, is_cache_hit)
-        """
-        from sklearn.cluster import MiniBatchKMeans
-        
-        cache_key = f"{cache_prefix}_{self._get_features_cache_key(features_np, n_clusters)}"
-        
-        if cache_key in self._kmeans_cache:
-            self._cache_hit_count += 1
-            return self._kmeans_cache[cache_key], True
-        else:
-            # Create new KMeans model
-            kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=256, n_init='auto', random_state=42)
-            kmeans.fit(features_np)
-            
-            # Cache the fitted model
-            self._kmeans_cache[cache_key] = kmeans
-            self._cache_miss_count += 1
-            
-            # Limit cache size to prevent memory issues
-            if len(self._kmeans_cache) > 50:  # Keep only 50 most recent models
-                # Remove oldest entry (simple FIFO)
-                oldest_key = next(iter(self._kmeans_cache))
-                del self._kmeans_cache[oldest_key]
-            
-            return kmeans, False
-
-    def _semantic_node_selection(self, node_embeddings, state, target_count):
-        """
-        Perform semantic node selection using attention-based clustering.
-        
-        This method uses graph neural network embeddings to identify semantically
-        similar nodes and select a diverse subset based on attention weights.
-        The selection aims to choose nodes that are representative of different
-        regions or characteristics in the topology.
-        
-        Parameters
-        ----------
-        node_embeddings : torch.Tensor
-            Node embeddings from the graph neural network, shape (num_nodes, out_dim)
-        state : dict
-            Current state dictionary containing graph information
-        target_count : int
-            Desired number of nodes to select
-            
-        Returns
-        -------
-        torch.Tensor
-            Indices of selected nodes, shape (target_count,)
-            
-        Notes
-        -----
-        The algorithm uses attention mechanisms to compute node importance scores
-        and applies diversity constraints to avoid selecting clustered nodes.
-        """
-        """
-        Intelligently select representative nodes using semantic features.
-        
-        Args:
-            node_embeddings: [num_nodes, out_dim] tensor of node embeddings
-            state: State dictionary with node features
-            target_count: Number of nodes to select
-            
-        Returns:
-            torch.Tensor: Indices of selected nodes
-        """
-        import torch
-        import numpy as np
-        from sklearn.cluster import MiniBatchKMeans
-        
-        num_nodes = node_embeddings.shape[0]
-        
-        try:
-            # Strategy 1: Use raw node features for semantic clustering
-            node_features = state['node_features']  # [num_nodes, 8] - rich feature set
-            
-            if node_features.shape[0] != num_nodes:
-                # Fallback to uniform sampling if feature mismatch
-                print(f"    ⚠️ Feature mismatch, using uniform sampling")
-                device = node_features.device
-                indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long, device=device)
-                return indices
-            
-            # Convert to numpy for clustering
-            features_np = node_features.detach().cpu().numpy()
-            
-            # Strategy 2: Multi-criteria semantic selection
-            selected_indices = []
-            
-            # A. Spatial diversity (based on position features - first 2 dims)
-            if features_np.shape[1] >= 2:
-                positions = features_np[:, :2]  # x, y coordinates
-                spatial_clusters = min(target_count // 3, 8)  # 1/3 for spatial diversity
-                
-                if spatial_clusters > 1:
-                    try:
-                        kmeans_spatial, is_cache_hit = self._get_cached_kmeans(positions, spatial_clusters, "spatial")
-                        spatial_labels = kmeans_spatial.predict(positions)
-                        
-                        if is_cache_hit:
-                            print(f"    🗺️ Spatial clustering: Using cached model for {spatial_clusters} clusters")
-                        
-                        # Select one representative from each spatial cluster
-                        for cluster_id in range(spatial_clusters):
-                            cluster_nodes = np.where(spatial_labels == cluster_id)[0]
-                            if len(cluster_nodes) > 0:
-                                # Choose node closest to cluster centroid
-                                centroid = kmeans_spatial.cluster_centers_[cluster_id]
-                                distances = np.linalg.norm(positions[cluster_nodes] - centroid, axis=1)
-                                best_idx = cluster_nodes[np.argmin(distances)]
-                                selected_indices.append(best_idx)
-                        
-                        print(f"    🗺️ Spatial clustering: {len(selected_indices)} nodes from {spatial_clusters} regions")
-                    except:
-                        pass
-            
-            # B. Feature diversity (based on all features)
-            remaining_slots = target_count - len(selected_indices)
-            if remaining_slots > 0:
-                # Select nodes not already chosen
-                available_indices = list(set(range(num_nodes)) - set(selected_indices))
-                
-                if len(available_indices) > remaining_slots:
-                    try:
-                        # Cluster remaining nodes by feature similarity
-                        available_features = features_np[available_indices]
-                        feature_clusters = min(remaining_slots, len(available_indices))
-                        
-                        if feature_clusters > 1:
-                            kmeans_features, is_cache_hit = self._get_cached_kmeans(available_features, feature_clusters, "features")
-                            feature_labels = kmeans_features.predict(available_features)
-                            
-                            if is_cache_hit:
-                                print(f"    🎯 Feature clustering: Using cached model for {feature_clusters} clusters")
-                            
-                            # Select representative from each feature cluster
-                            for cluster_id in range(feature_clusters):
-                                cluster_mask = (feature_labels == cluster_id)
-                                if np.any(cluster_mask):
-                                    cluster_indices = np.array(available_indices)[cluster_mask]
-                                    # Choose node closest to cluster centroid
-                                    centroid = kmeans_features.cluster_centers_[cluster_id]
-                                    distances = np.linalg.norm(available_features[cluster_mask] - centroid, axis=1)
-                                    best_local_idx = np.argmin(distances)
-                                    best_global_idx = cluster_indices[best_local_idx]
-                                    selected_indices.append(best_global_idx)
-                            
-                            print(f"    🎯 Feature clustering: +{len(selected_indices) - len(selected_indices[:spatial_clusters if 'spatial_clusters' in locals() else 0])} diverse nodes")
-                        else:
-                            # Just take the available nodes
-                            selected_indices.extend(available_indices[:remaining_slots])
-                    except Exception as e:
-                        print(f"    ⚠️ Feature clustering failed: {e}")
-                        # Fallback: uniform sampling from remaining
-                        selected_indices.extend(available_indices[:remaining_slots])
-                else:
-                    # Take all remaining nodes
-                    selected_indices.extend(available_indices)
-            
-            # C. Fill remaining slots with uniform sampling if needed
-            if len(selected_indices) < target_count:
-                available_indices = list(set(range(num_nodes)) - set(selected_indices))
-                remaining_needed = target_count - len(selected_indices)
-                
-                if available_indices:
-                    # Uniform sampling from remaining
-                    step = max(1, len(available_indices) // remaining_needed)
-                    additional = available_indices[::step][:remaining_needed]
-                    selected_indices.extend(additional)
-                    print(f"    📐 Uniform fill: +{len(additional)} nodes to reach target")
-            
-            # Ensure we don't exceed target count
-            selected_indices = selected_indices[:target_count]
-            
-            # Sort indices for consistent ordering
-            selected_indices = sorted(selected_indices)
-            
-            # Infer device from node_features
-            device = node_features.device if hasattr(node_features, 'device') else torch.device('cpu')
-            return torch.tensor(selected_indices, dtype=torch.long, device=device)
-            
-        except Exception as e:
-            print(f"    ❌ Semantic selection failed: {e}")
-            # Fallback to uniform sampling
-            device = node_features.device if hasattr(node_features, 'device') else torch.device('cpu')
-            indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long, device=device)
-            print(f"    🔄 Fallback to uniform sampling: {target_count} nodes")
-            return indices
-
 
     def step(self, action):
         """
@@ -2711,25 +2571,6 @@ class DurotaxisEnv(gym.Env):
             'persistent_ids_marked': marked_pids,
             'persistent_ids_safe': safe_pids
         }
-    
-    def get_kmeans_cache_stats(self):
-        """Get KMeans cache performance statistics."""
-        total_requests = self._cache_hit_count + self._cache_miss_count
-        hit_rate = (self._cache_hit_count / total_requests * 100) if total_requests > 0 else 0.0
-        
-        return {
-            'cache_hits': self._cache_hit_count,
-            'cache_misses': self._cache_miss_count,
-            'total_requests': total_requests,
-            'hit_rate_percent': hit_rate,
-            'cached_models_count': len(self._kmeans_cache)
-        }
-    
-    def clear_kmeans_cache(self):
-        """Clear the KMeans cache and reset statistics."""
-        self._kmeans_cache.clear()
-        self._cache_hit_count = 0
-        self._cache_miss_count = 0
 
     def get_encoder_cache_stats(self):
         """Get encoder observation cache performance statistics."""
@@ -2755,8 +2596,7 @@ class DurotaxisEnv(gym.Env):
 
     def close(self):
         """Clean up resources."""
-        # Clear all caches
-        self._kmeans_cache.clear()
+        # Clear edge index cache
         self._edge_index_cache = None
         
         if hasattr(self.topology, 'close'):

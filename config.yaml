@@ -328,6 +328,17 @@ environment:
   simple_delete_only_mode: false  # Set to true to enable simplified reward system
   
   # ============================================================================
+  # Observation Selection (Fast Fixed-Size Approach)
+  # ============================================================================
+  # When num_nodes > max_critical_nodes, select representative nodes using fast topk (O(N log K))
+  # This ensures fixed-size observations without slow semantic pooling
+  observation_selection:
+    method: topk_x              # Selection method: 'topk_x' (default) or 'topk_mixed'
+    w_x: 1.0                    # Weight for x-coordinate (rightward bias)
+    w_intensity: 0.0            # Weight for intensity feature (substrate quality)
+    w_norm: 0.0                 # Weight for embedding L2 norm (representational importance)
+  
+  # ============================================================================
   # EXPERIMENTAL: Centroid-to-Goal Distance Penalty Mode
   # ============================================================================
   # When enabled, this mode provides ONLY a distance-based penalty from centroid to goal:
@@ -383,7 +394,7 @@ environment:
   # Node and topology parameters - RELAXED for learning
   init_num_nodes: 5              # Start with more nodes for stability
   max_critical_nodes: 50         # Allow more nodes
-  threshold_critical_nodes: 100  # GREATLY INCREASED: Allow agent to explore without premature termination
+  threshold_critical_nodes: 200  # GREATLY INCREASED: Allow agent to explore without premature termination
   max_steps: 1000                # Much more time to reach goal
   
   # Termination behavior - RELAXED for exploration
