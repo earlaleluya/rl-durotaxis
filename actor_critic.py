@@ -828,6 +828,10 @@ class HybridPolicyAgent:
         self.state_extractor = state_extractor
         self.network = hybrid_network
         
+        # Store last action parameters for logging/analysis
+        self.last_continuous_actions = None
+        self.last_spawn_params = None
+        
     @torch.no_grad()
     def get_actions_and_values(self, deterministic: bool = False,
                               action_mask: Optional[torch.Tensor] = None) -> Tuple[Dict[int, str], 
@@ -850,6 +854,16 @@ class HybridPolicyAgent:
             return {}, (1.0, 1.0, 0.5, 0.0), empty_values
         
         output = self.network(state, deterministic=deterministic, action_mask=action_mask)
+        
+        # Store continuous actions for logging
+        self.last_continuous_actions = output['continuous_actions']  # [5] tensor (single global action)
+        
+        # Debug: print first few times to verify storage
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        if self._debug_count < 3:
+            print(f"🐛 DEBUG[{self._debug_count}]: Storing continuous_actions: {self.last_continuous_actions}")
+            self._debug_count += 1
         
         # OPTIMIZATION 1: Use argpartition for O(n) selection instead of O(n log n) sort
         # Get node x-positions directly from node features
@@ -897,7 +911,10 @@ class HybridPolicyAgent:
         """
         Execute actions using the hybrid network with delete ratio strategy.
         """
-        actions, spawn_params_global, _ = self.get_actions_and_values(deterministic, action_mask)
+        actions, spawn_params_global, value_predictions = self.get_actions_and_values(deterministic, action_mask)
+        
+        # Store spawn parameters for logging
+        self.last_spawn_params = spawn_params_global
         
         spawn_actions = {node_id: action for node_id, action in actions.items() if action == 'spawn'}
         delete_actions = {node_id: action for node_id, action in actions.items() if action == 'delete'}

@@ -842,15 +842,24 @@ class DurotaxisEnv(gym.Env):
                 # Try to extract action parameters if available
                 if hasattr(self.policy_agent, 'last_continuous_actions') and self.policy_agent.last_continuous_actions is not None:
                     last_actions = self.policy_agent.last_continuous_actions
-                    if len(last_actions) > 0:
-                        # Average across all nodes to get representative values
-                        action_params['delete_ratio'] = float(last_actions[:, 0].mean().item())
-                        action_params['gamma'] = float(last_actions[:, 1].mean().item())
-                        action_params['alpha'] = float(last_actions[:, 2].mean().item())
-                        action_params['noise'] = float(last_actions[:, 3].mean().item())
-                        action_params['theta'] = float(last_actions[:, 4].mean().item())
+                    if len(last_actions) >= 5:
+                        # Extract single global action parameters (shape: [5])
+                        action_params['delete_ratio'] = float(last_actions[0].item())
+                        action_params['gamma'] = float(last_actions[1].item())
+                        action_params['alpha'] = float(last_actions[2].item())
+                        action_params['noise'] = float(last_actions[3].item())
+                        action_params['theta'] = float(last_actions[4].item())
+                    else:
+                        print(f"⚠️  DEBUG: last_continuous_actions has wrong shape: {last_actions.shape if hasattr(last_actions, 'shape') else len(last_actions)}")
+                else:
+                    if not hasattr(self.policy_agent, 'last_continuous_actions'):
+                        print(f"⚠️  DEBUG: policy_agent has no attribute 'last_continuous_actions'")
+                    elif self.policy_agent.last_continuous_actions is None:
+                        print(f"⚠️  DEBUG: last_continuous_actions is None (prev_num_nodes={prev_num_nodes})")
             except Exception as e:
                 print(f"⚠️  Policy execution failed: {e}")
+                import traceback
+                traceback.print_exc()
                 executed_actions = {}
         else:
             # Fallback to random actions if policy fails or no nodes
