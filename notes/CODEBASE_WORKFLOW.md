@@ -4,6 +4,14 @@
 
 This codebase implements a **Reinforcement Learning (RL) system** for simulating and optimizing **durotaxis** - the directed migration of cells in response to substrate stiffness gradients. The agent learns to control a dynamic graph topology representing a cellular network, making decisions about cell spawning, deletion, and migration to maximize rightward movement along substrate gradients.
 
+### Key Technical Highlights
+
+- **Graph Transformer Encoder:** PyTorch Geometric TransformerConv with edge-aware attention
+- **Edge Features (`edge_attr`):** 3D edge properties [distance, direction_x, direction_y] used in attention mechanism
+- **Continuous Action Space:** Delete-ratio architecture (5D: delete_ratio, gamma, alpha, noise, theta)
+- **Simplicial Embedding:** Optional geometric constraint layer for ablation studies
+- **Experimental Reward Modes:** Dense centroid-distance reward with adaptive terminal scaling
+
 ---
 
 ## High-Level Architecture
@@ -81,7 +89,305 @@ config.yaml
 
 ---
 
-### 2. **Training Loop Architecture**
+### 2. **Reinforcement Learning Loop Flowchart**
+
+This diagram shows the detailed RL interaction cycle between the environment, actor-critic network, and PPO training:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    REINFORCEMENT LEARNING LOOP                           │
+│            (One Step: t → t+1 in Episode Trajectory)                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────┐
+                    │   ENVIRONMENT STATE     │
+                    │   s_t (at time t)       │
+                    │                         │
+                    │ • graph_features [19]   │
+                    │ • node_features [N, 11] │
+                    │ • edge_features [E, 3]  │
+                    │ • edge_index [2, E]     │
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+        ┌────────────────────────────────────────────────────────┐
+        │            GRAPH INPUT ENCODER                         │
+        │         (encoder.py: GraphInputEncoder)                │
+        │                                                         │
+        │  1. Feature Projection (MLP)                           │
+        │     node_features [N, 11] → [N, 128]                   │
+        │     edge_features [E, 3] → [E, 128]                    │
+        │     graph_features [19] → [1, 128] (virtual node)      │
+        │                                                         │
+        │  2. Graph Transformer (4 layers, TransformerConv)      │
+        │     Multi-head attention with edge_attr                │
+        │     Residual connections + LayerNorm + GELU            │
+        │                                                         │
+        │  3. Simplicial Embedding (Optional)                    │
+        │     Group-wise softmax constraint                      │
+        │                                                         │
+        │  OUTPUT: embeddings [N+1, 128]                         │
+        │    - graph_token [1, 128]                              │
+        │    - node_tokens [N, 128]                              │
+        └────────┬───────────────────────────┬───────────────────┘
+                 │                           │
+                 ▼                           ▼
+    ┌────────────────────────┐  ┌───────────────────────────┐
+    │        ACTOR           │  │         CRITIC            │
+    │  (Policy Network)      │  │    (Value Network)        │
+    │                        │  │                           │
+    │  Input: node_tokens +  │  │  Input: graph_token       │
+    │         graph_token    │  │                           │
+    │         [N+1, 128]     │  │         [1, 128]          │
+    │                        │  │                           │
+    │  1. ResNet18 Backbone  │  │  1. ResNet18 Backbone     │
+    │     (ImageNet init)    │  │     (ImageNet init)       │
+    │                        │  │                           │
+    │  2. MLP Head           │  │  2. MLP Head              │
+    │                        │  │                           │
+    │  OUTPUT:               │  │  OUTPUT:                  │
+    │  • μ [N, 5]           │  │  • V(s_t) = {             │
+    │  • log_σ [N, 5]       │  │      'total_reward'       │
+    │                        │  │      'graph_reward'       │
+    │  Continuous params:    │  │      'spawn_reward'       │
+    │  [delete_ratio, γ,     │  │      'delete_reward'      │
+    │   α, noise, θ]        │  │      'edge_reward'        │
+    │                        │  │      'total_node_reward'  │
+    │                        │  │    }                      │
+    └───────────┬────────────┘  │  Multi-component values   │
+                │                │  [1, 6]                   │
+                │                └───────────┬───────────────┘
+                │                            │
+                ▼                            │
+    ┌────────────────────────┐              │
+    │   POLICY π(a_t|s_t)   │              │
+    │                        │              │
+    │  1. Build Normal Dist. │              │
+    │     N(μ, exp(log_σ))  │              │
+    │                        │              │
+    │  2. Sample Actions     │              │
+    │     a_t ~ π(·|s_t)    │              │
+    │     a_t = [delete_ratio│              │
+    │            γ, α,       │              │
+    │            noise, θ]   │              │
+    │     [N, 5]             │              │
+    │                        │              │
+    │  3. Compute Log Prob   │              │
+    │     log π(a_t|s_t)    │              │
+    │                        │              │
+    │  4. Compute Entropy    │              │
+    │     H(π) = 0.5*log(2πe│              │
+    │            * σ²)       │              │
+    │     (encourages        │              │
+    │      exploration)      │              │
+    └───────────┬────────────┘              │
+                │                            │
+                │  a_t, log π(a_t|s_t), H   │  V(s_t)
+                │                            │
+                └─────────────┬──────────────┘
+                              │
+                              ▼
+                    ┌──────────────────────┐
+                    │    ENVIRONMENT       │
+                    │  env.step(a_t)       │
+                    │                      │
+                    │  1. Apply delete_ratio│
+                    │     (remove leftmost) │
+                    │                      │
+                    │  2. Apply spawn      │
+                    │     (γ,α,noise,θ)    │
+                    │                      │
+                    │  3. Update physics   │
+                    │                      │
+                    │  4. Compute rewards  │
+                    │                      │
+                    │  5. Check done       │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+            ┌──────────────────────────────────────┐
+            │         ENVIRONMENT OUTPUTS          │
+            │                                      │
+            │  • s_{t+1}: Next state               │
+            │  • r_t: Reward (6 components)        │
+            │    {total_reward, graph_reward,      │
+            │     spawn_reward, delete_reward,     │
+            │     edge_reward, total_node_reward}  │
+            │  • done: Episode termination flag    │
+            │  • info: Additional metadata         │
+            └──────────────┬───────────────────────┘
+                           │
+                           ▼
+            ┌────────────────────────────────────────┐
+            │      STORE TRANSITION IN BUFFER        │
+            │                                        │
+            │  trajectory.add_step(                  │
+            │    state=s_t,                          │
+            │    action=a_t,                         │
+            │    reward=r_t,                         │
+            │    value=V(s_t),                       │
+            │    log_prob=log π(a_t|s_t),           │
+            │    done=done                           │
+            │  )                                     │
+            └────────────┬───────────────────────────┘
+                         │
+                         ▼
+        ┌─────────────────────────────────────────────┐
+        │  AFTER COLLECTING BATCH OF EPISODES         │
+        │  (Every rollout_batch_size episodes)        │
+        └─────────────────────────────────────────────┘
+                         │
+                         ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │         COMPUTE ADVANTAGES & RETURNS                     │
+        │         (Generalized Advantage Estimation - GAE)         │
+        │                                                           │
+        │  For each component c in {total, graph, spawn, ...}:     │
+        │                                                           │
+        │  1. Compute TD errors δ_t^c:                             │
+        │     δ_t^c = r_t^c + γ*V^c(s_{t+1}) - V^c(s_t)           │
+        │                                                           │
+        │  2. Compute GAE advantages A_t^c:                        │
+        │     A_t^c = Σ_{l=0}^∞ (γλ)^l * δ_{t+l}^c                │
+        │     (exponentially weighted sum of TD errors)            │
+        │                                                           │
+        │  3. Compute returns G_t^c:                               │
+        │     G_t^c = A_t^c + V^c(s_t)                             │
+        │     (advantage + baseline = target for value function)   │
+        │                                                           │
+        │  4. Normalize advantages (optional):                     │
+        │     A_t = (A_t - mean(A)) / (std(A) + ε)                │
+        │     (improves training stability)                        │
+        └─────────────────────────┬───────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              PPO POLICY UPDATE (4 epochs)                 │
+        │         For each minibatch in trajectory buffer:          │
+        └──────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │                 RE-EVALUATE ACTIONS                       │
+        │                                                            │
+        │  Feed s_t through network again:                          │
+        │    new_log_prob, new_values, entropy = network.evaluate_  │
+        │                                         actions(s_t, a_t)  │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              COMPUTE PPO POLICY LOSS                      │
+        │                                                            │
+        │  1. Compute probability ratio:                            │
+        │     ratio = exp(new_log_prob - old_log_prob)              │
+        │           = π_new(a_t|s_t) / π_old(a_t|s_t)              │
+        │                                                            │
+        │  2. Compute clipped surrogate objective:                  │
+        │     L_clip = min(                                         │
+        │       ratio * A_t,                    # Unclipped         │
+        │       clip(ratio, 1-ε, 1+ε) * A_t    # Clipped (ε=0.1)  │
+        │     )                                                     │
+        │                                                            │
+        │  3. Policy loss (negative to maximize):                   │
+        │     L_policy = -mean(L_clip)                              │
+        │                                                            │
+        │  (Clipping prevents too large policy updates)             │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │         COMPUTE VALUE LOSS (Multi-Component)              │
+        │                                                            │
+        │  For each reward component c:                             │
+        │                                                            │
+        │  1. Unclipped value loss:                                 │
+        │     L_v_unclipped^c = (G_t^c - V_new^c(s_t))²            │
+        │                                                            │
+        │  2. Clipped value loss:                                   │
+        │     V_clipped^c = V_old^c(s_t) +                          │
+        │                   clip(V_new^c - V_old^c, -ε_v, +ε_v)    │
+        │     L_v_clipped^c = (G_t^c - V_clipped^c)²               │
+        │                                                            │
+        │  3. Take maximum (conservative update):                   │
+        │     L_value^c = max(L_v_unclipped^c, L_v_clipped^c)      │
+        │                                                            │
+        │  4. Weighted sum across components:                       │
+        │     L_value = Σ_c weight_c * L_value^c                    │
+        │                                                            │
+        │  (Clipping stabilizes value function training)            │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              COMPUTE ENTROPY BONUS                        │
+        │                                                            │
+        │  L_entropy = -entropy_coeff * H(π)                        │
+        │                                                            │
+        │  (Negative entropy = encourages exploration)              │
+        │  (Higher entropy = more random actions)                   │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │               COMPUTE TOTAL LOSS                          │
+        │                                                            │
+        │  L_total = L_policy +                                     │
+        │            value_loss_coeff * L_value +                   │
+        │            entropy_coeff * L_entropy                      │
+        │                                                            │
+        │  Typical coefficients:                                    │
+        │    value_loss_coeff = 0.5                                 │
+        │    entropy_coeff = 0.01                                   │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │            BACKPROPAGATION & OPTIMIZATION                 │
+        │                                                            │
+        │  1. optimizer.zero_grad()                                 │
+        │                                                            │
+        │  2. L_total.backward()                                    │
+        │     (compute gradients ∇θ L_total)                        │
+        │                                                            │
+        │  3. Check for NaN/Inf in gradients                        │
+        │     (safety check, skip update if detected)               │
+        │                                                            │
+        │  4. Gradient clipping:                                    │
+        │     clip_grad_norm_(parameters, max_norm=0.5)             │
+        │     (prevents exploding gradients)                        │
+        │                                                            │
+        │  5. optimizer.step()                                      │
+        │     θ_new = θ_old - learning_rate * ∇θ L_total           │
+        │     (update network parameters)                           │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+                    ┌──────────────────────────┐
+                    │   UPDATED POLICY & VALUE │
+                    │      NETWORKS (θ_new)    │
+                    │                          │
+                    │   Ready for next episode │
+                    └──────────────────────────┘
+```
+
+**Key Notation:**
+- `s_t`: State at time t
+- `a_t`: Action at time t  
+- `r_t`: Reward at time t
+- `V(s_t)`: Value function (state value estimate)
+- `π(a_t|s_t)`: Policy (probability of action a_t given state s_t)
+- `A_t`: Advantage (how much better is action a_t compared to average)
+- `G_t`: Return (cumulative discounted future reward)
+- `H(π)`: Entropy (measure of policy randomness/exploration)
+- `γ`: Discount factor (0.99)
+- `λ`: GAE lambda (0.95)
+- `ε`: PPO clip epsilon (0.1)
+- `θ`: Network parameters
+
+---
+
+### 3. **Training Loop Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -178,7 +484,7 @@ config.yaml
 
 ---
 
-### 3. **Environment Workflow (DurotaxisEnv)**
+### 4. **Environment Workflow (DurotaxisEnv)**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -227,6 +533,25 @@ STEP FUNCTION WORKFLOW:
   ┌─────────────────────────────────────────────────────────┐
   │ 3. COMPUTE REWARD COMPONENTS                             │
   │                                                           │
+  │    **EXPERIMENTAL REWARD MODES** (mutually exclusive):   │
+  │                                                           │
+  │    A) NORMAL MODE (default):                             │
+  │       All standard reward components enabled             │
+  │                                                           │
+  │    B) CENTROID DISTANCE ONLY MODE:                       │
+  │       environment.centroid_distance_only_mode: true      │
+  │       ├─▶ Dense delta-distance reward: scale × (cx_t - cx_{t-1}) / goal_x │
+  │       ├─▶ Potential-based shaping (preserves optimal policy) │
+  │       ├─▶ Terminal rewards scaled down (×0.02) to avoid domination │
+  │       └─▶ Adaptive scheduler: reduces terminal scale as progress improves │
+  │                                                           │
+  │    C) SIMPLE DELETE-ONLY MODE (deprecated):              │
+  │       environment.simple_delete_only_mode: true          │
+  │       Only penalties + termination rewards               │
+  │                                                           │
+  │    ─────────────────────────────────────────────────────│
+  │    NORMAL MODE REWARDS:                                  │
+  │                                                           │
   │    Graph Rewards:                                        │
   │    ├─▶ connectivity_penalty (nodes < 2)                  │
   │    ├─▶ growth_penalty (nodes > max_critical_nodes)       │
@@ -237,29 +562,34 @@ STEP FUNCTION WORKFLOW:
   │    ├─▶ movement_reward (rightward movement per node)     │
   │    ├─▶ intensity_bonus/penalty (substrate interaction)   │
   │    ├─▶ leftward_penalty (discourage left movement)       │
-  │    └─▶ position_rewards (boundary awareness)             │
+  │    └─▶ position_rewards (boundary awareness + safe zones)│
   │                                                           │
   │    Edge Rewards:                                         │
   │    ├─▶ rightward_bonus (edges pointing right)            │
   │    └─▶ leftward_penalty (edges pointing left)            │
   │                                                           │
-  │    Spawn/Delete Rewards:                                 │
+  │    Delete Rewards (delete_ratio action):                 │
+  │    ├─▶ proper_deletion_reward (delete leftmost nodes)    │
+  │    ├─▶ persistence_penalty (keeping flagged nodes)       │
+  │    └─▶ improper_deletion_penalty (delete non-flagged)    │
+  │                                                           │
+  │    Spawn Rewards (via gamma/alpha/noise/theta):          │
   │    ├─▶ spawn_success_reward                              │
   │    ├─▶ spawn_failure_penalty                             │
-  │    ├─▶ proper_deletion_reward                            │
-  │    └─▶ spawn_near_boundary_penalty                       │
+  │    └─▶ spawn_near_boundary_penalty (prevent risky spawns)│
   │                                                           │
   │    Milestone Rewards:                                    │
-  │    ├─▶ distance_25_percent (reached 25% of width)        │
-  │    ├─▶ distance_50_percent (reached 50%)                 │
-  │    ├─▶ distance_75_percent (reached 75%)                 │
-  │    └─▶ distance_90_percent (almost at goal)              │
+  │    ├─▶ distance_25_percent: +50.0 (reached 25% of width) │
+  │    ├─▶ distance_50_percent: +150.0 (reached 50%)         │
+  │    ├─▶ distance_75_percent: +300.0 (reached 75%)         │
+  │    └─▶ distance_90_percent: +500.0 (almost at goal)      │
   │                                                           │
   │    Termination Rewards:                                  │
-  │    ├─▶ success_reward (reached rightmost boundary)       │
-  │    ├─▶ out_of_bounds_penalty (boundary violation)        │
-  │    ├─▶ no_nodes_penalty (lost all nodes)                 │
-  │    └─▶ leftward_drift_penalty (persistent left movement) │
+  │    ├─▶ success_reward: +500.0 (reached goal!)            │
+  │    ├─▶ out_of_bounds_penalty: -100.0 (boundary violation)│
+  │    ├─▶ no_nodes_penalty: -100.0 (lost all nodes)         │
+  │    ├─▶ leftward_drift_penalty: -50.0 (persistent left)   │
+  │    └─▶ timeout_penalty: 0.0 (no penalty for exploration) │
   └─────────────────────────────────────────────────────────┘
         │
         ▼
@@ -293,7 +623,7 @@ STEP FUNCTION WORKFLOW:
 
 ---
 
-### 4. **Neural Network Architecture**
+### 5. **Neural Network Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -302,80 +632,103 @@ STEP FUNCTION WORKFLOW:
 └─────────────────────────────────────────────────────────────────┘
 
 INPUT: Graph State
-  ├─ node_features: [N, 3] (x, y, intensity)
-  ├─ edge_features: [E, 1] (edge weights)
-  ├─ graph_features: [G] (global features)
-  └─ edge_index: [2, E] (connectivity)
+  ├─ node_features: [N, 11] - Per-cell properties:
+  │   [node_x, node_y, substrate_intensity, in_degree, out_degree, 
+  │    centrality, centroid_distance, is_boundary, new_node_flag, age, stagnation]
+  ├─ edge_features: [E, 3] - Connection properties:
+  │   [distances, direction_norm_x, direction_norm_y]
+  ├─ graph_features: [19] - Global properties:
+  │   [num_nodes, num_edges, density, centroid_x, centroid_y, 
+  │    bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y, bbox_width, 
+  │    bbox_height, bbox_area, hull_area, avg_degree, max_degree, 
+  │    sum_degree, mean_intensity, max_intensity, sum_intensity]
+  └─ edge_index: [2, E] (connectivity in COO format)
 
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  GRAPH INPUT ENCODER (encoder.py)                               │
 │  ┌───────────────────────────────────────────────────────────┐ │
-│  │  1. Linear Projection                                      │ │
-│  │     - Node: [3] → [64]                                     │ │
-│  │     - Edge: [1] → [64]                                     │ │
-│  │     - Graph: [G] → [64]                                    │ │
+│  │  1. Feature Projection (MLP with GELU + LayerNorm)        │ │
+│  │     - Node: [11] → [hidden_dim=128]                       │ │
+│  │     - Edge: [3] → [hidden_dim=128]                        │ │
+│  │     - Graph: [19] → [hidden_dim=128] (virtual node)       │ │
 │  └───────────────────────────────────────────────────────────┘ │
 │                         │                                        │
 │                         ▼                                        │
 │  ┌───────────────────────────────────────────────────────────┐ │
-│  │  2. Multi-Head Self-Attention (4 layers)                   │ │
-│  │     - Node-to-node attention                               │ │
-│  │     - Graph-to-node attention                              │ │
-│  │     - Residual connections                                 │ │
-│  │     - Layer normalization                                  │ │
+│  │  2. Graph Transformer (PyTorch Geometric TransformerConv)  │ │
+│  │     - 4 layers of multi-head attention (4 heads)           │ │
+│  │     - Edge-aware message passing with edge_attr            │ │
+│  │     - Residual connections (when dims match)               │ │
+│  │     - Layer normalization + GELU activation                │ │
+│  │     - Dropout (0.1) for regularization                     │ │
+│  └───────────────────────────────────────────────────────────┘ │
+│                         │                                        │
+│                         ▼                                        │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │  3. Simplicial Embedding (Optional, if SEM enabled)        │ │
+│  │     - Group-wise softmax: out_dim → num_groups × group_size│ │
+│  │     - Constrains embeddings to product of simplices        │ │
+│  │     - Temperature-controlled softmax (τ=1.0 default)       │ │
+│  │     - Config: actor_critic.simplicial_embedding.enabled    │ │
 │  └───────────────────────────────────────────────────────────┘ │
 │                         │                                        │
 │                         ▼                                        │
 │  OUTPUT: [graph_token, node_tokens]                             │
-│    - graph_token: [1, 64] (global representation)               │
-│    - node_tokens: [N, 64] (per-node embeddings)                 │
+│    - graph_token: [1, out_dim=128] (global context)            │
+│    - node_tokens: [N, out_dim=128] (per-node embeddings)       │
 └─────────────────────────────────────────────────────────────────┘
         │
         ├──────────────────────┬─────────────────────────────┐
         ▼                      ▼                             ▼
 ┌─────────────────┐  ┌─────────────────┐    ┌─────────────────────┐
-│     ACTOR       │  │     CRITIC      │    │   SIMPLICIAL        │
-│                 │  │                 │    │   EMBEDDING         │
-│  node_tokens    │  │  graph_token    │    │   (Optional)        │
-│  graph_token    │  │                 │    │                     │
-│       │         │  │       │         │    │  - Group nodes      │
-│       ▼         │  │       ▼         │    │  - Cluster features │
-│  ┌──────────┐  │  │  ┌──────────┐  │    │  - Reduce dims      │
-│  │ ResNet18 │  │  │  │ ResNet18 │  │    └─────────────────────┘
-│  │ Backbone │  │  │  │ Backbone │  │
-│  │(ImageNet)│  │  │  │(ImageNet)│  │    ┌─────────────────────┐
-│  └────┬─────┘  │  │  └────┬─────┘  │    │   WSA (Optional)    │
-│       │         │  │       │         │    │   Weight Sharing    │
-│       ▼         │  │       ▼         │    │   Attention         │
+│     ACTOR       │  │     CRITIC      │    │   ARCHITECTURE      │
+│                 │  │                 │    │   NOTES             │
+│  node_tokens    │  │  graph_token    │    │                     │
+│  graph_token    │  │                 │    │  SEM: Applied in    │
+│       │         │  │       │         │    │  encoder output     │
+│       ▼         │  │       ▼         │    │  before Actor/Critic│
 │  ┌──────────┐  │  │  ┌──────────┐  │    │                     │
-│  │   MLP    │  │  │  │   MLP    │  │    │  - Multi-PTM        │
-│  └────┬─────┘  │  │  └────┬─────┘  │    │  - Dynamic weights  │
-│       │         │  │       │         │    │  - Feature fusion   │
-│       ▼         │  │       ▼         │    └─────────────────────┘
-│  ┌──────────┐  │  │  ┌──────────┐  │
-│  │ Outputs: │  │  │  │ Outputs: │  │
+│  │ ResNet18 │  │  │  │ ResNet18 │  │    │  ResNet Freezing:   │
+│  │ Backbone │  │  │  │ Backbone │  │    │  - freeze_mode      │
+│  │(ImageNet)│  │  │  │(ImageNet)│  │    │    options: none,   │
+│  └────┬─────┘  │  │  └────┬─────┘  │    │    all, until_layer3│
+│       │         │  │       │         │    │    last_block       │
+│       ▼         │  │       ▼         │    │                     │
+│  ┌──────────┐  │  │  ┌──────────┐  │    │  Input Adapter:     │
+│  │   MLP    │  │  │  │   MLP    │  │    │  - repeat3: RGB     │
+│  │(hidden=128)│  │  │ (hidden=128)│  │    │  - 1ch_conv: Conv1x1│
+│  └────┬─────┘  │  │  └────┬─────┘  │    │                     │
+│       │         │  │       │         │    │  Input Adapter:     │
+│       ▼         │  │       ▼         │    │  - repeat3: RGB    │
+│  ┌──────────┐  │  │  ┌──────────┐  │    │  - 1ch_conv: Conv1x1│
+│  │ Outputs: │  │  │  │ Outputs: │  │    └─────────────────────┘
 │  │          │  │  │  │          │  │
-│  │ discrete │  │  │  │  values  │  │
-│  │  logits  │  │  │  │  (6 comp)│  │
-│  │  [N, 2]  │  │  │  │          │  │
+│  │continuous│  │  │  │  values  │  │
+│  │   mu     │  │  │  │  (6 comp)│  │
+│  │  [N, 5]  │  │  │  │          │  │
 │  │          │  │  │  │ - total  │  │
 │  │continuous│  │  │  │ - graph  │  │
-│  │   mu     │  │  │  │ - spawn  │  │
-│  │  [N, 4]  │  │  │  │ - delete │  │
+│  │  logstd  │  │  │  │ - spawn  │  │
+│  │  [N, 5]  │  │  │  │ - delete │  │
 │  │          │  │  │  │ - edge   │  │
-│  │continuous│  │  │  │ - node   │  │
-│  │  logstd  │  │  │  │          │  │
-│  │  [N, 4]  │  │  │  └──────────┘  │
-│  └──────────┘  │  │                 │
+│  │          │  │  │  │ - node   │  │
+│  │          │  │  │  │          │  │
+│  └──────────┘  │  │  └──────────┘  │
 └─────────────────┘  └─────────────────┘
 
 ACTOR OUTPUT PROCESSING:
-  ├─▶ discrete_logits → _safe_masked_logits() → Categorical(logits)
-  │   └─ Sample: spawn/delete per node
+  ├─▶ continuous_mu, continuous_std → Normal() → Sample: [delete_ratio, γ, α, noise, θ]
+  │   └─ delete_ratio: [0.0, 0.5] - fraction of leftmost nodes to delete
+  │   └─ γ: [0.5, 15.0] - spawn growth rate (widened range)
+  │   └─ α: [0.5, 4.0] - directional bias strength
+  │   └─ noise: [0.05, 0.5] - stochastic noise level
+  │   └─ θ: [-π/6, π/6] - migration angle (-30° to +30°)
   │
-  └─▶ continuous_mu, continuous_std → Normal() → Sample: [γ, α, noise, θ]
+  └─▶ TWO-STAGE CURRICULUM (config: algorithm.two_stage_curriculum):
+      ├─ Stage 1: Learn delete_ratio only (spawn params fixed)
+      └─ Stage 2: Learn all 5 continuous actions (delete_ratio + spawn params)
 
 CRITIC OUTPUT:
   └─▶ value_predictions: dict with 6 components
@@ -384,7 +737,7 @@ CRITIC OUTPUT:
 
 ---
 
-### 5. **Policy Update (PPO with Value Clipping)**
+### 6. **Policy Update (PPO with Value Clipping)**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -488,7 +841,7 @@ INPUT: Minibatch of transitions
 
 ---
 
-### 6. **Curriculum Learning System**
+### 7. **Curriculum Learning System**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -589,25 +942,32 @@ PROGRESSION LOGIC:
 
 ---
 
-### 7. **Key Data Structures**
+### 8. **Key Data Structures**
 
 ```python
 # State Dictionary (observations)
 state_dict = {
-    'graph_features': torch.Tensor,     # [global_features]
-    'node_features': torch.Tensor,      # [N, 3] (x, y, intensity)
-    'edge_features': torch.Tensor,      # [E, 1] (edge weights)
-    'edge_index': torch.Tensor,         # [2, E] (connectivity)
+    'graph_features': torch.Tensor,     # [19] - Global properties (enriched with pooling stats)
+    'node_features': torch.Tensor,      # [N, 11] - Per-node properties (incl. age, stagnation)
+    'edge_features': torch.Tensor,      # [E, 3] - Per-edge properties (distance + direction)
+    'edge_index': torch.Tensor,         # [2, E] - Connectivity in COO format
     'num_nodes': int                    # Number of nodes
 }
 
-# Action Dictionary
+# Action Dictionary (DELETE_RATIO ARCHITECTURE)
 actions = {
-    'discrete_actions': torch.Tensor,   # [N] (0=spawn, 1=delete)
-    'continuous_actions': torch.Tensor, # [N, 4] (γ, α, noise, θ)
-    'discrete_log_probs': torch.Tensor, # [N]
-    'continuous_log_probs': torch.Tensor, # [N]
-    'total_log_probs': torch.Tensor     # [N]
+    'continuous_actions': torch.Tensor, # [N, 5] (delete_ratio, γ, α, noise, θ)
+    'continuous_log_probs': torch.Tensor, # [N] - Log probability of continuous actions
+    'total_log_probs': torch.Tensor     # [N] - Same as continuous_log_probs (no discrete)
+}
+
+# Action bounds (from config.yaml: actor_critic.action_parameter_bounds)
+action_bounds = {
+    'delete_ratio': [0.0, 0.5],        # Fraction of leftmost nodes to delete
+    'gamma': [0.5, 15.0],              # Spawn growth rate (widened from [2.0, 8.0])
+    'alpha': [0.5, 4.0],               # Directional bias strength
+    'noise': [0.05, 0.5],              # Stochastic noise level
+    'theta': [-0.5236, 0.5236]         # Migration angle (-π/6 to π/6, -30° to +30°)
 }
 
 # Reward Dictionary (multi-component)
@@ -633,7 +993,7 @@ value_predictions = {
 
 ---
 
-### 8. **File Organization & Responsibilities**
+### 9. **File Organization & Responsibilities**
 
 | File | Responsibility | Key Classes/Functions |
 |------|---------------|----------------------|
@@ -641,19 +1001,18 @@ value_predictions = {
 | **train_cli.py** | Command-line interface wrapper | CLI argument parsing |
 | **durotaxis_env.py** | Gym environment, reward computation, termination | `DurotaxisEnv` |
 | **actor_critic.py** | Neural network architecture | `HybridActorCritic`, `Actor`, `Critic` |
-| **encoder.py** | Graph neural network encoder | `GraphInputEncoder` |
+| **encoder.py** | Graph neural network encoder | `GraphInputEncoder`, `MyGraphTransformer`, `SimplicialEmbedding` |
 | **topology.py** | Graph structure, node/edge management | `Topology` |
 | **substrate.py** | Stiffness field generation | `Substrate` |
 | **state.py** | State representation and history | `TopologyState` |
 | **config.yaml** | Configuration parameters | N/A (YAML) |
 | **config_loader.py** | Configuration parsing | `ConfigLoader` |
 | **curriculum_learning.py** | Progressive difficulty stages | `CurriculumManager` |
-| **pretrained_fusion.py** | WSA multi-PTM fusion (optional) | `WeightSharingAttention` |
 | **plotter.py** | Visualization and plotting | Plotting utilities |
 
 ---
 
-### 9. **Training Execution Flow**
+### 10. **Training Execution Flow**
 
 ```bash
 # Command Line
@@ -725,26 +1084,46 @@ $ python train_cli.py --total-episodes 2000 --learning-rate 0.0003
 - Separate value heads for 6 reward components
 - Adaptive weighting based on component variance
 - Attention-based dynamic weighting
+- Value clipping for stable PPO updates
 
-### 2. **Hybrid Action Space**
-- Discrete: spawn/delete (Categorical distribution)
-- Continuous: spawn parameters (Normal distribution)
-- Combined policy loss with gradient balancing
+### 2. **Delete-Ratio Action Architecture (Current)**
+- **Continuous-only action space:** [delete_ratio, gamma, alpha, noise, theta]
+- Delete leftmost nodes by fraction (delete_ratio ∈ [0, 0.5])
+- Spawn new nodes using durotaxis parameters (gamma, alpha, noise, theta)
+- Two-stage curriculum: Stage 1 (delete_ratio only), Stage 2 (all 5 params)
 
-### 3. **Numerical Stability**
-- `_safe_masked_logits()`: Conditional normalization
-- `Categorical(logits=...)`: Use logits instead of probs
-- Gradient clipping and NaN/Inf detection
+### 3. **Graph Neural Networks with Edge Features**
+- **PyTorch Geometric TransformerConv:** Multi-head graph attention
+- **Edge-aware message passing:** `edge_attr` parameter provides edge features to attention
+- **Residual connections:** Applied when input/output dimensions match
+- **Enriched features:** 19 graph-level, 11 node-level, 3 edge-level dimensions
+- **Optional Simplicial Embedding (SEM):** Group-wise softmax for geometric constraints
 
-### 4. **Curriculum Learning**
+### 4. **Experimental Reward Modes**
+- **Normal Mode:** Full reward structure (graph, node, edge, spawn, delete, milestones)
+- **Centroid Distance Only Mode:** Dense delta-distance reward with adaptive terminal scaling
+  - Potential-based shaping preserves optimal policy
+  - Adaptive scheduler reduces terminal reward scale as progress improves
+  - Config: `environment.centroid_distance_only_mode: true`
+- **Simple Delete-Only Mode (Deprecated):** Penalties + termination only
+
+### 5. **Curriculum Learning**
 - 3 progressive stages with adaptive transitions
 - Stage-specific reward multipliers
 - Success criteria for stage advancement
+- Optional overlap between stages for smooth transitions
 
-### 5. **Graph Neural Networks**
-- Multi-head self-attention for node embeddings
-- Graph-level pooling for global features
-- Edge-aware message passing
+### 6. **ResNet Backbone Architecture**
+- **Pretrained weights:** ImageNet initialization (optional)
+- **Freeze modes:** none, all, until_layer3, last_block
+- **Input adapters:** repeat3 (RGB duplication) or 1ch_conv (1×1 convolution)
+- **Separate learning rates:** backbone_lr and head_lr for fine-tuning control
+
+### 7. **Numerical Stability & Safety**
+- NaN/Inf detection and replacement in encoder inputs
+- Gradient clipping (max_norm=0.5)
+- Value clipping for PPO stability
+- Adaptive gradient scaling with momentum
 
 ---
 
@@ -762,19 +1141,62 @@ trainer:
   resume_training:
     enabled: true
     checkpoint_path: "./training_results/run0001/checkpoint_episode_500.pt"
+    reset_optimizer: false      # Keep optimizer state
+    reset_episode_count: false  # Continue episode numbering
 ```
 
-### Ablation Study (Disable WSA)
+### Ablation Study: Disable Simplicial Embedding
 ```yaml
 # In config.yaml
 actor_critic:
-  wsa:
-    enabled: false  # Use standard ResNet backbone
+  simplicial_embedding:
+    enabled: false  # Ablation: Remove SEM constraint
+```
+
+### Ablation Study: Freeze ResNet Backbone
+```yaml
+# In config.yaml
+actor_critic:
+  backbone:
+    freeze_mode: all           # none | all | until_layer3 | last_block
+    pretrained_weights: imagenet  # or 'random' for random init
+```
+
+### Experimental Mode: Centroid Distance Only
+```yaml
+# In config.yaml
+environment:
+  centroid_distance_only_mode: true  # Dense distance-based reward
+  include_termination_rewards: true  # Include terminal rewards (recommended)
+  
+  distance_mode:
+    use_delta_distance: true         # Dense ∆-distance shaping
+    distance_reward_scale: 5.0       # Scale factor
+    terminal_reward_scale: 0.02      # Downscale terminals to avoid dominance
+    scheduler_enabled: false         # Adaptive terminal reduction
+```
+
+### Two-Stage Training Curriculum
+```yaml
+# In config.yaml
+algorithm:
+  two_stage_curriculum:
+    stage: 1  # Stage 1: Learn delete_ratio only (spawn params fixed)
+    
+    # Fixed spawn parameters for Stage 1
+    stage_1_fixed_spawn_params:
+      gamma: 0.5
+      alpha: 2.0
+      noise: 0.1
+      theta: 0.0
+
+# After Stage 1 converges, switch to Stage 2:
+# stage: 2  # Stage 2: Learn all 5 continuous actions
 ```
 
 ### Change Learning Rate via CLI
 ```bash
-python train_cli.py --learning-rate 0.0003
+python train_cli.py --learning-rate 0.0003 --total-episodes 2000
 ```
 
 ---
@@ -783,14 +1205,43 @@ python train_cli.py --learning-rate 0.0003
 
 This codebase implements a sophisticated **graph-based RL system** for durotaxis simulation with:
 
-✅ **Multi-component reward system** (6 components)  
-✅ **Hybrid action space** (discrete + continuous)  
-✅ **Graph neural networks** (attention-based encoder)  
-✅ **Curriculum learning** (3-stage progressive difficulty)  
-✅ **Numerical stability** (NaN-safe operations)  
-✅ **PPO with value clipping** (stable policy updates)  
-✅ **Comprehensive logging** (metrics, checkpoints, detailed node tracking)  
-✅ **Flexible configuration** (YAML + CLI overrides)  
-✅ **Ablation study support** (WSA, SEM, pretrained weights)
+✅ **Multi-component reward system** (6 components with adaptive weighting)  
+✅ **Delete-ratio continuous action architecture** (5D continuous: delete_ratio + spawn params)  
+✅ **Graph Transformer encoder** (PyTorch Geometric TransformerConv with edge features)  
+✅ **Enriched feature representations** (19 graph-level, 11 node-level, 3 edge-level)  
+✅ **Simplicial Embedding (SEM)** (optional geometric constraint for ablation studies)  
+✅ **Experimental reward modes** (Centroid Distance Only with adaptive scaling)  
+✅ **Two-stage training curriculum** (Stage 1: delete_ratio only, Stage 2: full 5D)  
+✅ **ResNet18 backbone** (ImageNet pretrained, configurable freezing modes)  
+✅ **Curriculum learning** (3-stage progressive difficulty with overlap)  
+✅ **PPO with value clipping** (stable policy updates with NaN safeguards)  
+✅ **Numerical stability** (gradient clipping, NaN/Inf detection, adaptive scaling)  
+✅ **Comprehensive logging** (metrics, checkpoints, detailed node tracking in JSON)  
+✅ **Flexible configuration** (YAML-based with CLI overrides)  
+✅ **Ablation study support** (SEM, pretrained weights, freeze modes, reward modes)
 
-The workflow is designed for **research reproducibility** and **production stability**, with extensive safeguards against training failures and comprehensive monitoring of learning progress.
+### Recent Architectural Updates (2025)
+
+**Encoder Architecture:**
+- Migrated from custom attention to **PyTorch Geometric TransformerConv**
+- Added **edge_attr parameter** for edge-aware message passing
+- Enriched features: graph (14→19), node (9→11), edge (1→3)
+- Optional **Simplicial Embedding** layer for geometric inductive bias
+
+**Action Space:**
+- Switched from hybrid (discrete+continuous) to **pure continuous (delete_ratio)**
+- Delete leftmost nodes by fraction instead of per-node discrete decisions
+- Two-stage curriculum for progressive learning complexity
+
+**Reward System:**
+- **Centroid Distance Only Mode:** Dense delta-distance reward with adaptive terminal scaling
+- Distance mode scheduler automatically reduces terminal rewards as agent improves
+- Enhanced boundary penalties (edge/danger/critical zones) for safety
+
+**Training Stability:**
+- Value clipping for PPO (0.2 epsilon)
+- Adaptive gradient scaling with momentum
+- Residual connections in graph transformer (when dims match)
+- NaN/Inf detection throughout forward pass
+
+The workflow is designed for **research reproducibility** and **production stability**, with extensive safeguards against training failures, comprehensive ablation study support, and detailed monitoring of learning progress.
