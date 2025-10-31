@@ -698,12 +698,10 @@ class DurotaxisTrainer:
         # Enhanced Learnable Component Weighting System
         self._initialize_learnable_weights()
         
-        # Optimizer (includes learnable weights)
+        # Optimizer (includes learnable weights and LR scheduler)
         self.learning_rate = config.get('learning_rate', 3e-4)
         self._build_optimizer()
-        
-        # Learning rate scheduler for long runs
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=500)
+        # Note: lr_scheduler is now created in _build_optimizer() with warmup + cosine decay
         
         # Training tracking - initialize before potential checkpoint loading
         self.episode_rewards = defaultdict(list)
@@ -734,6 +732,10 @@ class DurotaxisTrainer:
         
         # Episode history for model selection (rolling window)
         self.episode_history = []  # List of dicts with {success, final_centroid_x, goal_x, return}
+        
+        # Update tracking for warmup and scheduling
+        self.global_update_steps = 0  # Total number of optimizer.step() calls
+        self._param_snapshot = None  # For tracking parameter changes
         
         # Adaptive terminal scale scheduler (for distance mode optimization)
         # Gradually reduces terminal reward influence as rightward progress becomes consistent
@@ -955,6 +957,28 @@ class DurotaxisTrainer:
         # Create main optimizer with parameter groups
         self.optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), weight_decay=0.0)
         
+        # Create LR warmup + decay scheduler
+        import math
+        trainer_config = self.config_loader.get_trainer_config()
+        self.lr_warmup_updates = trainer_config.get('lr_warmup_updates', 200)
+        self.lr_total_updates = trainer_config.get('lr_total_updates', 10000)
+        self.warmup_updates_for_best = trainer_config.get('warmup_updates_for_best', 5)
+        
+        def lr_lambda(update_step):
+            """Linear warmup to step W, then cosine decay"""
+            W = self.lr_warmup_updates
+            T = self.lr_total_updates
+            
+            if update_step < W:
+                # Linear warmup from 0.001 to 1.0
+                return max(update_step / max(1, W), 1e-3)
+            # Cosine decay from 1.0 to 0.55 after warmup
+            progress = min(1.0, (update_step - W) / max(1, T - W))
+            return 0.55 + 0.45 * (1.0 + math.cos(math.pi * progress)) / 2.0
+        
+        from torch.optim.lr_scheduler import LambdaLR
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda)
+        
         # Print optimizer configuration
         print("\n" + "="*70)
         print("🎓 OPTIMIZER CONFIGURATION")
@@ -966,6 +990,7 @@ class DurotaxisTrainer:
             print(f"  Group: {group_name}")
             print(f"    LR: {group_lr:.6f}")
             print(f"    Parameters: {group_params:,}")
+        print(f"\n📈 LR Schedule: Warmup {self.lr_warmup_updates} steps → Cosine decay over {self.lr_total_updates} steps")
         print("="*70 + "\n")
     
     def create_action_mask(self, state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
@@ -2916,6 +2941,13 @@ class DurotaxisTrainer:
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
         self.optimizer.step()
         
+        # Step LR scheduler after optimizer update
+        if hasattr(self, 'lr_scheduler'):
+            self.lr_scheduler.step()
+        
+        # Increment global update counter
+        self.global_update_steps += 1
+        
         return losses
 
     def update_policy_minibatch(self, states: List[Dict], actions: List[Dict], 
@@ -3201,6 +3233,13 @@ class DurotaxisTrainer:
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
         self.optimizer.step()
         
+        # Step LR scheduler after optimizer update
+        if hasattr(self, 'lr_scheduler'):
+            self.lr_scheduler.step()
+        
+        # Increment global update counter
+        self.global_update_steps += 1
+        
         return losses
 
     def _compute_model_selection_kpis(self) -> dict:
@@ -3268,25 +3307,83 @@ class DurotaxisTrainer:
         
         return float(score)
     
-    def _should_save_best_model(self, kpis: dict, composite_score: float) -> bool:
+    def _should_save_best_model(self, kpis: dict, composite_score: float, episode_count: int) -> bool:
         """
         Determine if current model should be saved as best.
         
         Args:
             kpis: current KPI dict
             composite_score: current composite score
+            episode_count: current episode number
             
         Returns:
             True if this is a new best (with hysteresis threshold)
         """
+        # Check warmup: need minimum number of optimizer updates
+        if self.global_update_steps < self.warmup_updates_for_best:
+            return False
+        
+        # Check minimum episode threshold from config
+        trainer_config = self.config_loader.get_trainer_config()
+        model_sel_config = trainer_config.get('model_selection', {})
+        min_episode = model_sel_config.get('min_episode_for_best_save', 0)
+        if episode_count < min_episode:
+            return False
+        
         if self.best_model_score is None:
-            # First evaluation
+            # First evaluation after warmup
             return True
         
         # Check if improvement exceeds threshold (hysteresis)
         improvement = (composite_score - self.best_model_score) / max(abs(self.best_model_score), 1e-6)
         
         return improvement >= self.model_sel_min_improvement
+    
+    def _log_update_diagnostics(self, losses: dict):
+        """
+        Log gradient and parameter change diagnostics to verify learning is happening.
+        
+        Args:
+            losses: dict of loss values from last update
+        """
+        if not self.verbose:
+            return
+        
+        # Only log every 10 updates to avoid spam
+        if self.global_update_steps % 10 != 0:
+            return
+        
+        # Gradient norm across all parameters
+        total_grad = 0.0
+        count = 0
+        for p in self.network.parameters():
+            if p.grad is not None:
+                g = p.grad.data
+                total_grad += float(g.norm().item())
+                count += 1
+        grad_norm = total_grad / max(1, count)
+        
+        # Parameter delta norm (requires snapshot before step)
+        if self._param_snapshot is None:
+            # Initialize snapshot
+            self._param_snapshot = [p.detach().clone() for p in self.network.parameters() if p.requires_grad]
+            delta_norm = 0.0
+        else:
+            delta = []
+            i = 0
+            for p in self.network.parameters():
+                if p.requires_grad:
+                    if i < len(self._param_snapshot):
+                        delta.append((p.detach() - self._param_snapshot[i]).norm().item())
+                        self._param_snapshot[i].copy_(p.detach())
+                    i += 1
+            delta_norm = float(np.mean(delta) if delta else 0.0)
+        
+        # Get current LR
+        current_lr = self.optimizer.param_groups[0]['lr']
+        
+        print(f"   🔍 Update Diagnostics (step {self.global_update_steps}): "
+              f"grad_norm={grad_norm:.4f}, param_delta={delta_norm:.6f}, LR={current_lr:.2e}")
 
     def _compute_rightward_progress_rate(self, episode_count: int) -> float:
         """
@@ -3546,6 +3643,10 @@ class DurotaxisTrainer:
                 for loss_name, loss_values in total_losses.items():
                     final_losses[loss_name] = np.mean(loss_values)
                 
+                # === LOG UPDATE DIAGNOSTICS ===
+                # Log gradient and parameter changes to confirm learning is happening
+                self._log_update_diagnostics(final_losses)
+                
                 # === LOG PPO HEALTH METRICS ===
                 if self.verbose and final_losses:
                     # Extract PPO health signals (continuous-only)
@@ -3715,8 +3816,9 @@ class DurotaxisTrainer:
                     if self.empty_graph_recovery_count > 0:
                         recovery_info = f" | Recoveries: {self.empty_graph_recovery_count}"
                     
+                    current_lr = self.lr_scheduler.get_last_lr()[0] if hasattr(self, 'lr_scheduler') else self.optimizer.param_groups[0]['lr']
                     print(f"Batch {batch_count:3d} | R: {batch_stats['avg_reward']:6.3f} (MA: {recent_reward:6.3f}, Best: {best_so_far:6.3f}) | "
-                          f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
+                          f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {current_lr:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
                           f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
                 
                 # ==========================================
@@ -3727,8 +3829,8 @@ class DurotaxisTrainer:
                 kpis = self._compute_model_selection_kpis()
                 composite_score = self._compute_composite_score(kpis)
                 
-                # Check if this is a new best model
-                if self._should_save_best_model(kpis, composite_score):
+                # Check if this is a new best model (with warmup and episode checks)
+                if self._should_save_best_model(kpis, composite_score, episode_count):
                     prev_score = self.best_model_score
                     self.best_model_score = composite_score
                     self.best_model_metrics = kpis.copy()
@@ -3739,7 +3841,7 @@ class DurotaxisTrainer:
                     
                     # Print detailed improvement message
                     if prev_score is None:
-                        print(f"💾 Best model saved (initial): {self.best_model_filename}")
+                        print(f"💾 Best model saved (initial after warmup): {self.best_model_filename}")
                     else:
                         improvement_pct = ((composite_score - prev_score) / max(abs(prev_score), 1e-6)) * 100
                         print(f"💾 NEW BEST model saved: {self.best_model_filename} (score: {composite_score:.2f}, +{improvement_pct:.1f}%)")

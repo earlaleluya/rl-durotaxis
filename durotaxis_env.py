@@ -1344,26 +1344,23 @@ class DurotaxisEnv(gym.Env):
             # Update previous centroid for next step
             self._prev_centroid_x = centroid_x
             
-            # === 2. Calculate Delete Penalties (Efficient Node Management) ===
-            # Extract only the delete penalties from delete_reward
-            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
+            # === 2. Calculate Delete Rewards/Penalties (Efficient Node Management) ===
+            # Use the full delete_reward which now includes:
+            # - Rule 1 (Persistence Penalty): to_delete=1 but still exists → -reward
+            # - Rule 2 (Improper Deletion): to_delete=0 but deleted → -reward
+            # - Proper Deletion: to_delete=1 and deleted → +reward
+            # - Proper Persistence: to_delete=0 and still exists → +reward
             
-            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
-            growth_penalty_only = 0.0
-            if num_nodes > self.max_critical_nodes:
-                excess_nodes = num_nodes - self.max_critical_nodes
-                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
-            
-            # Combine delete penalties
-            delete_penalties_total = growth_penalty_only + delete_penalty_only
+            # NO growth penalty - Rule 0 removed per user requirements
+            # When num_nodes > max_critical_nodes, it only signals tagging (no reward/penalty)
             
             # === 3. Combine Distance + Delete ===
-            total_reward = distance_signal + delete_penalties_total
-            graph_reward = distance_signal + delete_penalties_total
+            total_reward = distance_signal + delete_reward
+            graph_reward = distance_signal + delete_reward
             
             # Zero out all other components (keep reward focused)
             spawn_reward = 0.0
-            delete_reward = delete_penalties_total  # Keep for logging
+            # delete_reward already calculated above, keep for logging
             efficiency_reward = 0.0
             edge_reward = 0.0
             centroid_reward = 0.0
@@ -1372,21 +1369,21 @@ class DurotaxisEnv(gym.Env):
             survival_reward = 0.0
         
         # === SIMPLE DELETE-ONLY MODE ===
-        # When enabled, zero out all rewards except delete penalties (Rule 1 & 2) and growth penalty (Rule 0)
+        # When enabled, use ONLY delete rewards/penalties (Rule 1 & 2)
+        # Rule 0 (growth penalty) is REMOVED - no penalty/reward when num_nodes > max_critical_nodes
+        # Instead, excess nodes trigger tagging logic: nodes with intensity < avg are marked to_delete=1
         elif self.simple_delete_only_mode:
-            # Extract only the delete penalties from delete_reward
-            # In simple mode, we want ONLY penalties, no positive rewards
-            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
+            # Use the full delete_reward which now includes:
+            # - Rule 1 (Persistence Penalty): to_delete=1 but still exists → -reward
+            # - Rule 2 (Improper Deletion): to_delete=0 but deleted → -reward
+            # - Proper Deletion: to_delete=1 and deleted → +reward
+            # - Proper Persistence: to_delete=0 and still exists → +reward
             
-            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
-            growth_penalty_only = 0.0
-            if num_nodes > self.max_critical_nodes:
-                excess_nodes = num_nodes - self.max_critical_nodes
-                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
+            # NO growth penalty - Rule 0 removed per user requirements
+            # When num_nodes > max_critical_nodes, it only signals tagging (no reward/penalty)
             
-            # Combine penalties: Rule 0 (growth) + Rule 1 (persistence) + Rule 2 (improper deletion)
-            total_reward = growth_penalty_only + delete_penalty_only
-            graph_reward = growth_penalty_only + delete_penalty_only
+            total_reward = delete_reward
+            graph_reward = delete_reward
             
             # Zero out all other components
             spawn_reward = 0.0
@@ -1757,10 +1754,16 @@ class DurotaxisEnv(gym.Env):
         """
         Calculate reward/penalty based on deletion compliance with to_delete flags.
         
-        Logic:
+        Logic (REVISED for simple_delete_only_mode):
         - If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
-        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence)
-        - If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper)
+        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence - RULE 1)
+        - If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper - RULE 2)
+        - If a node from previous topology was NOT marked (to_delete=0) AND still exists: +delete_reward (proper persistence)
+        
+        Tagging Strategy:
+        - At step t, if node's intensity < avg(all intensities), tag as to_delete=1 at step t+delta_time
+        - delta_time is configurable (default: 3)
+        - Only triggered when num_nodes > max_critical_nodes (signals need for deletion)
         
         Args:
             prev_state: Previous state dict containing topology
@@ -1768,7 +1771,7 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken this step
             
         Returns:
-            float: Delete reward (positive for proper deletions, negative for persistence/improper deletions)
+            float: Delete reward (positive for proper behavior, negative for violations)
         """
         delete_reward = 0.0
         
@@ -1800,9 +1803,7 @@ class DurotaxisEnv(gym.Env):
             if to_delete_flag.item() > 0.5:  # Node was marked for deletion
                 if node_was_deleted:
                     # Node was marked for deletion and was actually deleted - reward
-                    # In simple_delete_only_mode, we give 0 instead of positive reward
-                    if not self.simple_delete_only_mode:
-                        delete_reward += self.delete_proper_reward
+                    delete_reward += self.delete_proper_reward
                     # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
                 else:
                     # Node was marked for deletion but still exists - penalty (RULE 1)
@@ -1813,7 +1814,10 @@ class DurotaxisEnv(gym.Env):
                     # Node was NOT marked but was deleted anyway - penalty (RULE 2)
                     delete_reward -= self.delete_improper_penalty
                     # print(f"🔴 Improper delete penalty! Node PID:{prev_persistent_id} was deleted without marking (-{self.delete_improper_penalty})")
-                # else: node not marked and still exists - neutral (expected behavior)
+                else:
+                    # Node was NOT marked and still exists - reward (proper persistence)
+                    delete_reward += self.delete_proper_reward
+                    # print(f"🟢 Proper persistence! Node PID:{prev_persistent_id} correctly kept (+{self.delete_proper_reward})")
         
         return delete_reward
     

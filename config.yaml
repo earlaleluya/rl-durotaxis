@@ -47,6 +47,17 @@ trainer:
     
     # Improvement threshold (hysteresis to avoid frequent saves)
     min_improvement: 0.01               # Save only if composite score improves by ≥1%
+    
+    # Warmup: Prevent "best at batch 0" issue
+    min_episode_for_best_save: 50      # Don't save best model before episode 50
+  
+  # ============================================================================
+  # LEARNING RATE SCHEDULE
+  # ============================================================================
+  # Warmup + decay prevents early training instability and improves convergence
+  warmup_updates_for_best: 5           # Require at least 5 updates before saving best model
+  lr_warmup_updates: 200               # Linear warmup for first 200 updates
+  lr_total_updates: 10000              # Total updates for cosine decay schedule
   
   # ============================================================================
   # CURRICULUM LEARNING SYSTEM - Progressive Migration Training
@@ -296,17 +307,24 @@ trainer:
 # ============================================================================
 environment:
   # ============================================================================
-  # EXPERIMENTAL: Simple Delete-Only Reward Mode
+  # EXPERIMENTAL: Simple Delete-Only Reward Mode (REVISED)
   # ============================================================================
-  # When enabled, this mode zeros out ALL reward components except penalties and termination rewards:
-  # The agent receives ONLY:
-  #   Rule 0: Growth penalty - when num_nodes > max_critical_nodes
-  #   Rule 1: Persistence penalty - keeping a node marked for deletion
-  #   Rule 2: Improper deletion penalty - deleting a node NOT marked for deletion
-  #   Termination rewards/penalties: success_reward, critical_nodes_penalty, no_nodes_penalty, 
-  #                                   out_of_bounds_penalty, leftward_drift_penalty, timeout_penalty
-  # NO positive rewards for spawning/movement/milestones (proper deletions give 0 instead of positive reward).
-  # Use this to test if the agent can learn node management purely from penalties and outcome feedback.
+  # When enabled, this mode provides rewards/penalties based ONLY on delete behavior:
+  # 
+  # Tagging Strategy:
+  # - At step t, if a node's intensity < avg(all node intensities), tag it as to_delete=1 at step t+delta_time
+  # - Tagging is triggered when num_nodes > max_critical_nodes (signals need for deletion)
+  # - delta_time is configurable (default: 3 steps)
+  # 
+  # Reward Logic:
+  #   Rule 0: NO PENALTY/REWARD - when num_nodes > max_critical_nodes (just triggers tagging)
+  #   Rule 1: Persistence penalty - keeping a node marked for deletion (to_delete=1 but still exists)
+  #   Rule 2: Improper deletion penalty - deleting a node NOT marked (to_delete=0 but deleted)
+  #   Proper Deletion: +reward for deleting marked nodes (to_delete=1 and deleted)
+  #   Proper Persistence: +reward for keeping unmarked nodes (to_delete=0 and still exists)
+  # 
+  # Termination rewards can be optionally included via include_termination_rewards flag.
+  # Use this to test if the agent can learn node management from delete compliance feedback.
   simple_delete_only_mode: false  # Set to true to enable simplified reward system
   
   # ============================================================================
