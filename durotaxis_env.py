@@ -397,6 +397,26 @@ class DurotaxisEnv(gym.Env):
         
         self.survival_reward_config = config.get('survival_reward_config', {'enabled': False})
         self.milestone_rewards = config.get('milestone_rewards', {'enabled': False})
+        
+        # ============================================================================
+        # POTENTIAL-BASED REWARD SHAPING (PBRS) PARAMETERS
+        # ============================================================================
+        # Get gamma from algorithm config for PBRS (preserves optimal policy)
+        algo_config = config_loader.config.get('algorithm', {})
+        self._pbrs_gamma = float(algo_config.get('gamma', 0.99))
+        
+        # Delete reward PBRS parameters
+        pbrs_delete = self.delete_reward.get('pbrs', {})
+        self._pbrs_delete_enabled = pbrs_delete.get('enabled', False)
+        self._pbrs_delete_coeff = float(pbrs_delete.get('shaping_coeff', 0.0))
+        self._pbrs_delete_w_pending = float(pbrs_delete.get('phi_weight_pending_marked', 1.0))
+        self._pbrs_delete_w_safe = float(pbrs_delete.get('phi_weight_safe_unmarked', 0.25))
+        
+        # Centroid distance PBRS parameters
+        pbrs_centroid = self.graph_rewards.get('pbrs_centroid', {})
+        self._pbrs_centroid_enabled = pbrs_centroid.get('enabled', False)
+        self._pbrs_centroid_coeff = float(pbrs_centroid.get('shaping_coeff', 0.0))
+        self._pbrs_centroid_scale = float(pbrs_centroid.get('phi_distance_scale', 1.0))
 
         self.current_step = 0
         self.current_episode = 0
@@ -1451,11 +1471,22 @@ class DurotaxisEnv(gym.Env):
         prev_centroid_x = prev_state['graph_features'][3].item()
         curr_centroid_x = new_state['graph_features'][3].item()
         
-        # Calculate movement
+        # Calculate movement (base reward)
         centroid_movement = curr_centroid_x - prev_centroid_x
         
         # Apply reward multiplier
         reward = centroid_movement * self.centroid_movement_reward
+        
+        # ============================================================================
+        # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
+        # ============================================================================
+        # Add PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
+        # This biases learning toward rightward movement without changing optimal policy
+        if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
+            phi_prev = self._phi_centroid_distance_potential(prev_state)
+            phi_new = self._phi_centroid_distance_potential(new_state)
+            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
+            reward += self._pbrs_centroid_coeff * pbrs_shaping
         
         return reward
     
@@ -1609,6 +1640,97 @@ class DurotaxisEnv(gym.Env):
                                     #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
         
         return spawn_reward
+    
+    # ============================================================================
+    # POTENTIAL-BASED REWARD SHAPING (PBRS) - HELPER FUNCTIONS
+    # ============================================================================
+    
+    def _phi_delete_potential(self, state):
+        """
+        Compute potential function Phi(s) for delete reward shaping.
+        
+        Uses only current state (Markov property):
+        - pending_marked(s): count of nodes with to_delete=1 that still exist
+        - safe_unmarked(s): count of nodes with to_delete=0 that still exist
+        
+        Phi(s) = -w_pending * pending_marked(s) + w_safe * safe_unmarked(s)
+        
+        Deleting a marked node reduces pending_marked → Phi increases → positive shaping
+        Deleting an unmarked node reduces safe_unmarked → Phi decreases → negative shaping
+        
+        Args:
+            state: State dict containing 'to_delete' flags and node existence info
+            
+        Returns:
+            float: Potential value Phi(s)
+        """
+        try:
+            if state['num_nodes'] == 0:
+                return 0.0
+            
+            # Get to_delete flags from state
+            to_delete = state.get('to_delete', None)
+            if to_delete is None:
+                return 0.0
+            
+            # Convert to numpy for device-agnostic computation
+            if hasattr(to_delete, 'detach'):
+                to_delete_np = to_delete.detach().cpu().numpy()
+            else:
+                to_delete_np = np.asarray(to_delete)
+            
+            to_delete_np = to_delete_np.astype(np.float32)
+            
+            # All nodes in state exist (by definition)
+            pending_marked = float((to_delete_np > 0.5).sum())
+            safe_unmarked = float((to_delete_np <= 0.5).sum())
+            
+            phi = -self._pbrs_delete_w_pending * pending_marked + self._pbrs_delete_w_safe * safe_unmarked
+            return float(phi)
+            
+        except Exception as e:
+            # Fail gracefully
+            return 0.0
+    
+    def _phi_centroid_distance_potential(self, state):
+        """
+        Compute potential function Phi(s) for centroid distance shaping.
+        
+        Uses only current state (Markov property):
+        - centroid_x(s): Current x-coordinate of graph centroid
+        - goal_x: Target x-coordinate (rightmost substrate boundary)
+        
+        Phi(s) = -scale * (goal_x - centroid_x(s))
+        
+        Moving right reduces distance → Phi increases → positive shaping
+        Moving left increases distance → Phi decreases → negative shaping
+        
+        Args:
+            state: State dict containing centroid_x and goal_x
+            
+        Returns:
+            float: Potential value Phi(s)
+        """
+        try:
+            if state['num_nodes'] == 0:
+                return 0.0
+            
+            centroid_x = state.get('centroid_x', 0.0)
+            goal_x = state.get('goal_x', 1.0)
+            
+            # Distance to goal (negative potential, so moving closer increases Phi)
+            distance_to_goal = goal_x - centroid_x
+            phi = -self._pbrs_centroid_scale * distance_to_goal
+            
+            return float(phi)
+            
+        except Exception as e:
+            # Fail gracefully
+            return 0.0
+    
+    # ============================================================================
+    # REWARD CALCULATION FUNCTIONS
+    # ============================================================================
 
     def _calculate_delete_reward(self, prev_state, new_state, actions):
         """
@@ -1678,6 +1800,17 @@ class DurotaxisEnv(gym.Env):
                     # Node was NOT marked and still exists - reward (proper persistence)
                     delete_reward += self.delete_proper_reward
                     # print(f"🟢 Proper persistence! Node PID:{prev_persistent_id} correctly kept (+{self.delete_proper_reward})")
+        
+        # ============================================================================
+        # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
+        # ============================================================================
+        # Add PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
+        # This biases learning toward compliant deletions without changing optimal policy
+        if self._pbrs_delete_enabled and self._pbrs_delete_coeff != 0.0:
+            phi_prev = self._phi_delete_potential(prev_state)
+            phi_new = self._phi_delete_potential(new_state)
+            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
+            delete_reward += self._pbrs_delete_coeff * pbrs_shaping
         
         return delete_reward
     

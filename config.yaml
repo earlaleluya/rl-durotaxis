@@ -441,6 +441,13 @@ environment:
     survival_reward: 0.1          # Reward for each step survived
     action_reward: 0.01           # Small reward for taking actions
     centroid_movement_reward: 5.0 # MASSIVELY INCREASED: Strongest possible incentive for rightward movement!
+    
+    # Potential-Based Reward Shaping (PBRS) for centroid distance to goal
+    # Preserves optimal policy while improving credit assignment
+    pbrs_centroid:
+      enabled: false              # Set to true to enable PBRS for centroid distance reward
+      shaping_coeff: 0.0          # Shaping coefficient (0.0 = OFF, try 0.05-0.2)
+      phi_distance_scale: 1.0     # Scale factor for distance-to-goal in potential function
   
   # Reward structure - Node rewards (OPTIMIZED for migration)
   node_rewards:
@@ -493,6 +500,14 @@ environment:
     proper_deletion: 2.0          # Reward for proper node deletion
     persistence_penalty: 2.0      # Penalty for inappropriate persistence
     improper_deletion_penalty: 2.0  # Penalty for deleting nodes not marked for deletion
+    
+    # Potential-Based Reward Shaping (PBRS) for delete compliance
+    # Preserves optimal policy while improving credit assignment
+    pbrs:
+      enabled: false              # Set to true to enable PBRS for delete reward
+      shaping_coeff: 0.0          # Shaping coefficient (0.0 = OFF, try 0.05-0.2)
+      phi_weight_pending_marked: 1.0    # Weight for pending marked nodes (to be deleted)
+      phi_weight_safe_unmarked: 0.25    # Weight for safe unmarked nodes (to be kept)
   
   # Reward structure - Position rewards (ENHANCED for boundary avoidance)
   position_rewards:
