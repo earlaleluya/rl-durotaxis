@@ -388,6 +388,9 @@ class HybridActorCritic(nn.Module):
             backbone_cfg=backbone_cfg
         )
         
+        # Validate value heads match config (defensive check)
+        self._validate_value_heads()
+        
         # Parameter bounds for continuous actions from config
         # New action space: [delete_ratio, gamma, alpha, noise, theta]
         action_bounds_config = config.get('action_parameter_bounds', {
@@ -412,6 +415,70 @@ class HybridActorCritic(nn.Module):
         
         # Print parameter information for verification
         self._print_parameter_info(backbone_cfg)
+    
+    def _validate_value_heads(self):
+        """
+        Validate that critic value heads exactly match configured value_components.
+        
+        This defensive check catches config/architecture mismatches at initialization
+        rather than failing silently or crashing during training.
+        """
+        expected_components = set(self.value_components)
+        actual_heads = set(self.critic.value_heads.keys())
+        
+        if expected_components != actual_heads:
+            missing_heads = expected_components - actual_heads
+            extra_heads = actual_heads - expected_components
+            
+            error_msg = "❌ Value head configuration mismatch!\n"
+            if missing_heads:
+                error_msg += f"  Missing heads: {missing_heads}\n"
+            if extra_heads:
+                error_msg += f"  Extra heads: {extra_heads}\n"
+            error_msg += f"  Expected: {sorted(expected_components)}\n"
+            error_msg += f"  Actual: {sorted(actual_heads)}"
+            
+            raise ValueError(error_msg)
+        
+        # Success message
+        print(f"✅ Value head validation passed: {len(expected_components)} components")
+        for component in sorted(self.value_components):
+            print(f"   - {component}")
+    
+    def validate_component_weights(self, trainer_component_weights: Dict[str, float]) -> None:
+        """
+        Validate that trainer component weights are compatible with value heads.
+        
+        This method should be called by the trainer after initialization to ensure
+        that the critic can provide values for all weighted components.
+        
+        Args:
+            trainer_component_weights: Dictionary of component weights from trainer config
+            
+        Raises:
+            ValueError: If there are critical mismatches between components
+        """
+        vc_set = set(self.value_components)
+        tcw_set = set(trainer_component_weights.keys())
+        
+        # Check for components in trainer weights but not in value heads
+        missing_in_critic = tcw_set - vc_set
+        if missing_in_critic:
+            raise ValueError(
+                f"❌ Trainer component_weights has keys not present in critic value_components:\n"
+                f"  Missing in critic: {missing_in_critic}\n"
+                f"  Critic components: {sorted(vc_set)}\n"
+                f"  Trainer weights: {sorted(tcw_set)}"
+            )
+        
+        # Warn about components in value heads but not in trainer weights
+        missing_in_trainer = vc_set - tcw_set
+        if missing_in_trainer:
+            print(f"⚠️  WARNING: Value components not in trainer.component_weights (will use weight=0):")
+            for component in sorted(missing_in_trainer):
+                print(f"   - {component}")
+        else:
+            print(f"✅ Component weights validation passed: All {len(tcw_set)} components aligned")
     
     def _print_parameter_info(self, backbone_cfg: dict):
         """Print detailed parameter information for debugging and verification."""

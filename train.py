@@ -695,6 +695,9 @@ class DurotaxisTrainer:
             dropout_rate=actor_critic_config.get('dropout_rate', 0.1)
         ).to(self.device)
         
+        # Validate component weights match network value heads
+        self.network.validate_component_weights(self.component_weights)
+        
         # Enhanced Learnable Component Weighting System
         self._initialize_learnable_weights()
         
@@ -1053,6 +1056,92 @@ class DurotaxisTrainer:
             else:
                 stats['std'] = 1.0
     
+    def validate_reward_components(self, reward_components: Dict[str, float], step_info: str = "") -> None:
+        """
+        Validate reward components from environment to ensure consistency.
+        
+        Guards against:
+        1. Legacy components (edge_reward, total_node_reward) being returned
+        2. Missing expected components
+        3. graph_reward != total_reward inconsistency
+        4. Unexpected components from environment
+        
+        Args:
+            reward_components: Dict of reward components from env.step()
+            step_info: Optional context string for error messages (e.g., "Episode 5, Step 12")
+        
+        Raises:
+            ValueError: If validation fails
+        """
+        if not hasattr(self, '_env_validation_enabled'):
+            # Check config for validation flag (default: False for production, True for debugging)
+            trainer_config = self.config_loader.config.get('trainer', {})
+            self._env_validation_enabled = trainer_config.get('validate_env_rewards', False)
+        
+        if not self._env_validation_enabled:
+            return  # Validation disabled
+        
+        # Expected components (from config)
+        expected_components = set(self.component_names)
+        
+        # Actual components (from environment)
+        actual_components = set(reward_components.keys())
+        
+        # Allowed extra components (not in component_names but OK to have)
+        allowed_extras = {'milestone_bonus', 'termination_reward', 'termination_reward_scaled', 
+                          'empty_graph_recovery_penalty', 'num_nodes'}
+        
+        # Legacy components that should NOT be present
+        legacy_components = {'edge_reward', 'total_node_reward'}
+        
+        # Check 1: Detect legacy components
+        found_legacy = actual_components & legacy_components
+        if found_legacy:
+            raise ValueError(
+                f"❌ ENV VALIDATION ERROR {step_info}: "
+                f"Legacy components found in environment output: {found_legacy}\n"
+                f"   These components should NOT be returned by the environment.\n"
+                f"   Check durotaxis_env.py reward_breakdown construction."
+            )
+        
+        # Check 2: Verify all expected components are present (excluding allowed extras)
+        missing_components = expected_components - actual_components
+        if missing_components:
+            raise ValueError(
+                f"❌ ENV VALIDATION ERROR {step_info}: "
+                f"Missing expected components: {missing_components}\n"
+                f"   Expected: {expected_components}\n"
+                f"   Actual: {actual_components}\n"
+                f"   Check durotaxis_env.py ensures all components in reward_breakdown."
+            )
+        
+        # Check 3: Detect unexpected components (not expected and not allowed extras)
+        unexpected_components = actual_components - expected_components - allowed_extras
+        if unexpected_components:
+            print(
+                f"⚠️  ENV VALIDATION WARNING {step_info}: "
+                f"Unexpected components in environment output: {unexpected_components}\n"
+                f"   Expected: {expected_components}\n"
+                f"   Allowed extras: {allowed_extras}\n"
+                f"   Actual: {actual_components}"
+            )
+        
+        # Check 4: Verify graph_reward == total_reward (must be exactly equal)
+        if 'total_reward' in reward_components and 'graph_reward' in reward_components:
+            total = float(reward_components['total_reward'])
+            graph = float(reward_components['graph_reward'])
+            
+            # Allow tiny floating point differences
+            if abs(total - graph) > 1e-6:
+                raise ValueError(
+                    f"❌ ENV VALIDATION ERROR {step_info}: "
+                    f"graph_reward != total_reward inconsistency!\n"
+                    f"   total_reward: {total}\n"
+                    f"   graph_reward: {graph}\n"
+                    f"   difference: {abs(total - graph)}\n"
+                    f"   Check durotaxis_env.py ensures graph_reward = total_reward."
+                )
+
     def get_component_scaling_factors(self) -> Dict[str, float]:
         """
         Tier 2 Scaling: Cross-episode adaptive scaling factors
@@ -2485,6 +2574,12 @@ class DurotaxisTrainer:
             # Environment step
             next_obs, reward_components, terminated, truncated, info = self.env.step(0)
             done = terminated or truncated
+            
+            # Validate reward components (optional, controlled by config flag)
+            self.validate_reward_components(
+                reward_components, 
+                step_info=f"(Episode {self.current_episode}, Step {episode_length})"
+            )
 
             # Track environment-side empty graph recoveries for logging consistency
             if info.get('empty_graph_recovered'):

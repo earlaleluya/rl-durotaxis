@@ -9,8 +9,9 @@ This codebase implements a **Reinforcement Learning (RL) system** for simulating
 - **Graph Transformer Encoder:** PyTorch Geometric TransformerConv with edge-aware attention
 - **Edge Features (`edge_attr`):** 3D edge properties [distance, direction_x, direction_y] used in attention mechanism
 - **Continuous Action Space:** Delete-ratio architecture (5D: delete_ratio, gamma, alpha, noise, theta)
-- **Simplicial Embedding:** Optional geometric constraint layer for ablation studies
-- **Experimental Reward Modes:** Dense centroid-distance reward with adaptive terminal scaling
+- **Simplified Reward System:** Weighted composition of 3 core components (Delete > Spawn > Distance)
+- **Multi-Head Critic:** 5-head value function (total_reward, graph_reward, delete_reward, spawn_reward, distance_signal)
+- **Special Ablation Modes:** Configurable modes to isolate specific reward components for targeted studies
 
 ---
 
@@ -67,9 +68,8 @@ This codebase implements a **Reinforcement Learning (RL) system** for simulating
 config.yaml
     │
     ├─▶ trainer: Training parameters (episodes, learning rate, batch size)
-    ├─▶ environment: Environment setup (substrate size, node limits, rewards)
-    ├─▶ actor_critic: Network architecture (hidden dims, action spaces)
-    ├─▶ curriculum_learning: Progressive difficulty stages
+    ├─▶ environment: Env setup (substrate size, node limits, reward weights)
+    ├─▶ actor_critic: Network architecture (hidden dims, value components)
     ├─▶ algorithm: PPO parameters (gamma, GAE, clipping)
     └─▶ system: Device configuration (CUDA/CPU)
             │
@@ -151,11 +151,11 @@ This diagram shows the detailed RL interaction cycle between the environment, ac
     │                        │  │      'graph_reward'       │
     │  Continuous params:    │  │      'spawn_reward'       │
     │  [delete_ratio, γ,     │  │      'delete_reward'      │
-    │   α, noise, θ]        │  │      'edge_reward'        │
-    │                        │  │      'total_node_reward'  │
+    │   α, noise, θ]        │  │      'distance_signal'    │
     │                        │  │    }                      │
+    │                        │  │    (graph=total alias)    │
     └───────────┬────────────┘  │  Multi-component values   │
-                │                │  [1, 6]                   │
+                │                │  [1, 5]                   │
                 │                └───────────┬───────────────┘
                 │                            │
                 ▼                            │
@@ -209,10 +209,11 @@ This diagram shows the detailed RL interaction cycle between the environment, ac
             │         ENVIRONMENT OUTPUTS          │
             │                                      │
             │  • s_{t+1}: Next state               │
-            │  • r_t: Reward (6 components)        │
+            │  • r_t: Reward (5 components)        │
             │    {total_reward, graph_reward,      │
             │     spawn_reward, delete_reward,     │
-            │     edge_reward, total_node_reward}  │
+            │     distance_signal}                 │
+            │    Note: graph = total (alias)       │
             │  • done: Episode termination flag    │
             │  • info: Additional metadata         │
             └──────────────┬───────────────────────┘
@@ -242,7 +243,8 @@ This diagram shows the detailed RL interaction cycle between the environment, ac
         │         COMPUTE ADVANTAGES & RETURNS                     │
         │         (Generalized Advantage Estimation - GAE)         │
         │                                                           │
-        │  For each component c in {total, graph, spawn, ...}:     │
+        │  For each component c in {total, graph, spawn,           │
+        │                           delete, distance}:             │
         │                                                           │
         │  1. Compute TD errors δ_t^c:                             │
         │     δ_t^c = r_t^c + γ*V^c(s_{t+1}) - V^c(s_t)           │
@@ -533,63 +535,35 @@ STEP FUNCTION WORKFLOW:
   ┌─────────────────────────────────────────────────────────┐
   │ 3. COMPUTE REWARD COMPONENTS                             │
   │                                                           │
-  │    **EXPERIMENTAL REWARD MODES** (mutually exclusive):   │
+  │    **SIMPLIFIED REWARD SYSTEM**:                         │
   │                                                           │
-  │    A) NORMAL MODE (default):                             │
-  │       All standard reward components enabled             │
+  │    Three core components with explicit priority:         │
   │                                                           │
-  │    B) CENTROID DISTANCE ONLY MODE:                       │
-  │       environment.centroid_distance_only_mode: true      │
-  │       ├─▶ Dense delta-distance reward: scale × (cx_t - cx_{t-1}) / goal_x │
-  │       ├─▶ Potential-based shaping (preserves optimal policy) │
-  │       ├─▶ Terminal rewards scaled down (×0.02) to avoid domination │
-  │       └─▶ Adaptive scheduler: reduces terminal scale as progress improves │
+  │    A) DELETE REWARD (weight: 1.0) - Highest priority     │
+  │       ├─▶ Proper deletion bonus (remove leftmost)        │
+  │       ├─▶ Improper deletion penalty                      │
+  │       └─▶ Persistence penalty (keeping flagged nodes)    │
   │                                                           │
-  │    C) SIMPLE DELETE-ONLY MODE (deprecated):              │
-  │       environment.simple_delete_only_mode: true          │
-  │       Only penalties + termination rewards               │
+  │    B) SPAWN REWARD (weight: 0.75) - Medium priority      │
+  │       ├─▶ Spawn success reward                           │
+  │       ├─▶ Spawn failure penalty                          │
+  │       └─▶ Near-boundary spawn penalty                    │
   │                                                           │
-  │    ─────────────────────────────────────────────────────│
-  │    NORMAL MODE REWARDS:                                  │
+  │    C) DISTANCE SIGNAL (weight: 0.5) - Lower priority     │
+  │       ├─▶ Centroid movement (rightward progress)         │
+  │       ├─▶ Milestone rewards (25%, 50%, 75%, 90%)         │
+  │       └─▶ Termination rewards (success/failure)          │
   │                                                           │
-  │    Graph Rewards:                                        │
-  │    ├─▶ connectivity_penalty (nodes < 2)                  │
-  │    ├─▶ growth_penalty (nodes > max_critical_nodes)       │
-  │    ├─▶ survival_reward (per step)                        │
-  │    └─▶ centroid_movement_reward (rightward progress)     │
+  │    Total reward composition:                             │
+  │    total_reward = 1.0*delete + 0.75*spawn + 0.5*distance │
+  │    graph_reward = total_reward (explicit alias)          │
   │                                                           │
-  │    Node Rewards:                                         │
-  │    ├─▶ movement_reward (rightward movement per node)     │
-  │    ├─▶ intensity_bonus/penalty (substrate interaction)   │
-  │    ├─▶ leftward_penalty (discourage left movement)       │
-  │    └─▶ position_rewards (boundary awareness + safe zones)│
-  │                                                           │
-  │    Edge Rewards:                                         │
-  │    ├─▶ rightward_bonus (edges pointing right)            │
-  │    └─▶ leftward_penalty (edges pointing left)            │
-  │                                                           │
-  │    Delete Rewards (delete_ratio action):                 │
-  │    ├─▶ proper_deletion_reward (delete leftmost nodes)    │
-  │    ├─▶ persistence_penalty (keeping flagged nodes)       │
-  │    └─▶ improper_deletion_penalty (delete non-flagged)    │
-  │                                                           │
-  │    Spawn Rewards (via gamma/alpha/noise/theta):          │
-  │    ├─▶ spawn_success_reward                              │
-  │    ├─▶ spawn_failure_penalty                             │
-  │    └─▶ spawn_near_boundary_penalty (prevent risky spawns)│
-  │                                                           │
-  │    Milestone Rewards:                                    │
-  │    ├─▶ distance_25_percent: +50.0 (reached 25% of width) │
-  │    ├─▶ distance_50_percent: +150.0 (reached 50%)         │
-  │    ├─▶ distance_75_percent: +300.0 (reached 75%)         │
-  │    └─▶ distance_90_percent: +500.0 (almost at goal)      │
-  │                                                           │
-  │    Termination Rewards:                                  │
-  │    ├─▶ success_reward: +500.0 (reached goal!)            │
-  │    ├─▶ out_of_bounds_penalty: -100.0 (boundary violation)│
-  │    ├─▶ no_nodes_penalty: -100.0 (lost all nodes)         │
-  │    ├─▶ leftward_drift_penalty: -50.0 (persistent left)   │
-  │    └─▶ timeout_penalty: 0.0 (no penalty for exploration) │
+  │    **SPECIAL ABLATION MODES**:                           │
+  │    Configurable modes to isolate components for study:   │
+  │    - Centroid distance only mode                         │
+  │    - Delete-only mode                                    │
+  │    - Spawn-only mode                                     │
+  │    (See reward_mode CLI guide for details)               │
   └─────────────────────────────────────────────────────────┘
         │
         ▼
@@ -706,14 +680,14 @@ INPUT: Graph State
 │  │ Outputs: │  │  │  │ Outputs: │  │    └─────────────────────┘
 │  │          │  │  │  │          │  │
 │  │continuous│  │  │  │  values  │  │
-│  │   mu     │  │  │  │  (6 comp)│  │
+│  │   mu     │  │  │  │  (5 comp)│  │
 │  │  [N, 5]  │  │  │  │          │  │
 │  │          │  │  │  │ - total  │  │
 │  │continuous│  │  │  │ - graph  │  │
-│  │  logstd  │  │  │  │ - spawn  │  │
-│  │  [N, 5]  │  │  │  │ - delete │  │
-│  │          │  │  │  │ - edge   │  │
-│  │          │  │  │  │ - node   │  │
+│  │  logstd  │  │  │  │   (alias)│  │
+│  │  [N, 5]  │  │  │  │ - spawn  │  │
+│  │          │  │  │  │ - delete │  │
+│  │          │  │  │  │ -distance│  │
 │  │          │  │  │  │          │  │
 │  └──────────┘  │  │  └──────────┘  │
 └─────────────────┘  └─────────────────┘
@@ -731,7 +705,7 @@ ACTOR OUTPUT PROCESSING:
       └─ Stage 2: Learn all 5 continuous actions (delete_ratio + spawn params)
 
 CRITIC OUTPUT:
-  └─▶ value_predictions: dict with 6 components
+  └─▶ value_predictions: dict with 5 components (graph=total alias)
       - Used for multi-objective advantage estimation
 ```
 
@@ -750,8 +724,8 @@ INPUT: Minibatch of transitions
   ├─ actions: [B, ...]
   ├─ old_log_probs: [B]
   ├─ advantages: [B]
-  ├─ returns: [B, 6]  (6 reward components)
-  └─ old_values: [B, 6]
+  ├─ returns: [B, 5]  (5 reward components)
+  └─ old_values: [B, 5]
 
         │
         ▼
@@ -763,7 +737,7 @@ INPUT: Minibatch of transitions
 │     ├─ discrete_log_probs: [B]                                  │
 │     ├─ continuous_log_probs: [B]                                │
 │     ├─ total_log_probs: [B]                                     │
-│     ├─ value_predictions: [B, 6]                                │
+│     ├─ value_predictions: [B, 5]                                │
 │     └─ entropy: scalar                                           │
 └─────────────────────────────────────────────────────────────────┘
         │
@@ -970,24 +944,22 @@ action_bounds = {
     'theta': [-0.5236, 0.5236]         # Migration angle (-π/6 to π/6, -30° to +30°)
 }
 
-# Reward Dictionary (multi-component)
+# Reward Dictionary (5 components, graph=total alias)
 rewards = {
-    'total_reward': float,
-    'graph_reward': float,
-    'spawn_reward': float,
-    'delete_reward': float,
-    'edge_reward': float,
-    'total_node_reward': float
+    'total_reward': float,              # Weighted sum (1.0*d + 0.75*s + 0.5*dist)
+    'graph_reward': float,              # Explicit alias of total_reward
+    'spawn_reward': float,              # Spawn component (weight: 0.75)
+    'delete_reward': float,             # Delete component (weight: 1.0)
+    'distance_signal': float            # Distance component (weight: 0.5)
 }
 
-# Value Predictions (multi-component)
+# Value Predictions (5 independent heads)
 value_predictions = {
-    'total_reward': torch.Tensor,       # [1]
-    'graph_reward': torch.Tensor,       # [1]
-    'spawn_reward': torch.Tensor,       # [1]
-    'delete_reward': torch.Tensor,      # [1]
-    'edge_reward': torch.Tensor,        # [1]
-    'total_node_reward': torch.Tensor   # [1]
+    'total_reward': torch.Tensor,       # [1] - Critic weight: 1.0
+    'graph_reward': torch.Tensor,       # [1] - Critic weight: 0.4
+    'spawn_reward': torch.Tensor,       # [1] - Critic weight: 0.3
+    'delete_reward': torch.Tensor,      # [1] - Critic weight: 0.3
+    'distance_signal': torch.Tensor     # [1] - Critic weight: 0.3
 }
 ```
 
@@ -1081,9 +1053,11 @@ $ python train_cli.py --total-episodes 2000 --learning-rate 0.0003
 ## Key Design Patterns
 
 ### 1. **Multi-Component Value Learning**
-- Separate value heads for 6 reward components
-- Adaptive weighting based on component variance
-- Attention-based dynamic weighting
+- Separate value heads for 5 reward components:
+  - total_reward, graph_reward (alias), delete_reward, spawn_reward, distance_signal
+- Environment priority weights: delete=1.0 > spawn=0.75 > distance=0.5
+- Critic learning weights: total=1.0, graph=0.4, others=0.3
+- Policy uses weighted composition of ALL component advantages
 - Value clipping for stable PPO updates
 
 ### 2. **Delete-Ratio Action Architecture (Current)**
@@ -1099,13 +1073,16 @@ $ python train_cli.py --total-episodes 2000 --learning-rate 0.0003
 - **Enriched features:** 19 graph-level, 11 node-level, 3 edge-level dimensions
 - **Optional Simplicial Embedding (SEM):** Group-wise softmax for geometric constraints
 
-### 4. **Experimental Reward Modes**
-- **Normal Mode:** Full reward structure (graph, node, edge, spawn, delete, milestones)
-- **Centroid Distance Only Mode:** Dense delta-distance reward with adaptive terminal scaling
-  - Potential-based shaping preserves optimal policy
-  - Adaptive scheduler reduces terminal reward scale as progress improves
-  - Config: `environment.centroid_distance_only_mode: true`
-- **Simple Delete-Only Mode (Deprecated):** Penalties + termination only
+### 4. **Reward System Architecture**
+- **Core Components:** 3 weighted components (Delete, Spawn, Distance)
+  - Environment priority weights: delete=1.0 > spawn=0.75 > distance=0.5
+  - Critic learning weights: total=1.0, graph=0.4, others=0.3
+  - graph_reward = total_reward (explicit alias prevents contradictory signals)
+- **Special Ablation Modes:** Configurable modes to isolate components:
+  - Centroid distance only mode: `environment.centroid_distance_only_mode: true`
+  - Delete-only mode: Isolate deletion behavior
+  - Spawn-only mode: Isolate spawning behavior
+  - (See REWARD_MODE_CLI_GUIDE.md for detailed usage)
 
 ### 5. **Curriculum Learning**
 - 3 progressive stages with adaptive transitions

@@ -1,243 +1,234 @@
-# Configuration file for Durotaxis Reinforcement Learning Training
-# This file contains default parameters for all necessary classes used in DurotaxisTrainer
+# ============================================================================
+# Durotaxis RL Configuration File
+# ============================================================================
+# Organized configuration for the refactored reward system
+# Core components: Delete (Priority 1), Spawn (Priority 2), Distance (Priority 3)
 
 # ============================================================================
-# DurotaxisTrainer Configuration
+# ENVIRONMENT CONFIGURATION
+# ============================================================================
+environment:
+  # Basic parameters
+  substrate_size: [600, 400]
+  substrate_params:
+    m: 0.01
+    b: 1.0
+  
+  # Node and topology limits
+  init_num_nodes: 5
+  max_critical_nodes: 50
+  threshold_critical_nodes: 200
+  max_steps: 1000
+  
+  # Simulation parameters
+  delta_time: 3
+  delta_intensity: 2.50
+  consecutive_left_moves_limit: 30
+  
+  # Visualization
+  flush_delay: 0.0001
+  enable_visualization: false
+  
+  # ============================================================================
+  # REWARD MODES (Special Modes for Ablation Studies)
+  # ============================================================================
+  # Normal mode (all three disabled): Delete + Spawn + Distance
+  # Special modes: Enable ONE or MORE for ablation studies
+  simple_delete_only_mode: false
+  simple_spawn_only_mode: false
+  centroid_distance_only_mode: false
+  include_termination_rewards: false
+  
+  # ============================================================================
+  # REWARD WEIGHTS (Priority: Delete > Spawn > Distance)
+  # ============================================================================
+  # Environment-level weights applied when composing total reward
+  # Makes priority explicit in the task reward, not just critic loss weights
+  reward_weights:
+    delete_weight: 1.0      # Priority 1: Full weight for deletion compliance
+    spawn_weight: 0.75      # Priority 2: Reduced weight for spawning behavior
+    distance_weight: 0.5    # Priority 3: Lower weight for distance signal
+  
+  # ============================================================================
+  # CORE REWARD COMPONENTS (Refactored System)
+  # ============================================================================
+  # Priority: Delete > Spawn > Distance
+  
+  # Delete Reward (Priority 1: Proper deletion compliance)
+  delete_reward:
+    proper_deletion: 2.0
+    persistence_penalty: 2.0
+    improper_deletion_penalty: 2.0
+    
+    # PBRS: Potential-Based Reward Shaping (optional)
+    # Higher shaping_coeff reinforces priority when enabled
+    pbrs:
+      enabled: false
+      shaping_coeff: 0.1              # Higher than spawn (0.1 vs 0.05)
+      phi_weight_pending_marked: 1.0
+      phi_weight_safe_unmarked: 0.25
+  
+  # Spawn Reward (Priority 2: Intensity-based spawning)
+  # Uses same magnitude for both simple and normal modes
+  spawn_rewards:
+    spawn_success_reward: 2.0     
+    spawn_failure_penalty: 2.0     
+    
+    # PBRS: Potential-Based Reward Shaping (optional)
+    # Lower shaping_coeff than delete reinforces priority when enabled
+    pbrs:
+      enabled: false
+      shaping_coeff: 0.05             # Lower than delete (0.05 vs 0.1)
+      phi_weight_spawnable: 1.0
+  
+  # Distance Reward (Priority 3: Centroid movement toward goal)
+  distance_mode:
+    use_delta_distance: true
+    distance_reward_scale: 5.0
+    
+    # Termination reward handling
+    terminal_reward_scale: 0.02
+    clip_terminal_rewards: true
+    terminal_reward_clip_value: 10.0
+
+  
+  # ============================================================================
+  # TERMINATION REWARDS
+  # ============================================================================
+  termination_rewards:
+    success_reward: 500.0
+    out_of_bounds_penalty: -100.0
+    no_nodes_penalty: -100.0
+    leftward_drift_penalty: -50.0
+    timeout_penalty: 0.0
+    critical_nodes_penalty: -15.0
+  
+  # ============================================================================
+  # OBSERVATION SELECTION
+  # ============================================================================
+  observation_selection:
+    method: topk_x
+    w_x: 1.0
+    w_intensity: 0.0
+    w_norm: 0.0
+
+# ============================================================================
+# NETWORK ARCHITECTURE
+# ============================================================================
+encoder:
+  out_dim: 128
+  num_layers: 4
+
+actor_critic:
+  hidden_dim: 128
+  continuous_dim: 5
+  dropout_rate: 0.2
+  pretrained_weights: 'imagenet'
+  
+  # Backbone configuration
+  backbone:
+    input_adapter: 1ch_conv
+    freeze_mode: all
+    backbone_lr: 1.0e-4
+    head_lr: 3.0e-4
+  
+  # Action parameter bounds
+  action_parameter_bounds:
+    delete_ratio: [0.0, 0.9]
+    gamma: [0.5, 15.0]
+    alpha: [0.5, 4.0]
+    noise: [0.05, 0.5]
+    theta: [-0.5236, 0.5236]  # -30 to 30 deg
+  
+  # Value function components
+  value_components:
+    - 'total_reward'
+    - 'graph_reward'
+    - 'spawn_reward'
+    - 'delete_reward'
+    - 'distance_signal'
+  
+  # Simplicial Embedding
+  simplicial_embedding:
+    enabled: true
+    num_groups: 16
+    temperature: 1.0
+
+# ============================================================================
+# TRAINING ALGORITHM
+# ============================================================================
+algorithm:
+  gamma: 0.99
+  gae_lambda: 0.95
+  ppo_epochs: 4
+  clip_epsilon: 0.1
+  value_loss_coeff: 0.5
+  max_grad_norm: 0.5
+
+# ============================================================================
+# TRAINER CONFIGURATION
 # ============================================================================
 trainer:
-  # Training parameters
-  # Total number of episodes for the whole training run.
-  # Note: When `curriculum_learning.enable_curriculum` is true the trainer will
-  # automatically scale curriculum stage durations to this value. If you change
-  # this number (for example to 10000), the curriculum stages will be resized
-  # proportionally so the curriculum covers the full training run.
+  substrate_type: random
   total_episodes: 1000
   max_steps: 1000
-  learning_rate: 0.0001   
+  learning_rate: 0.0001
   save_dir: "./training_results"
   
-  # Resume training configuration
+  # Resume training
   resume_training:
-    enabled: false                      # Set to true to resume from checkpoint
-    checkpoint_path: ""               # Path to checkpoint file (e.g., "./training_results/run0001/best_model_batch1.pt")
-    resume_from_best: false             # If true, resume from best_model.pt instead of checkpoint
-    reset_optimizer: true              # If true, create fresh optimizer (useful if changing learning rate)
-    reset_episode_count: true          # If true, restart episode counter from 0
+    enabled: false
+    checkpoint_path: ""
+    resume_from_best: false
+    reset_optimizer: true
+    reset_episode_count: true
   
-  # ============================================================================
-  # MODEL SELECTION - Best Model Checkpointing Strategy
-  # ============================================================================
-  # Determines which metric to use for identifying the "best" model checkpoint.
-  # Uses a hierarchical system: primary → secondary → tertiary for tie-breaking.
+  # Model selection
   model_selection:
-    # Primary metric: Success rate (goal achievement)
-    primary_metric: success_rate       # Fraction of episodes that reach the goal
-    primary_weight: 1000.0              # High weight for prioritization
-    
-    # Secondary metric: Progress (how far the agent gets)
-    secondary_metric: progress         # Mean final_centroid_x / goal_x
-    secondary_weight: 100.0             # Medium weight
-    
-    # Tertiary metric: Return (episodic reward sum)
-    tertiary_metric: return_mean       # Mean episodic return
-    tertiary_weight: 1.0                # Low weight (tie-breaker)
-    
-    # Averaging window for computing metrics
-    window_episodes: 50                 # Average over last 50 episodes for stability
-    
-    # Improvement threshold (hysteresis to avoid frequent saves)
-    min_improvement: 0.01               # Save only if composite score improves by ≥1%
-    
-    # Warmup: Prevent "best at batch 0" issue
-    min_episode_for_best_save: 50      # Don't save best model before episode 50
+    primary_metric: success_rate
+    primary_weight: 1000.0
+    secondary_metric: progress
+    secondary_weight: 100.0
+    tertiary_metric: return_mean
+    tertiary_weight: 1.0
+    window_episodes: 50
+    min_improvement: 0.01
+    min_episode_for_best_save: 50
   
-  # ============================================================================
-  # LEARNING RATE SCHEDULE
-  # ============================================================================
-  # Warmup + decay prevents early training instability and improves convergence
-  warmup_updates_for_best: 5           # Require at least 5 updates before saving best model
-  lr_warmup_updates: 200               # Linear warmup for first 200 updates
-  lr_total_updates: 10000              # Total updates for cosine decay schedule
+  # Learning rate schedule
+  warmup_updates_for_best: 5
+  lr_warmup_updates: 200
+  lr_total_updates: 10000
   
-  # ============================================================================
-  # CURRICULUM LEARNING SYSTEM - Progressive Migration Training
-  # ============================================================================
-  # This curriculum works WITH the new reward structure to progressively
-  # guide the agent from basic survival to successful rightmost migration
-  curriculum_learning:
-    enable_curriculum: false           # Enable progressive learning stages
-    
-    # Stage 1: Survival & Basic Movement (Episodes 0-200)
-    # GOAL: Learn to stay alive and move rightward without catastrophic failures
-    stage_1_navigation:
-      episode_start: 0
-      episode_end: 200
-      focus: "survival_and_movement"
-      description: "Master survival, avoid boundaries, and learn rightward movement"
-      
-      # Simplified environment for early learning
-      max_nodes_allowed: 30           # Moderate complexity (was 5, too restrictive)
-      simplified_actions: false       # Keep full actions to learn properly
-      
-      # Stage 1: Emphasize survival and basic movement
-      reward_multipliers:
-        survival_reward: 2.0          # 2x survival bonus (important but not dominant)
-        movement_reward: 3.0          # 3x movement reward (PRIMARY GOAL: move right!)
-        centroid_movement_reward: 3.0 # 3x centroid reward (collective rightward movement!)
-        boundary_penalty: 5.0         # 5x boundary penalty (avoid catastrophe)
-        milestone_rewards: 2.0        # 2x milestone rewards (celebrate progress)
-        
-      # Success criteria for stage 1
-      success_criteria:
-        min_episode_length: 50        # Survive at least 50 steps
-        max_boundary_violations: 2    # Allow some exploration mistakes
-        min_rightward_progress: 50.0  # Must reach 50 units right (approx 8% of 600)
-        min_centroid_x: 100.0         # Centroid must reach x=100
-        
-    # Stage 2: Distance Milestones (Episodes 201-500)  
-    # GOAL: Reach progressive distance milestones (25%, 50%, 75%)
-    stage_2_management:
-      episode_start: 201
-      episode_end: 500
-      focus: "milestone_achievement"
-      description: "Reach 25%, 50%, and 75% distance milestones consistently"
-      
-      # Increased complexity for intermediate learning
-      max_nodes_allowed: 50           # Standard complexity (was 15)
-      unlock_advanced_actions: true   # Full action space
-      
-      # Stage 2: Emphasize milestone achievement and sustained movement
-      reward_multipliers:
-        survival_reward: 2.0          # Still important but reduced
-        movement_reward: 1.5          # Still rewarded
-        centroid_movement_reward: 2.5 # 2.5x centroid (group progress crucial)
-        milestone_rewards: 3.0        # 3x milestone rewards (primary focus!)
-        spawn_success_reward: 1.5     # 1.5x spawn (efficient expansion)
-        delete_reward: 2.5            # 2.5x delete reward (learn node management!)
-        intensity_bonus: 2.0          # 2x intensity bonus (seek better substrate)
-        
-      # Success criteria for stage 2
-      success_criteria:
-        min_episode_length: 100       # Longer episodes required
-        max_boundary_violations: 1    # Fewer mistakes allowed
-        min_rightward_progress: 150.0 # Must reach 150 units (25% of 600)
-        milestone_25_percent: true    # Must trigger 25% milestone
-        milestone_50_percent: true    # Aim for 50% milestone
-        
-    # Stage 3: Goal Achievement (Episodes 501-1000)
-    # GOAL: Consistently reach the rightmost substrate (100% success)
-    stage_3_optimization:
-      episode_start: 501
-      episode_end: 1000
-      focus: "goal_completion"
-      description: "Master full migration to rightmost substrate"
-      
-      # Full complexity for final mastery
-      max_nodes_allowed: 75           # Maximum capacity (was 50)
-      enable_all_constraints: true    # Full problem complexity
-      
-      # Stage 3: Balanced rewards with emphasis on goal completion
-      reward_multipliers:
-        survival_reward: 1.5          # Reduced but still present
-        movement_reward: 1.0          # Standard (well-learned by now)
-        centroid_movement_reward: 2.0 # Still important for group coordination
-        milestone_rewards: 1.5        # Reduced (should be easy now)
-        success_reward: 2.0           # 2x success reward (MAIN GOAL!)
-        spawn_success_reward: 1.2     # Slightly boosted for efficiency
-        delete_reward: 1.5            # 1.5x delete reward (maintain efficiency)
-        efficiency_bonus: 3.0         # 3x efficiency (optimize path)
-        
-      # Success criteria for stage 3  
-      success_criteria:
-        min_episode_length: 200       # Long sustainable episodes
-        max_boundary_violations: 0    # No violations in final stage
-        min_rightward_progress: 450.0 # Must reach 450+ units (75%+)
-        completion_rate: 0.15         # 15% success rate to advance
-        milestone_90_percent: true    # Must trigger 90% milestone
-        efficiency_threshold: 0.7     # 70% efficiency required
-        
-  # Curriculum progression settings - ALIGNED WITH NEW REWARD STRUCTURE
-  curriculum_progression:
-    auto_advance: true                # Automatically advance stages
-    advancement_criteria: "mixed"     # Use both success rate AND episode thresholds
-    min_success_rate: 0.10           # 10% success rate to advance (was 60%, too strict)
-    evaluation_window: 100           # Evaluate over last 100 episodes (more stable)
-    allow_early_advance: true        # Allow advancing if criteria met before episode_end
-    force_advance_at_end: true       # Always advance at episode_end regardless of performance
-    # Overlap control between stages:
-    # - You may provide `stage_overlap` (absolute number of episodes to overlap)
-    # - OR provide `curriculum_overlap_pct` (fraction 0..1) which will be applied
-    #   proportionally to each stage after scaling. When both are present, the
-    #   fractional option `curriculum_overlap_pct` takes precedence.
-    # Example: curriculum_overlap_pct: 0.02 -> 2% overlap of each stage length
-    stage_overlap: 50                # 50 episode overlap for gradual transition
-    # Optional proportional overlap (fraction of stage length). Use instead of stage_overlap.
-    # curriculum_overlap_pct: 0.05
-    
-  # Reward shaping system - ALIGNED WITH MIGRATION GOAL
-  reward_shaping:
-    enable_progressive_shaping: true  # Enable progressive reward shaping
-    stage_specific_bonuses: true     # Enable stage-specific bonus rewards
-    milestone_rewards: true          # Enable milestone achievement rewards
-    
-    # Milestone definitions - FOCUSED ON MIGRATION PROGRESS
-    milestones:
-      first_survival_50_steps: 30.0        # Bonus for first 50+ step episode (Stage 1)
-      first_survival_100_steps: 50.0       # Bonus for first 100+ step episode (Stage 2)
-      first_rightward_50_units: 40.0       # Bonus for reaching 50 units right (Stage 1)
-      first_rightward_150_units: 60.0      # Bonus for reaching 150 units (25%) (Stage 2)
-      first_rightward_300_units: 100.0     # Bonus for reaching 300 units (50%) (Stage 2)
-      first_rightward_450_units: 150.0     # Bonus for reaching 450 units (75%) (Stage 3)
-      boundary_violation_free: 40.0        # Bonus for episode without violations
-      first_milestone_25_percent: 80.0     # Bonus for triggering first 25% milestone
-      first_milestone_50_percent: 120.0    # Bonus for triggering first 50% milestone
-      first_milestone_75_percent: 180.0    # Bonus for triggering first 75% milestone
-      first_milestone_90_percent: 250.0    # Bonus for triggering first 90% milestone
-      task_completion: 300.0               # HUGE bonus for first goal completion!
+  # Batch training
+  rollout_collection_mode: "steps"
+  rollout_steps: 2048
+  rollout_batch_size: 10
+  update_epochs: 4
+  minibatch_size: 64
   
-  # Loss weighting and optimization
-  entropy_bonus_coeff: 0.03        # Moderate reduction from original 0.05 for better balance
-  weight_momentum: 0.9
-  normalize_weights_every: 10
+  # Value clipping
+  enable_value_clipping: true
+  value_clip_epsilon: 0.2
   
-  # Batch training configuration
-  rollout_collection_mode: "steps"  # "steps" or "episodes". "steps" is recommended for stable training.
-  rollout_steps: 2048               # Target number of steps to collect per batch (if mode is "steps")
-  rollout_batch_size: 10            # Number of episodes to collect per batch (if mode is "episodes")
-  update_epochs: 4                  # Number of update epochs per batch
-  minibatch_size: 64                # Size of minibatches during updates
-  
-  # Value clipping configuration
-  enable_value_clipping: true # Enable PPO-style value clipping for stable training
-  value_clip_epsilon: 0.2     # Clipping range for value predictions (0.1-0.3 typical)
-  
-  # Logging and checkpointing
+  # Logging
   moving_avg_window: 20
   log_every: 50
   progress_print_every: 5
-  checkpoint_every: null  # Set to integer for periodic checkpoints, null for disabled
+  checkpoint_every: null
   
-  # Detailed node logging configuration
+  # Detailed logging
   detailed_logging:
-    enable_detailed_logging: true      # Enable comprehensive node tracking per step
-    save_detailed_logs_to_json: true   # Save detailed logs to JSON files
-    single_file_mode: true             # Save all episodes to one JSON file (vs separate files)
-    log_node_positions: true           # Include node x,y positions
-    log_spawn_parameters: true         # Include gamma, alpha, noise, theta values
-    log_persistent_ids: true           # Include persistent node IDs
-    log_connectivity: false            # Include degree and neighbor information
-    log_substrate_values: false        # Include substrate values at node positions
-    compress_logs: false               # Compress JSON files (reduces file size)
-    max_log_file_size_mb: 50           # Maximum size per log file in MB
-  
-  # Environment setup parameters
-  substrate_type: 'linear'  # 'linear', 'exponential', or 'random'
-  
-  # Empty graph handling configuration
-  empty_graph_handling:
-    enable_graceful_recovery: false  # Enable graceful handling instead of breaking episodes
-    recovery_num_nodes: 5           # Number of nodes to spawn when recovering from empty graph
-    log_recoveries: true            # Log when empty graph recovery occurs
+    enable_detailed_logging: true
+    save_detailed_logs_to_json: true
+    single_file_mode: true
+    log_node_positions: true
+    log_spawn_parameters: true
+    log_persistent_ids: true
+    log_connectivity: false
+    log_substrate_values: false
+    compress_logs: false
+    max_log_file_size_mb: 50
   
   # Encoder configuration
   encoder_hidden_dim: 128
@@ -246,454 +237,93 @@ trainer:
   
   # Random substrate parameter ranges (only used when substrate_type='random')
   random_substrate:
-    linear_m_range: [0.01, 0.1]    # Slope range for linear substrate
-    linear_b_range: [0.5, 2.0]     # Intercept range for linear substrate
-    exponential_m_range: [0.01, 0.05]  # Growth rate range for exponential substrate
-    exponential_b_range: [0.5, 1.5]    # Base value range for exponential substrate
+    linear_m_range: [0.01, 0.1]           # Slope range for linear substrate
+    linear_b_range: [0.5, 2.0]            # Intercept range for linear substrate
+    exponential_m_range: [0.01, 0.05]     # Growth rate range for exponential substrate
+    exponential_b_range: [0.5, 1.5]       # Base value range for exponential substrate
   
-  # Component weights for multi-objective learning (adaptive)
+  # Optimization
+  entropy_bonus_coeff: 0.03
+  weight_momentum: 0.9
+  normalize_weights_every: 10
+  
+  # Component weights (for multi-head value function)
   component_weights:
     total_reward: 1.0
     graph_reward: 0.4
     spawn_reward: 0.3
-    delete_reward: 0.2
-    edge_reward: 0.2
-    total_node_reward: 0.3
+    delete_reward: 0.3
+    distance_signal: 0.3
   
-  # Policy loss weights (continuous actions only)
+  # Policy loss weights
   policy_loss_weights:
-    continuous_weight: 1.0   # Weight for continuous actions (delete_ratio architecture)
-    entropy_weight: 0.01     # Exploration bonus weight
+    continuous_weight: 1.0
+    entropy_weight: 0.01
   
-  # Adaptive gradient scaling (continuous-only action space)
+  # Gradient scaling
   gradient_scaling:
-    enable_adaptive_scaling: true    # Enable intelligent gradient balancing
-    gradient_norm_target: 1.0        # Target gradient norm for balancing
-    scaling_momentum: 0.9            # EMA momentum for gradient norm tracking
-    min_scaling_factor: 0.1          # Minimum scaling to prevent collapse
-    max_scaling_factor: 10.0         # Maximum scaling to prevent explosion
-    warmup_steps: 100                # Steps to establish baseline gradient norms
+    enable_adaptive_scaling: true
+    gradient_norm_target: 1.0
+    scaling_momentum: 0.9
+    min_scaling_factor: 0.1
+    max_scaling_factor: 10.0
+    warmup_steps: 100
   
-  # Adaptive reward scaling
+  # Adaptive scaling
   adaptive_scaling:
     enable_adaptive_scaling: true
     scaling_warmup_episodes: 50
-    
-  # Reward normalization system (two-tier approach) - STRENGTHENED
+  
+  # Reward normalization
   reward_normalization:
-    enable_per_episode_norm: true     # Tier 1: Per-episode normalization
-    enable_cross_episode_scaling: true  # Tier 2: Cross-episode adaptive scaling
-    min_episode_length: 3             # Reduced for more frequent normalization
-    normalization_method: 'zscore'    # Changed to zscore for stronger normalization
-    
-  # Enhanced learnable advantage weighting system
+    enable_per_episode_norm: true
+    enable_cross_episode_scaling: true
+    min_episode_length: 3
+    normalization_method: 'zscore'
+  
+  # Advantage weighting
   advantage_weighting:
-    enable_learnable_weights: true    # Enable learnable component weights
-    enable_attention_weighting: true  # Enable attention-based dynamic weighting
-    weight_learning_rate: 0.01        # Learning rate for component weights
-    weight_regularization: 0.001      # L2 regularization for weight stability
-    
-  # Enhanced entropy regularization system (continuous actions only)
+    enable_learnable_weights: true
+    enable_attention_weighting: true
+    weight_learning_rate: 0.01
+    weight_regularization: 0.001
+  
+  # Entropy regularization
   entropy_regularization:
-    enable_adaptive_entropy: true     # Enable adaptive entropy scheduling
-    entropy_coeff_start: 0.25         # Starting entropy coefficient (high exploration)
-    entropy_coeff_end: 0.05           # Ending entropy coefficient (low exploration)
-    entropy_decay_episodes: 300       # Episodes over which to decay entropy
-    continuous_entropy_weight: 1.0    # Weight for continuous action entropy
-    min_entropy_threshold: 0.1        # Minimum entropy to maintain exploration
+    enable_adaptive_entropy: true
+    entropy_coeff_start: 0.25
+    entropy_coeff_end: 0.05
+    entropy_decay_episodes: 300
+    continuous_entropy_weight: 1.0
+    min_entropy_threshold: 0.1
 
 # ============================================================================
-# DurotaxisEnv Configuration
-# ============================================================================
-environment:
-  # ============================================================================
-  # EXPERIMENTAL: Simple Delete-Only Reward Mode (REVISED)
-  # ============================================================================
-  # When enabled, this mode provides rewards/penalties based ONLY on delete behavior:
-  # 
-  # Tagging Strategy:
-  # - At step t, if a node's intensity < avg(all node intensities), tag it as to_delete=1 at step t+delta_time
-  # - Tagging is triggered when num_nodes > max_critical_nodes (signals need for deletion)
-  # - delta_time is configurable (default: 3 steps)
-  # 
-  # Reward Logic:
-  #   Rule 0: NO PENALTY/REWARD - when num_nodes > max_critical_nodes (just triggers tagging)
-  #   Rule 1: Persistence penalty - keeping a node marked for deletion (to_delete=1 but still exists)
-  #   Rule 2: Improper deletion penalty - deleting a node NOT marked (to_delete=0 but deleted)
-  #   Proper Deletion: +reward for deleting marked nodes (to_delete=1 and deleted)
-  #   Proper Persistence: +reward for keeping unmarked nodes (to_delete=0 and still exists)
-  # 
-  # Termination rewards can be optionally included via include_termination_rewards flag.
-  # Use this to test if the agent can learn node management from delete compliance feedback.
-  simple_delete_only_mode: false  # Set to true to enable simplified reward system
-  
-  # ============================================================================
-  # EXPERIMENTAL: Simple Spawn-Only Mode
-  # ============================================================================
-  # When enabled, this mode provides ONLY spawn-based reward feedback:
-  # The agent receives ONLY:
-  #   - +spawn_reward if ΔI ≥ delta_intensity (successful spawn on good substrate)
-  #   - -spawn_reward if ΔI < delta_intensity (failed to improve intensity)
-  # NO boundary checking penalties are applied in this mode.
-  # ALL other rewards/penalties are disabled (movement, delete, milestones, termination, etc.)
-  # Use this to test if the agent can learn spawn quality optimization from intensity feedback alone.
-  # Can be combined with simple_delete_only_mode and/or centroid_distance_only_mode.
-  simple_spawn_only_mode: false  # Set to true to enable spawn-only reward mode
-  spawn_reward: 2.0               # Single reward/penalty value for spawn success/failure
-  
-  # ============================================================================
-  # Observation Selection (Fast Fixed-Size Approach)
-  # ============================================================================
-  # When num_nodes > max_critical_nodes, select representative nodes using fast topk (O(N log K))
-  # This ensures fixed-size observations without slow semantic pooling
-  observation_selection:
-    method: topk_x              # Selection method: 'topk_x' (default) or 'topk_mixed'
-    w_x: 1.0                    # Weight for x-coordinate (rightward bias)
-    w_intensity: 0.0            # Weight for intensity feature (substrate quality)
-    w_norm: 0.0                 # Weight for embedding L2 norm (representational importance)
-  
-  # ============================================================================
-  # EXPERIMENTAL: Centroid-to-Goal Distance Penalty Mode
-  # ============================================================================
-  # When enabled, this mode provides ONLY a distance-based penalty from centroid to goal:
-  # The agent receives ONLY:
-  #   - Distance penalty = -(goal_x - centroid_x) / goal_x
-  #   - Example: If centroid_x=6 and goal_x=100, penalty = -(100-6)/100 = -0.94
-  #   - As centroid approaches goal, penalty approaches 0
-  #   - At goal (centroid_x = goal_x), penalty = 0
-  # ALL other rewards/penalties are disabled (movement, spawn, delete, milestones, termination, etc.)
-  # Use this to test if the agent can learn pure goal-seeking behavior from distance feedback alone.
-  centroid_distance_only_mode: true  # Set to true to enable centroid distance penalty mode
-  
-  # ============================================================================
-  # Distance Mode Scaling and Shaping (for centroid_distance_only_mode)
-  # ============================================================================
-  distance_mode:
-    # Dense delta-based reward shaping (potential-based, keeps optimal policy)
-    use_delta_distance: true              # Reward ∝ (cx_t - cx_{t-1}) / goal_x (dense directional signal)
-    distance_reward_scale: 5.0            # Scale up dense signal for better learning
-    
-    # Termination reward handling in distance-only mode
-    terminal_reward_scale: 0.02               # Downscale terminal rewards (e.g., +100 → +2.0)
-    clip_terminal_rewards: true               # Clip terminal reward contribution
-    terminal_reward_clip_value: 10.0          # Clamp to [-10, +10]
-    
-    # Adaptive terminal reward scheduler (reduces scale as rightward progress becomes consistent)
-    scheduler_enabled: false                   # Gradually reduce terminal_reward_scale
-    scheduler_window_size: 5                  # Episodes to measure progress
-    scheduler_progress_threshold: 0.6         # Threshold: >=60% episodes show progress
-    scheduler_consecutive_windows: 3          # Consecutive good windows before decay
-    scheduler_decay_rate: 0.9                 # Multiplicative decay factor
-    scheduler_min_scale: 0.005                # Lower bound for scheduler
-  
-  # ============================================================================
-  # Termination Reward Control Flag
-  # ============================================================================
-  # Controls whether termination rewards (success_reward, out_of_bounds_penalty, etc.) are included.
-  # Behavior:
-  #   - If simple_delete_only_mode=False AND centroid_distance_only_mode=False (normal mode):
-  #     Termination rewards are ALWAYS included (this flag is ignored)
-  #   - If simple_delete_only_mode=True OR centroid_distance_only_mode=True (special modes):
-  #     Set this to True to include termination rewards, False to exclude them
-  # Default: false (special modes exclude termination rewards by default for pure learning)
-  include_termination_rewards: true  # ENABLED to help agent learn goal achievement
-  
-  # Basic environment parameters - EXPANDED for successful migration
-  substrate_size: [600, 400]  # Much larger substrate (3x width)
-  substrate_type: 'linear'
-  substrate_params:
-    m: 0.01
-    b: 1.0
-  
-  # Node and topology parameters - RELAXED for learning
-  init_num_nodes: 5              # Start with more nodes for stability
-  max_critical_nodes: 50         # Allow more nodes
-  threshold_critical_nodes: 200  # GREATLY INCREASED: Allow agent to explore without premature termination
-  max_steps: 1000                # Much more time to reach goal
-  
-  # Termination behavior - RELAXED for exploration
-  consecutive_left_moves_limit: 30  # More forgiving (was implicitly 6)
-  
-  # ============================================================================
-  # CURRICULUM-SPECIFIC ENVIRONMENT SETTINGS
-  # ============================================================================
-  curriculum_environment:
-    # Stage 1: Simplified environment for navigation learning
-    stage_1_settings:
-      simplified_substrate: true      # Use simpler substrate patterns
-      reduced_action_space: true      # Limit available actions
-      boundary_buffer: 10.0           # Add safety buffer near boundaries
-      max_nodes_override: 5           # Override max nodes for stage 1
-      disable_complex_rewards: true   # Disable complex reward components
-      
-    # Stage 2: Moderate complexity for node management
-    stage_2_settings:
-      enable_advanced_spawning: true  # Enable more spawning options
-      node_management_focus: true     # Focus on node lifecycle management
-      max_nodes_override: 15          # Override max nodes for stage 2
-      enable_deletion_training: true  # Special deletion training mode
-      
-    # Stage 3: Full complexity
-    stage_3_settings:
-      full_environment: true          # Enable all features
-      competition_mode: true          # Enable competitive constraints
-      optimization_focus: true        # Focus on efficiency metrics
-      enable_success_detection: true  # Enable task completion detection
-  
-  # Simulation parameters
-  delta_time: 3
-  delta_intensity: 2.50
-  
-  # Visualization
-  flush_delay: 0.0001
-  enable_visualization: false
-  
-  # Reward structure - Graph rewards (OPTIMIZED for migration success)
-  graph_rewards:
-    connectivity_penalty: 5.0     # Moderate penalty for losing connectivity
-    growth_penalty: 3.0           # INCREASED: Penalize excessive node spawning more strongly
-    survival_reward: 0.1          # Reward for each step survived
-    action_reward: 0.01           # Small reward for taking actions
-    centroid_movement_reward: 5.0 # MASSIVELY INCREASED: Strongest possible incentive for rightward movement!
-    
-    # Potential-Based Reward Shaping (PBRS) for centroid distance to goal
-    # Preserves optimal policy while improving credit assignment
-    pbrs_centroid:
-      enabled: false              # Set to true to enable PBRS for centroid distance reward
-      shaping_coeff: 0.0          # Shaping coefficient (0.0 = OFF, try 0.05-0.2)
-      phi_distance_scale: 1.0     # Scale factor for distance-to-goal in potential function
-  
-  # Reward structure - Node rewards (OPTIMIZED for migration)
-  node_rewards:
-    movement_reward: 3.0          # FURTHER INCREASED: Maximum rightward movement incentive
-    leftward_penalty: 3.0         # FURTHER INCREASED: Strong deterrent for leftward movement
-    intensity_penalty: 0.3        # FURTHER REDUCED: Minimal penalty for exploration
-    intensity_bonus: 1.5          # INCREASED 15x: Strong bonus for good positions
-    substrate_reward: 0.3         # Increased substrate interaction reward
-  
-  # Curriculum-specific reward bonuses
-  curriculum_rewards:
-    # Stage 1: Navigation bonuses
-    navigation_bonuses:
-      rightward_movement_bonus: 1.0     # Extra bonus for moving right
-      boundary_avoidance_bonus: 2.0     # Extra bonus for avoiding boundaries
-      episode_survival_bonus: 0.5       # Bonus per step survived
-      distance_milestone_bonus: 5.0     # Bonus for distance milestones
-      
-    # Stage 2: Node management bonuses  
-    management_bonuses:
-      successful_spawn_bonus: 2.0       # Bonus for successful node spawning
-      efficient_deletion_bonus: 3.0     # Bonus for efficient node deletion
-      node_diversity_bonus: 1.5         # Bonus for maintaining node diversity
-      connectivity_maintenance_bonus: 1.0  # Bonus for good connectivity
-      
-    # Stage 3: Optimization bonuses
-    optimization_bonuses:
-      task_completion_bonus: 50.0       # Large bonus for completing task
-      efficiency_bonus: 10.0            # Bonus for efficient performance
-      constraint_satisfaction_bonus: 5.0  # Bonus for satisfying all constraints
-      perfection_bonus: 25.0            # Bonus for perfect execution
-  
-  # Reward structure - Edge rewards
-  edge_reward:
-    rightward_bonus: 0.5          # INCREASED from 0.1 for better directional incentive
-    leftward_penalty: 0.05        # REDUCED from 0.1 for gentler penalty
-  
-  # Reward structure - Spawn rewards (ENHANCED for boundary-safe spawning)
-  spawn_rewards:
-    spawn_success_reward: 2.5     # INCREASED from 1.0 to strongly incentivize growth
-    spawn_failure_penalty: 1.0    # Penalty for failed durotaxis spawning
-    
-    # NEW: Boundary-aware spawn penalties
-    spawn_near_boundary_penalty: 3.0  # Strong penalty for spawning nodes near boundaries
-    spawn_in_danger_zone_penalty: 8.0 # SEVERE penalty for spawning in danger zone
-    spawn_boundary_check: true    # Enable boundary checking for new spawns
-    
-    # Potential-Based Reward Shaping (PBRS) for spawn quality optimization
-    # Preserves optimal policy while improving credit assignment for spawnable nodes
-    pbrs:
-      enabled: false              # Set to true to enable PBRS for spawn reward
-      shaping_coeff: 0.0          # Shaping coefficient (0.0 = OFF, try 0.05-0.2)
-      phi_weight_spawnable: 1.0   # Weight for spawnable nodes (high-intensity positions)
-  
-  # Reward structure - Delete rewards
-  delete_reward:
-    proper_deletion: 2.0          # Reward for proper node deletion
-    persistence_penalty: 2.0      # Penalty for inappropriate persistence
-    improper_deletion_penalty: 2.0  # Penalty for deleting nodes not marked for deletion
-    
-    # Potential-Based Reward Shaping (PBRS) for delete compliance
-    # Preserves optimal policy while improving credit assignment
-    pbrs:
-      enabled: false              # Set to true to enable PBRS for delete reward
-      shaping_coeff: 0.0          # Shaping coefficient (0.0 = OFF, try 0.05-0.2)
-      phi_weight_pending_marked: 1.0    # Weight for pending marked nodes (to be deleted)
-      phi_weight_safe_unmarked: 0.25    # Weight for safe unmarked nodes (to be kept)
-  
-  # Reward structure - Position rewards (ENHANCED for boundary avoidance)
-  position_rewards:
-    boundary_bonus: 0.1           # Bonus for boundary/frontier nodes (horizontal edges only)
-    left_edge_penalty: 0.2        # Penalty for being near left edge
-    
-    # ENHANCED: Progressive penalties for approaching top/bottom boundaries
-    edge_position_penalty: 0.5    # Base penalty for being near top/bottom edges (INCREASED 5x)
-    danger_zone_penalty: 2.0      # NEW: Strong penalty for danger zone (very close to boundary)
-    critical_zone_penalty: 5.0    # NEW: SEVERE penalty for critical zone (about to violate)
-    
-    # Boundary zone thresholds (as percentage of substrate height)
-    edge_zone_threshold: 0.15     # Within 15% of top/bottom = edge zone
-    danger_zone_threshold: 0.08   # Within 8% of top/bottom = danger zone  
-    critical_zone_threshold: 0.03 # Within 3% of top/bottom = critical zone
-    
-    # Safe zone rewards (encourage staying in center)
-    safe_center_bonus: 0.05       # NEW: Small bonus for staying in safe center zone
-    safe_center_range: 0.30       # Center 30% of height is "safe zone"
-  
-  # Reward structure - Termination rewards (OPTIMIZED for learning)
-  termination_rewards:
-    success_reward: 500.0         # MASSIVE reward for reaching goal (5x increase)
-    out_of_bounds_penalty: -100.0 # SEVERE penalty to discourage boundary violations
-    no_nodes_penalty: -100.0      # SEVERE penalty to discourage losing all nodes
-    leftward_drift_penalty: -50.0 # Strong penalty for persistent leftward movement
-    timeout_penalty: 0.0          # NO penalty for timeout (exploration is good!)
-    critical_nodes_penalty: -15.0 # Moderate penalty
-  
-  # NEW: Progressive milestone rewards for reaching distance thresholds
-  milestone_rewards:
-    enabled: true
-    distance_25_percent: 50.0     # DOUBLED: Strong reward for 25% milestone
-    distance_50_percent: 150.0    # TRIPLED: Massive reward for 50% milestone
-    distance_75_percent: 300.0    # TRIPLED: Huge reward for 75% milestone
-    distance_90_percent: 500.0    # INCREASED: Enormous reward for almost reaching goal
-  
-  # NEW: Time-based survival rewards (encourage longevity)
-  survival_reward_config:
-    enabled: true
-    base_reward: 0.01            # REDUCED: Don't make survival too comfortable
-    bonus_threshold: 100         # After 100 steps, give bonus
-    bonus_reward: 0.02           # REDUCED: Additional reward after threshold
-    max_step_factor: 0.8         # Scale rewards up to 80% of max_steps
-
-# ============================================================================
-# GraphInputEncoder Configuration
-# ============================================================================
-encoder:
-  out_dim: 128                  # Output embedding dimension per node (INCREASED for richer representations)
-  num_layers: 4                 # Number of transformer layers
-
-# ============================================================================
-# HybridActorCritic Configuration
-# ============================================================================
-actor_critic:
-  pretrained_weights: imagenet
-  # Backbone options for both Actor and Critic
-  backbone:
-    input_adapter: 1ch_conv       # repeat3 | 1ch_conv (CHANGED to match checkpoint)
-    freeze_mode: all              # none | all | until_layer3 | last_block
-    backbone_lr: 1.0e-4           # LR for unfrozen backbone params
-    head_lr: 3.0e-4               # LR for heads (action/value MLP + heads)
-  
-  hidden_dim: 128               # Hidden dimension for final MLPs after ResNet
-  continuous_dim: 5             # Dimension of continuous action space (delete_ratio, gamma, alpha, noise, theta)
-  dropout_rate: 0.2             # Dropout for regularization
-  
-  # Pretrained weights configuration
-  # Options: 'imagenet', 'random', or null (same as 'random')
-  pretrained_weights: 'imagenet'  # Default: ImageNet pre-trained weights
-  
-  # Action parameter bounds [min, max]
-  action_parameter_bounds:
-    delete_ratio: [0.0, 0.9]    # Fraction of nodes to delete (sorted leftmost first)
-    gamma: [0.5, 15.0]          # Spawn: WIDENED from [2.0, 8.0] for more expressive control
-    alpha: [0.5, 4.0]           # Spawn: Directional bias strength
-    noise: [0.05, 0.5]          # Spawn: Stochastic noise level
-    theta: [-0.5236, 0.5236]    # Spawn: Migration direction angle (-π/6 to π/6, -30° to +30°, biased toward rightward)
-  
-  # Value function components (list of reward components to predict)
-  value_components:
-    - 'total_reward'
-    - 'graph_reward'
-    - 'spawn_reward'
-    - 'delete_reward'
-    - 'edge_reward'
-    - 'total_node_reward'
-  
-  # ============================================================================
-  # Simplicial Embedding (SEM) Configuration
-  # ============================================================================
-  # SEM constrains node embeddings to lie on product of simplices via group-wise softmax.
-  # This is ACTION-AGNOSTIC and works with any action space (discrete, continuous, hybrid).
-  # For ablation studies, toggle 'enabled' between true/false.
-  simplicial_embedding:
-    enabled: true                # Toggle for ablation: true (with SEM) / false (without SEM)
-    num_groups: 16               # Number of simplex groups (must divide hidden_dim evenly)
-    temperature: 1.0             # Softmax temperature for simplex constraints
-
-# ============================================================================
-# Training Algorithm Configuration
-# ============================================================================
-algorithm:
-  # GAE (Generalized Advantage Estimation) parameters
-  gamma: 0.99                   # Discount factor
-  gae_lambda: 0.95              # GAE lambda parameter
-  
-  # PPO (Proximal Policy Optimization) parameters
-  ppo_epochs: 4                 # Number of PPO epochs per update
-  clip_epsilon: 0.1             # PPO clipping parameter
-  value_loss_coeff: 0.5         # Increased from 0.5 for better value estimation
-  
-  # NEW: Two-Stage Training Curriculum with Delete Ratio
-  # Stage 1: Learn delete_ratio only. Spawn params are fixed constants.
-  # Stage 2: Learn delete_ratio + spawn parameters (gamma, alpha, noise, theta).
-  two_stage_curriculum:
-    stage: 1  # Set to 1 for delete-ratio-only, 2 for full continuous
-    
-    # Fixed spawn parameters used during Stage 1.
-    # Stage 1 learns ONLY delete_ratio, spawn params are constants.
-    stage_1_fixed_spawn_params:
-      gamma: 0.5      # Conservative growth rate for stable exploration
-      alpha: 2.0      # Directional bias
-      noise: 0.1      # Low noise for predictable spawning
-      theta: 0.0      # No angular bias (pure rightward)
-  
-  # Optimization parameters
-  max_grad_norm: 0.5            # Increased from 0.5 for less aggressive clipping
-
-# ============================================================================
-# Device and Performance Configuration
+# SYSTEM CONFIGURATION
 # ============================================================================
 system:
-  device: 'auto'                # 'cuda', 'cpu', or 'auto' for automatic detection
-  num_workers: 1                # Number of parallel workers (if applicable)
-  seed: null                    # Random seed (null for no seeding)
+  device: 'auto'
+  num_workers: 1
+  seed: null
 
 # ============================================================================
-# Logging and Monitoring Configuration
+# LOGGING CONFIGURATION
 # ============================================================================
 logging:
-  tensorboard: false            # Enable TensorBoard logging
-  wandb: false                  # Enable Weights & Biases logging
-  save_model_every: null        # Save model every N episodes (null for disabled)
-  save_best_model: true         # Save best performing model
-  verbose: true                 # Verbose logging
+  tensorboard: false
+  wandb: false
+  save_model_every: null
+  save_best_model: true
+  verbose: true
 
 # ============================================================================
-# Experimental Configuration
+# EXPERIMENTAL FEATURES
 # ============================================================================
 experimental:
-  # Action masking
-  use_action_masking: true      # Enable action masking for invalid actions
-  
-  # Adaptive component weighting
-  adaptive_component_weights: true    # Enable adaptive component weight updates
-  
-  # Substrate variation
-  substrate_variation: true     # Enable substrate parameter variation during training
-  
-  # Enhanced success criteria
+  # Multiple success criteria for episode evaluation
+  # Used in train.py to determine if episode is successful beyond just reaching goal
   success_criteria:
-    enable_multiple_criteria: true    # Use multiple success definitions
-    survival_success_steps: 10        # Maintain nodes for 10+ steps
-    reward_success_threshold: -20     # Achieve reasonable reward
-    growth_success_nodes: 2           # Maintain connectivity (2+ nodes)
-    exploration_success_steps: 15     # Long episode regardless of outcome
+    enable_multiple_criteria: true
+    survival_success_steps: 10        # Episode length threshold for survival success
+    reward_success_threshold: -20     # Total reward threshold for reward-based success
+    growth_success_nodes: 2           # Node count threshold for growth success
+    exploration_success_steps: 15     # Episode length threshold for exploration success

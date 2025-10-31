@@ -254,6 +254,7 @@ class DurotaxisEnv(gym.Env):
         
         # Simple spawn-only mode flag
         self.simple_spawn_only_mode = config.get('simple_spawn_only_mode', False)
+        # Legacy: spawn_reward scalar kept for backward compatibility (no longer used)
         self.spawn_reward = float(config.get('spawn_reward', 2.0))
         
         # Include termination rewards flag (for special modes)
@@ -261,6 +262,12 @@ class DurotaxisEnv(gym.Env):
         #   - If both modes are False: Always use termination rewards (default True, ignored)
         #   - If either mode is True: User must explicitly set this to True to include termination rewards
         self.include_termination_rewards = config.get('include_termination_rewards', False)
+
+        # Reward composition weights (Priority: Delete > Spawn > Distance)
+        rw = config.get('reward_weights', {})
+        self._w_delete = float(rw.get('delete_weight', 1.0))
+        self._w_spawn = float(rw.get('spawn_weight', 0.75))
+        self._w_distance = float(rw.get('distance_weight', 0.5))
 
         # Distance-mode parameters
         dm = config.get('distance_mode', {})
@@ -984,211 +991,74 @@ class DurotaxisEnv(gym.Env):
 
     def _calculate_reward(self, prev_state, new_state, actions):
         """
-        Calculate reward based on topology evolution and substrate exploration.
-        Returns scalar reward (graph-level + aggregated node-level).
+        Calculate reward based on simplified composition: Delete > Spawn > Distance.
+        
+        Refactored to use ONLY:
+        - Delete reward (Rule 1: proper deletion compliance)
+        - Spawn reward (Rule 2: intensity-based spawning, NO boundary checks)
+        - Distance reward (Rule 3: centroid movement toward goal)
+        - Termination rewards (applied at episode end)
+        
+        Special modes (delete-only, centroid-only, spawn-only, combinations) still work.
+        Priority: Delete > Spawn > Distance (assumption: good delete/spawn → better distance)
         """
         # Initialize reward components
-        graph_reward = 0.0
-        node_rewards = []
-        
-        # === GRAPH-LEVEL REWARDS ===
-        
-        # Penalty for too many (N > Nc) or too few nodes (N < 2)
         num_nodes = new_state['num_nodes']
-        if num_nodes < 2:
-            graph_reward -= self.connectivity_penalty  # Strong penalty for losing all connectivity
-        elif num_nodes > self.max_critical_nodes:
-            # Scaled penalty: grows quadratically with excess nodes to strongly discourage runaway growth
-            excess_nodes = num_nodes - self.max_critical_nodes
-            scaled_penalty = self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
-            graph_reward -= scaled_penalty
-        else:
-            graph_reward += self.survival_reward # Basic survival reward
-
-        # Small reward for taking actions (encourages exploration)
-        graph_reward += len(actions) * self.action_reward
         
-        # === CENTROID MOVEMENT REWARD: Collective rightward progress ===
-        centroid_reward = self._calculate_centroid_movement_reward(prev_state, new_state)
-        graph_reward += centroid_reward
+        # === CALCULATE CORE REWARD COMPONENTS ===
         
-        # === SPAWN REWARD: Durotaxis-based spawning ===
-        spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
-        graph_reward += spawn_reward
-        
-        # === DELETE REWARD: Proper deletion compliance ===
+        # PRIORITY 1: Delete reward (proper deletion compliance)
         delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
-        graph_reward += delete_reward
         
-        # === DELETION EFFICIENCY REWARD: Tidiness bonus for smart pruning ===
-        efficiency_reward = self._calculate_deletion_efficiency_reward(prev_state, new_state)
-        graph_reward += efficiency_reward
+        # PRIORITY 2: Spawn reward (intensity-based, simplified - no boundary checks in refactored version)
+        spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
         
-        # === EDGE REWARD: Directional bias toward rightward movement ===
-        edge_reward = self._calculate_edge_reward(prev_state, new_state, actions)
-        graph_reward += edge_reward
-        
-        
-        # === NODE-LEVEL REWARDS (VECTORIZED) ===
+        # PRIORITY 3: Distance reward (centroid movement toward goal)
+        # Calculate centroid x position for distance signal
+        centroid_x = 0.0
+        distance_signal = 0.0
         
         if num_nodes > 0:
-            import numpy as np
-            node_features = new_state['node_features']
-            
-            # Convert to numpy for efficient vectorized operations
-            node_features_np = node_features.detach().cpu().numpy()  # [num_nodes, feature_dim]
-            
-            # Initialize vectorized reward array
-            node_rewards_vec = np.zeros(num_nodes, dtype=np.float32)
-            
-            # 1. VECTORIZED Position-based rewards (durotaxis progression)
-            node_positions = node_features_np[:, :2]  # [num_nodes, 2] - x, y coordinates
-            
-            # Reward/penalize based on movement direction - VECTORIZED
-            if hasattr(self, 'prev_node_positions') and len(self.prev_node_positions) > 0:
-                # Convert previous positions to numpy array
-                prev_positions = np.array(self.prev_node_positions[:num_nodes])  # Handle size mismatches
-                if prev_positions.shape[0] == num_nodes:
-                    # Vectorized movement calculation
-                    x_movement = node_positions[:, 0] - prev_positions[:, 0]  # [num_nodes]
-                    
-                    # Reward rightward movement, penalize leftward movement
-                    movement_rewards = np.where(
-                        x_movement > 0,
-                        x_movement * self.movement_reward,  # Rightward: strong reward
-                        x_movement * self.leftward_penalty  # Leftward: penalty (x_movement is negative, so this is negative)
-                    )
-                    node_rewards_vec += movement_rewards
-            
-            # 2. VECTORIZED Substrate intensity rewards
-            if node_features_np.shape[1] > 2:
-                substrate_intensities = node_features_np[:, 2]  # [num_nodes] - intensity values
-                intensity_rewards = substrate_intensities * self.substrate_reward  # [num_nodes]
-                node_rewards_vec += intensity_rewards
-            
-            # 3. VECTORIZED Boundary position rewards  
-            if node_features_np.shape[1] > 7:
-                boundary_flags = node_features_np[:, 7]  # [num_nodes] - boundary indicators
-                boundary_rewards = np.where(boundary_flags > 0.5, self.boundary_bonus, 0.0)  # [num_nodes]
-                node_rewards_vec += boundary_rewards
-            
-            # 4. VECTORIZED Positional penalties (avoid substrate edges) - ENHANCED BOUNDARY AVOIDANCE
-            substrate_width = self.substrate.width
-            substrate_height = self.substrate.height
-            
-            # Left edge penalty - VECTORIZED
-            left_edge_mask = node_positions[:, 0] < substrate_width * 0.1  # [num_nodes]
-            left_edge_penalties = np.where(left_edge_mask, -self.left_edge_penalty, 0.0)  # [num_nodes]
-            node_rewards_vec += left_edge_penalties
-            
-            # ENHANCED: Progressive top/bottom edge penalties - VECTORIZED
-            # Calculate distance from top and bottom boundaries
-            y_positions = node_positions[:, 1]  # [num_nodes]
-            dist_from_top = y_positions / substrate_height  # 0.0 = top, 1.0 = bottom
-            dist_from_bottom = (substrate_height - y_positions) / substrate_height  # 0.0 = bottom, 1.0 = top
-            
-            # Get minimum distance to either boundary (0.0 = at boundary, 0.5 = center)
-            min_dist_to_boundary = np.minimum(dist_from_top, dist_from_bottom)  # [num_nodes]
-            
-            # Define zone thresholds
-            edge_threshold = self.edge_zone_threshold      # 15% - edge zone
-            danger_threshold = self.danger_zone_threshold  # 8% - danger zone
-            critical_threshold = self.critical_zone_threshold  # 3% - critical zone
-            safe_center_range = self.safe_center_range     # 30% - safe center
-            
-            # Progressive penalties based on proximity to boundary
-            boundary_penalties = np.zeros(num_nodes, dtype=np.float32)
-            
-            # Critical zone: SEVERE penalty (within 3% of boundary)
-            critical_mask = min_dist_to_boundary < critical_threshold
-            boundary_penalties = np.where(critical_mask, -self.critical_zone_penalty, boundary_penalties)
-            
-            # Danger zone: Strong penalty (within 8% of boundary)
-            danger_mask = (min_dist_to_boundary >= critical_threshold) & (min_dist_to_boundary < danger_threshold)
-            boundary_penalties = np.where(danger_mask, -self.danger_zone_penalty, boundary_penalties)
-            
-            # Edge zone: Moderate penalty (within 15% of boundary)
-            edge_mask = (min_dist_to_boundary >= danger_threshold) & (min_dist_to_boundary < edge_threshold)
-            boundary_penalties = np.where(edge_mask, -self.edge_position_penalty, boundary_penalties)
-            
-            # Safe center zone: Small bonus (center 30% of height)
-            center_dist = np.abs(y_positions - substrate_height/2) / (substrate_height/2)  # 0.0 = center, 1.0 = edge
-            safe_center_mask = center_dist < safe_center_range
-            safe_center_rewards = np.where(safe_center_mask, self.safe_center_bonus, 0.0)
-            
-            node_rewards_vec += boundary_penalties
-            node_rewards_vec += safe_center_rewards
-            
-            # 5. Per-node intensity comparison (requires loop for complexity)
-            if self.dequeued_topology is not None and node_features_np.shape[1] > 2:
-                # Compute average intensity once for all nodes - VECTORIZED
-                current_intensities = node_features_np[:, 2]  # [num_nodes]
-                avg_intensity = np.mean(current_intensities)
-                
-                # Process each node for intensity comparison (some complexity requires per-node handling)
-                for i in range(num_nodes):
-                    node_x = node_positions[i, 0]
-                    node_y = node_positions[i, 1]
-                    
-                    # Get node's persistent ID for reliable tracking
-                    node_persistent_id = self._get_node_persistent_id(i)
-                    
-                    # Check if this node was present in the dequeued topology
-                    if node_persistent_id is not None:
-                        node_was_in_dequeued = self._check_persistent_id_in_topology(node_persistent_id, self.dequeued_topology)
+            try:
+                graph_features = new_state.get('graph_features')
+                if graph_features is not None:
+                    if isinstance(graph_features, torch.Tensor):
+                        centroid_x = graph_features[3].item()  # Index 3 is centroid_x
                     else:
-                        # Fallback to spatial matching if persistent IDs not available
-                        node_was_in_dequeued = self._node_exists_in_topology(node_x, node_y, self.dequeued_topology)
-                    
-                    if node_was_in_dequeued:
-                        current_node_intensity = current_intensities[i]
-                        
-                        # Set penalties/bonuses based on intensity comparison
-                        if current_node_intensity < avg_intensity:
-                            node_rewards_vec[i] -= self.intensity_penalty  # Penalty for being below average
-                        else:
-                            node_rewards_vec[i] += self.intensity_bonus  # Basic survival reward
-            
-            # Convert back to list for compatibility with existing code
-            node_rewards = node_rewards_vec.tolist()
-            
-            # Store current positions for next step - VECTORIZED
-            self.prev_node_positions = node_positions.tolist()  # Convert back to list format
-          
-        # === COMBINE REWARDS ===
+                        centroid_x = graph_features[3]
+            except (IndexError, TypeError):
+                # Fallback: calculate centroid from node positions
+                node_features = new_state.get('node_features', [])
+                if len(node_features) > 0:
+                    x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                 for node in node_features]
+                    centroid_x = sum(x_positions) / len(x_positions)
         
-        # Aggregate node rewards (you can use different strategies)
-        if node_rewards:
-            # Strategy 1: Simple sum
-            total_node_reward = sum(node_rewards)
-            
-            # Strategy 2: Average (uncomment to use)
-            # total_node_reward = sum(node_rewards) / len(node_rewards)
-            
-            # Strategy 3: Weighted combination (uncomment to use)
-            # total_node_reward = sum(node_rewards) * (num_nodes / self.max_critical_nodes)
+        # Use delta distance shaping (potential-based) for rightward migration
+        if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
+            # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
+            # Positive when moving right, negative when moving left
+            delta_x = centroid_x - self._prev_centroid_x
+            distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
         else:
-            total_node_reward = 0.0
+            # Fallback: static distance penalty
+            if self.goal_x > 0:
+                distance_signal = -(self.goal_x - centroid_x) / self.goal_x
+            else:
+                distance_signal = 0.0
         
-        # Apply curriculum penalty multiplier to negative rewards
-        penalty_multiplier = getattr(self, '_curriculum_penalty_multiplier', 1.0)
-        if penalty_multiplier != 1.0:
-            # Apply penalty multiplier to negative components
-            if graph_reward < 0:
-                graph_reward *= penalty_multiplier
-            if total_node_reward < 0:
-                total_node_reward *= penalty_multiplier
+        # Optional: add proper PBRS shaping on top (preserves optimal policy)
+        if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
+            phi_prev = self._phi_centroid_distance_potential(prev_state)
+            phi_new = self._phi_centroid_distance_potential(new_state)
+            distance_signal += self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
         
-        # Add survival reward if configured
-        survival_reward = self.get_survival_reward(self.current_step)
+        # Update previous centroid for next step
+        self._prev_centroid_x = centroid_x
         
-        # Add milestone rewards for reaching distance thresholds
-        milestone_reward = self._calculate_milestone_reward(new_state)
+        # === REWARD COMPOSITION ===
+        # Two paths: (1) Special modes (selective components), (2) Default (all three components)
         
-        # Final combined reward (default for normal mode)
-        total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
-        
-        # === MODE COMBINATIONS (8 total: 2^3 for delete/centroid/spawn) ===
         # Check which special modes are enabled
         has_delete_mode = self.simple_delete_only_mode
         has_centroid_mode = self.centroid_distance_only_mode
@@ -1197,92 +1067,55 @@ class DurotaxisEnv(gym.Env):
         # Count how many special modes are enabled
         num_special_modes = sum([has_delete_mode, has_centroid_mode, has_spawn_mode])
         
-        # If any special mode is enabled, override the normal reward composition
         if num_special_modes > 0:
-            # Initialize distance_signal (will be used if centroid_mode is enabled)
-            distance_signal = 0.0
-            
-            # === STEP 1: Calculate distance signal (if needed) ===
-            if has_centroid_mode:
-                # Calculate centroid x position
-                centroid_x = 0.0
-                if num_nodes > 0:
-                    try:
-                        graph_features = new_state.get('graph_features')
-                        if graph_features is not None:
-                            if isinstance(graph_features, torch.Tensor):
-                                centroid_x = graph_features[3].item()  # Index 3 is centroid_x
-                            else:
-                                centroid_x = graph_features[3]
-                    except (IndexError, TypeError):
-                        # Fallback: calculate centroid from node positions
-                        node_features = new_state.get('node_features', [])
-                        if len(node_features) > 0:
-                            x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
-                                         for node in node_features]
-                            centroid_x = sum(x_positions) / len(x_positions)
-                
-                # Use delta distance shaping (potential-based) for rightward migration
-                if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
-                    # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
-                    # Positive when moving right, negative when moving left
-                    delta_x = centroid_x - self._prev_centroid_x
-                    distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
-                else:
-                    # Fallback: static distance penalty
-                    if self.goal_x > 0:
-                        distance_signal = -(self.goal_x - centroid_x) / self.goal_x
-                    else:
-                        distance_signal = 0.0
-                
-                # Update previous centroid for next step
-                self._prev_centroid_x = centroid_x
-            
-            # === STEP 2: Compose reward from enabled special modes ===
-            # Build total_reward by adding ONLY the enabled mode components
+            # === SPECIAL MODES: Use ONLY enabled components (no weighting in special modes) ===
             mode_reward = 0.0
             
+            # Priority 1: Delete (if enabled)
             if has_delete_mode:
                 mode_reward += delete_reward
             
-            if has_centroid_mode:
-                mode_reward += distance_signal
-            
+            # Priority 2: Spawn (if enabled)
             if has_spawn_mode:
                 mode_reward += spawn_reward
             
-            # Override total_reward with special mode composition
+            # Priority 3: Distance (if enabled)
+            if has_centroid_mode:
+                mode_reward += distance_signal
+            
+            # Set total reward from special mode composition
             total_reward = mode_reward
             graph_reward = mode_reward
             
-            # Zero out components NOT in special modes
+            # Zero out components NOT in special modes (for logging clarity)
             if not has_spawn_mode:
                 spawn_reward = 0.0
             if not has_delete_mode:
                 delete_reward = 0.0
-            
-            # Always zero these in special modes
-            efficiency_reward = 0.0
-            edge_reward = 0.0
-            centroid_reward = 0.0
-            milestone_reward = 0.0
-            total_node_reward = 0.0
-            survival_reward = 0.0
+            if not has_centroid_mode:
+                distance_signal = 0.0
+        else:
+            # === DEFAULT MODE: Weighted composition (Delete > Spawn > Distance) ===
+            # Apply environment-level weights to make priority explicit in task reward
+            total_reward = (
+                self._w_delete * float(delete_reward) +
+                self._w_spawn * float(spawn_reward) +
+                self._w_distance * float(distance_signal)
+            )
+            graph_reward = total_reward
         
-        # OPTIMIZATION 2: Use preallocated template for faster dict creation
-        reward_breakdown = dict(self._reward_components_template)
-        reward_breakdown['total_reward'] = total_reward
-        reward_breakdown['graph_reward'] = graph_reward
-        reward_breakdown['spawn_reward'] = spawn_reward
-        reward_breakdown['delete_reward'] = delete_reward
-        reward_breakdown['deletion_efficiency_reward'] = efficiency_reward if 'efficiency_reward' in locals() else 0.0
-        reward_breakdown['edge_reward'] = edge_reward
-        reward_breakdown['centroid_reward'] = centroid_reward if 'centroid_reward' in locals() else 0.0
-        reward_breakdown['milestone_reward'] = milestone_reward
-        reward_breakdown['node_rewards'] = node_rewards
-        reward_breakdown['total_node_reward'] = total_node_reward
-        reward_breakdown['survival_reward'] = survival_reward
-        reward_breakdown['num_nodes'] = num_nodes
+        # === BUILD REWARD BREAKDOWN ===
+        # Create reward breakdown with only the components used in refactored system
+        reward_breakdown = {
+            'total_reward': total_reward,
+            'graph_reward': graph_reward,
+            'delete_reward': delete_reward,
+            'spawn_reward': spawn_reward,
+            'distance_signal': distance_signal,
+            'num_nodes': num_nodes,
+            'empty_graph_recovery_penalty': 0.0,  # Set later if recovery occurred
+            'termination_reward': 0.0  # Set later if episode terminates
+        }
         
         # Store for backward compatibility (some methods might still use this)
         self.last_reward_breakdown = reward_breakdown
@@ -1388,114 +1221,15 @@ class DurotaxisEnv(gym.Env):
 
         self.topology.graph.ndata['pos'] = adjusted_positions
 
-    def _calculate_centroid_movement_reward(self, prev_state, new_state):
-        """
-        Calculate reward based on collective centroid movement to the right.
-        
-        This reward encourages the entire cell colony to migrate rightward as a group,
-        providing a strong signal for the primary goal of durotaxis.
-        
-        Args:
-            prev_state: Previous state dict containing graph_features with centroid
-            new_state: Current state dict containing graph_features with centroid
-            
-        Returns:
-            float: Positive reward for rightward movement, negative for leftward
-        """
-        if new_state['num_nodes'] == 0 or prev_state['num_nodes'] == 0:
-            return 0.0
-        
-        # Get centroid x-coordinates from graph features
-        prev_centroid_x = prev_state['graph_features'][3].item()
-        curr_centroid_x = new_state['graph_features'][3].item()
-        
-        # Calculate movement (base reward)
-        centroid_movement = curr_centroid_x - prev_centroid_x
-        
-        # Apply reward multiplier
-        reward = centroid_movement * self.centroid_movement_reward
-        
-        # ============================================================================
-        # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
-        # ============================================================================
-        # Add PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
-        # This biases learning toward rightward movement without changing optimal policy
-        if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
-            phi_prev = self._phi_centroid_distance_potential(prev_state)
-            phi_new = self._phi_centroid_distance_potential(new_state)
-            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
-            reward += self._pbrs_centroid_coeff * pbrs_shaping
-        
-        return reward
-    
-    def _calculate_milestone_reward(self, new_state):
-        """
-        Calculate reward for reaching distance milestones.
-        
-        Provides progressive rewards as the agent reaches certain percentages
-        of the substrate width, creating intermediate goals that guide learning.
-        
-        Args:
-            new_state: Current state dict
-            
-        Returns:
-            float: Milestone reward if a new milestone is reached, 0.0 otherwise
-        """
-        if not hasattr(self, 'milestone_rewards') or not self.milestone_rewards.get('enabled', False):
-            return 0.0
-        
-        # Skip milestone rewards and printing when in centroid distance only mode
-        if self.centroid_distance_only_mode:
-            return 0.0
-        
-        if new_state['num_nodes'] == 0:
-            return 0.0
-        
-        # Get the rightmost node position
-        node_features = new_state['node_features']
-        max_x = max(node_features[:, 0]).item()
-        
-        substrate_width = self.substrate.width
-        progress_percent = (max_x / substrate_width) * 100
-        
-        # Check if we've reached a new milestone (track in episode)
-        if not hasattr(self, '_milestones_reached'):
-            self._milestones_reached = set()
-        
-        reward = 0.0
-        
-        # Check each milestone threshold
-        milestones = [
-            (25, 'distance_25_percent'),
-            (50, 'distance_50_percent'),
-            (75, 'distance_75_percent'),
-            (90, 'distance_90_percent')
-        ]
-        
-        for threshold, key in milestones:
-            if progress_percent >= threshold and threshold not in self._milestones_reached:
-                self._milestones_reached.add(threshold)
-                milestone_reward = self.milestone_rewards.get(key, 0.0)
-                reward += milestone_reward
-                print(f"🎯 MILESTONE REACHED! {threshold}% of substrate width! Reward: +{milestone_reward}")
-        
-        return reward
-    
     def _calculate_spawn_reward(self, prev_state, new_state, actions):
         """
         Calculate reward for durotaxis-based spawning.
         
-        Two modes:
-        1. Normal mode: 
-           - Reward += spawn_success_reward if ΔI >= delta_intensity
-           - Penalty -= spawn_failure_penalty otherwise
-           - Includes boundary checking penalties
-        
-        2. Simple spawn-only mode:
-           - Reward += spawn_reward if ΔI >= delta_intensity
-           - Penalty -= spawn_reward if ΔI < delta_intensity
-           - NO boundary checking
-           - Includes PBRS shaping term
+        Unified behavior (same magnitude for both modes):
+        - Reward += spawn_success_reward if ΔI >= delta_intensity
+        - Penalty -= spawn_failure_penalty if ΔI < delta_intensity
+        - Uses same values from spawn_rewards config regardless of mode
+        - Includes PBRS shaping term when enabled
         
         Args:
             prev_state: Previous topology state
@@ -1529,29 +1263,9 @@ class DurotaxisEnv(gym.Env):
                         if len(node_feature_vector) > 2:
                             new_node_intensity = node_feature_vector[2].item()
                             new_node_pos = node_feature_vector[:2]  # x, y coordinates
-                            new_node_y = new_node_pos[1].item()
                             
-                            # Check if spawned near boundary (boundary-aware spawning)
-                            # Skip boundary checking in simple_spawn_only_mode
-                            if self.spawn_boundary_check and not self.simple_spawn_only_mode:
-                                substrate_height = self.substrate.height
-                                
-                                # Calculate distance from top/bottom boundaries
-                                dist_from_top = new_node_y / substrate_height
-                                dist_from_bottom = (substrate_height - new_node_y) / substrate_height
-                                min_dist_to_boundary = min(dist_from_top, dist_from_bottom)
-                                
-                                # Apply penalties for spawning near boundaries
-                                if min_dist_to_boundary < self.danger_zone_threshold:  # Within 8% - danger zone
-                                    spawn_reward -= self.spawn_in_danger_zone_penalty
-                                    # print(f"⚠️ Spawn in DANGER ZONE! Y={new_node_y:.1f}, "
-                                    #       f"dist={min_dist_to_boundary:.2%} < {self.danger_zone_threshold:.2%}, "
-                                    #       f"penalty: -{self.spawn_in_danger_zone_penalty}")
-                                elif min_dist_to_boundary < self.edge_zone_threshold:  # Within 15% - edge zone
-                                    spawn_reward -= self.spawn_near_boundary_penalty
-                                    # print(f"⚠️ Spawn near boundary! Y={new_node_y:.1f}, "
-                                    #       f"dist={min_dist_to_boundary:.2%} < {self.edge_zone_threshold:.2%}, "
-                                    #       f"penalty: -{self.spawn_near_boundary_penalty}")
+                            # REFACTORED: Boundary checks removed in simplified system
+                            # Focus purely on intensity-based spawning
                             
                             # Find parent node from previous state by checking actions
                             # For now, we'll use spatial proximity as backup
@@ -1575,25 +1289,17 @@ class DurotaxisEnv(gym.Env):
                             if best_parent_intensity is not None:
                                 intensity_difference = new_node_intensity - best_parent_intensity
                                 
-                                # Use different reward values depending on mode
-                                if self.simple_spawn_only_mode:
-                                    # Simple mode: single reward value for both success and failure
-                                    if intensity_difference >= self.delta_intensity:
-                                        spawn_reward += self.spawn_reward
-                                    else:
-                                        spawn_reward -= self.spawn_reward
+                                # Use unified reward values (same magnitude for both modes)
+                                if intensity_difference >= self.delta_intensity:
+                                    spawn_reward += self.spawn_success_reward
+                                    # print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
+                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
+                                    #       f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
                                 else:
-                                    # Normal mode: different values for success and failure
-                                    if intensity_difference >= self.delta_intensity:
-                                        spawn_reward += self.spawn_success_reward
-                                        # print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
-                                        #       f"Parent intensity: {best_parent_intensity:.3f}, "
-                                        #       f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
-                                    else:
-                                        spawn_reward -= self.spawn_failure_penalty
-                                        # print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
-                                        #       f"Parent intensity: {best_parent_intensity:.3f}, "
-                                        #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
+                                    spawn_reward -= self.spawn_failure_penalty
+                                    # print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
+                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
+                                    #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
         
         # Add PBRS shaping term for simple_spawn_only_mode
         if self.simple_spawn_only_mode and self._pbrs_spawn_enabled and self._pbrs_spawn_coeff != 0.0:
@@ -1678,8 +1384,19 @@ class DurotaxisEnv(gym.Env):
             if state['num_nodes'] == 0:
                 return 0.0
             
-            centroid_x = state.get('centroid_x', 0.0)
-            goal_x = state.get('goal_x', 1.0)
+            # Prefer explicit field, else derive from graph_features
+            if 'centroid_x' in state and state['centroid_x'] is not None:
+                centroid_x = float(state['centroid_x'])
+            else:
+                gf = state.get('graph_features', None)
+                if isinstance(gf, torch.Tensor) and gf.numel() >= 4:
+                    centroid_x = float(gf[3].item())
+                elif isinstance(gf, (list, tuple)) and len(gf) >= 4:
+                    centroid_x = float(gf[3])
+                else:
+                    return 0.0
+            
+            goal_x = float(getattr(self, 'goal_x', self.substrate.width - 1))
             
             # Distance to goal (negative potential, so moving closer increases Phi)
             distance_to_goal = goal_x - centroid_x
@@ -1687,7 +1404,7 @@ class DurotaxisEnv(gym.Env):
             
             return float(phi)
             
-        except Exception as e:
+        except Exception:
             # Fail gracefully
             return 0.0
     
@@ -1823,133 +1540,6 @@ class DurotaxisEnv(gym.Env):
             delete_reward += self._pbrs_delete_coeff * pbrs_shaping
         
         return delete_reward
-    
-    def _calculate_deletion_efficiency_reward(self, prev_state, new_state):
-        """
-        Reward the agent for deleting old, stagnant, or strategically unimportant nodes.
-        
-        This "tidiness" reward encourages the agent to prune its network efficiently,
-        particularly targeting nodes that are:
-        - Old (existed for many steps without contributing)
-        - Stagnant (not moving/exploring)
-        - On low-quality substrate (marked by the heuristic system)
-        
-        Args:
-            prev_state: Previous state dict (using snapshots)
-            new_state: Current state dict (using snapshots)
-            
-        Returns:
-            float: Efficiency reward for smart deletions
-        """
-        # Use snapshot data instead of topology references
-        if prev_state['num_nodes'] == 0 or 'persistent_id' not in prev_state:
-            return 0.0
-
-        efficiency_reward = 0.0
-        
-        # Get persistent IDs from snapshots
-        prev_pids = set(prev_state['persistent_id'].cpu().tolist())
-        current_pids = set(new_state['persistent_id'].cpu().tolist()) if new_state['num_nodes'] > 0 else set()
-        
-        deleted_pids = prev_pids - current_pids
-
-        if not deleted_pids:
-            return 0.0
-
-        # Define reward multipliers (tuned for balanced learning)
-        AGE_REWARD_MULTIPLIER = 0.05      # Reward for deleting old nodes
-        STAGNATION_REWARD_MULTIPLIER = 0.1  # Reward for deleting stagnant nodes
-        
-        for pid in deleted_pids:
-            reward = 0.0
-            
-            # Reward for deleting old nodes (>50 steps old)
-            if pid in self._node_age and self._node_age[pid] > 50:
-                age_bonus = (self._node_age[pid] - 50) * AGE_REWARD_MULTIPLIER
-                reward += age_bonus
-
-            # Reward for deleting stagnant nodes (>20 steps without movement)
-            if pid in self._node_stagnation and self._node_stagnation[pid]['count'] > 20:
-                stagnation_bonus = (self._node_stagnation[pid]['count'] - 20) * STAGNATION_REWARD_MULTIPLIER
-                reward += stagnation_bonus
-            
-            if reward > 0:
-                # Optional: Debug logging (uncomment for debugging)
-                # print(f"🧹 Tidiness reward! Deleted node {pid} "
-                #       f"(Age: {self._node_age.get(pid, 0)}, "
-                #       f"Stagnant: {self._node_stagnation.get(pid, {}).get('count', 0)}). "
-                #       f"Reward: +{reward:.2f}")
-                efficiency_reward += reward
-                
-        return efficiency_reward
-
-    def _calculate_edge_reward(self, prev_state, new_state, actions):
-        """
-        Calculate reward/penalty based on edge directions to encourage rightward movement.
-        
-        Logic:
-        - For each edge, calculate direction vector from source to destination node
-        - If edge points rightward (positive x-direction): +edge_reward
-        - If edge points leftward (negative x-direction): -edge_reward
-        - Vertical edges (same x-coordinate) get no reward/penalty
-        
-        Args:
-            prev_state: Previous state dict (not used but kept for consistency)
-            new_state: Current state dict containing topology
-            actions: Actions taken this step (not used but kept for consistency)
-            
-        Returns:
-            float: Edge reward (positive for rightward bias, negative for leftward bias)
-        """
-        edge_reward = 0.0
-        
-        # Need current topology to analyze edges
-        if 'topology' not in new_state or new_state['topology'] is None:
-            return 0.0
-            
-        current_topology = new_state['topology']
-        
-        # Check if topology has any nodes and edges
-        if current_topology.graph.num_nodes() == 0 or current_topology.graph.num_edges() == 0:
-            return 0.0
-        
-        # Get node positions and edge information
-        node_positions = current_topology.graph.ndata['pos']  # Shape: [num_nodes, 2]
-        edges = current_topology.graph.edges()  # Returns (src_nodes, dst_nodes)
-        src_nodes, dst_nodes = edges
-        
-        rightward_edges = 0
-        leftward_edges = 0
-        
-        # Analyze each edge direction
-        for i in range(len(src_nodes)):
-            src_idx = src_nodes[i].item()
-            dst_idx = dst_nodes[i].item()
-            
-            # Get positions of source and destination nodes
-            src_pos = node_positions[src_idx]  # [x, y]
-            dst_pos = node_positions[dst_idx]  # [x, y]
-            
-            # Calculate direction vector
-            dx = dst_pos[0].item() - src_pos[0].item()  # x-direction component
-            
-            # Categorize edge direction
-            if dx > 0.01:  # Rightward (with small threshold to avoid numerical issues)
-                rightward_edges += 1
-                edge_reward += self.edge_rightward_bonus
-            elif dx < -0.01:  # Leftward
-                leftward_edges += 1
-                edge_reward -= self.edge_leftward_penalty
-            # If |dx| <= 0.01, consider it vertical/neutral (no reward/penalty)
-        
-        # Log edge direction analysis for debugging
-        if rightward_edges > 0 or leftward_edges > 0:
-            total_edges = current_topology.graph.num_edges()
-            # print(f"🔀 Edge analysis: {rightward_edges} rightward (+), {leftward_edges} leftward (-), "
-            #       f"{total_edges - rightward_edges - leftward_edges} vertical/neutral (0) "
-            #       f"| Reward: {edge_reward:.3f}")
-        
-        return edge_reward
 
     def _node_exists_in_topology(self, node_x, node_y, topology, tolerance=None):
         """
@@ -2528,21 +2118,16 @@ class DurotaxisEnv(gym.Env):
         self.empty_graph_recovery_last_step = None
         
         # OPTIMIZATION 2: Preallocate reward dict template to reduce per-step allocations
+        # Only includes components used in refactored system
         self._reward_components_template = {
             'total_reward': 0.0,
             'graph_reward': 0.0,
-            'spawn_reward': 0.0,
             'delete_reward': 0.0,
-            'deletion_efficiency_reward': 0.0,
-            'edge_reward': 0.0,
-            'centroid_reward': 0.0,
-            'milestone_reward': 0.0,
-            'node_rewards': [],
-            'total_node_reward': 0.0,
-            'survival_reward': 0.0,
+            'spawn_reward': 0.0,
+            'distance_signal': 0.0,
+            'num_nodes': 0,
             'empty_graph_recovery_penalty': 0.0,
-            'termination_reward': 0.0,
-            'num_nodes': 0
+            'termination_reward': 0.0
         }
         
         # Reset topology
