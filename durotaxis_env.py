@@ -1005,7 +1005,7 @@ class DurotaxisEnv(gym.Env):
         print(
             f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
             f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
-            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.1f} S:{spawn_r:+4.1f} Dist:{distance_r:+4.1f}) | "
+            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.3f} S:{spawn_r:+4.3f} Dist:{distance_r:+4.3f}) | "
             f"C={centroid_x:5.1f}{centroid_direction}{boundary_warning}{recovery_flag} | "
             f"Actions: dr={action_params['delete_ratio']:.3f} γ={action_params['gamma']:.2f} "
             f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f} | "
