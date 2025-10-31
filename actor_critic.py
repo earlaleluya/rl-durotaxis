@@ -743,7 +743,9 @@ class HybridActorCritic(nn.Module):
             'total_log_probs': continuous_log_probs,  # Only continuous actions
             'value_predictions': output['value_predictions'],
             'entropy': continuous_entropy.mean(),
-            'continuous_entropy': continuous_entropy.mean()
+            'continuous_entropy': continuous_entropy.mean(),
+            'continuous_mu': continuous_mu,  # For proper KL divergence
+            'continuous_std': continuous_std  # For proper KL divergence
         }
     
     def get_topology_actions(self, output: Dict[str, torch.Tensor], node_positions: List[Tuple[int, float]]) -> Dict[int, str]:

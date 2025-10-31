@@ -124,12 +124,14 @@ class TrajectoryBuffer:
             'values': [],
             'old_values': [],  # Store old values for PPO value clipping
             'log_probs': [],
+            'continuous_mu': [],      # Store mu for proper KL divergence
+            'continuous_std': [],     # Store std for proper KL divergence
             'final_values': None,
             'terminated': False,
             'success': False
         }
     
-    def add_step(self, state, action, reward, value, log_prob, old_value=None):
+    def add_step(self, state, action, reward, value, log_prob, old_value=None, continuous_mu=None, continuous_std=None):
         """Add a step to the current episode"""
         self.current_episode['states'].append(state)
         self.current_episode['actions'].append(action)
@@ -137,6 +139,8 @@ class TrajectoryBuffer:
         self.current_episode['values'].append(value)
         self.current_episode['old_values'].append(old_value if old_value is not None else value)
         self.current_episode['log_probs'].append(log_prob)
+        self.current_episode['continuous_mu'].append(continuous_mu)
+        self.current_episode['continuous_std'].append(continuous_std)
     
     def finish_episode(self, final_values, terminated, success):
         """Finish the current episode and add it to the buffer"""
@@ -157,6 +161,8 @@ class TrajectoryBuffer:
         all_values = []
         all_old_values = []
         all_log_probs = []
+        all_continuous_mu = []
+        all_continuous_std = []
         
         # Per-component returns and advantages (dict of lists)
         all_returns = {}
@@ -169,6 +175,8 @@ class TrajectoryBuffer:
             all_values.extend(episode['values'])
             all_old_values.extend(episode['old_values'])
             all_log_probs.extend(episode['log_probs'])
+            all_continuous_mu.extend(episode['continuous_mu'])
+            all_continuous_std.extend(episode['continuous_std'])
             
             # Handle per-component returns and advantages
             if isinstance(episode['returns'], dict):
@@ -197,6 +205,8 @@ class TrajectoryBuffer:
             'values': all_values,
             'old_values': all_old_values,
             'log_probs': all_log_probs,
+            'continuous_mu': all_continuous_mu,
+            'continuous_std': all_continuous_std,
             'returns': all_returns,  # Dict[component_name, List[Tensor]]
             'advantages': all_advantages  # Dict[component_name, List[Tensor]]
         }
@@ -2406,7 +2416,7 @@ class DurotaxisTrainer:
         
         return is_successful, success_criteria
     
-    def collect_episode(self, episode_num: int = 0) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], bool, bool]:
+    def collect_episode(self, episode_num: int = 0) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], List[Dict], List[torch.Tensor], List[torch.Tensor], Optional[Dict], bool, bool]:
         """Collect one episode of experience with curriculum learning support"""
         # Apply curriculum learning configuration
         curriculum_config = self._get_curriculum_config(episode_num)
@@ -2444,6 +2454,8 @@ class DurotaxisTrainer:
         rewards = []
         values = []
         log_probs_list = []
+        continuous_mu_list = []
+        continuous_std_list = []
         
         obs, info = self.env.reset()
         # Update state extractor with current topology
@@ -2531,6 +2543,10 @@ class DurotaxisTrainer:
                     'continuous': log_probs,
                     'total': log_probs
                 })
+                
+                # Store distribution parameters for proper KL divergence computation
+                continuous_mu_list.append(output['continuous_mu'])
+                continuous_std_list.append(output['continuous_std'])
                 
                 # Get node positions sorted by x-coordinate for delete ratio strategy
                 node_features = state_dict['node_features']
@@ -2665,7 +2681,7 @@ class DurotaxisTrainer:
             # Negative termination rewards indicate failures (penalties)
             success = termination_reward > 0
         
-        return states, actions_taken, rewards, values, log_probs_list, final_values, terminated, success
+        return states, actions_taken, rewards, values, log_probs_list, continuous_mu_list, continuous_std_list, final_values, terminated, success
     
     def compute_returns_and_advantages(self, rewards: List[Dict], values: List[Dict], 
                                      final_values: Optional[Dict] = None, terminated: bool = False,
@@ -2741,7 +2757,9 @@ class DurotaxisTrainer:
     
     def compute_hybrid_policy_loss(self, old_log_probs_dict: Dict[str, torch.Tensor], 
                                   eval_output: Dict[str, torch.Tensor], 
-                                  advantage: float, episode: int = 0) -> Dict[str, torch.Tensor]:
+                                  advantage: float, episode: int = 0, 
+                                  old_mu: Optional[torch.Tensor] = None, 
+                                  old_std: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Compute policy loss for continuous actions (delete ratio architecture) with PPO clipping"""
         policy_losses = {}
         
@@ -2771,8 +2789,22 @@ class DurotaxisTrainer:
             old_continuous_log_prob = old_log_probs_dict['continuous']
             new_continuous_log_prob = eval_output['continuous_log_probs']
             
-            # Approximate KL divergence: KL ≈ E[log π_old - log π_new] (device-agnostic)
-            approx_kl_continuous = (old_continuous_log_prob - new_continuous_log_prob).clamp_min(0.0)
+            # Exact KL divergence using PyTorch's built-in kl_divergence for Normal distributions
+            # KL(π_old || π_new) = sum over dims of: 0.5 * (log(σ_new²/σ_old²) + (σ_old² + (μ_old - μ_new)²)/σ_new² - 1)
+            if old_mu is not None and old_std is not None and 'continuous_mu' in eval_output and 'continuous_std' in eval_output:
+                new_mu = eval_output['continuous_mu']
+                new_std = eval_output['continuous_std']
+                
+                # Create Normal distributions
+                old_dist = torch.distributions.Normal(old_mu, old_std)
+                new_dist = torch.distributions.Normal(new_mu, new_std)
+                
+                # Compute exact KL divergence (sum over action dimensions)
+                approx_kl_continuous = torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1)
+            else:
+                # Fallback: use log probability difference (less accurate but still works)
+                # Note: This is only an approximation and can be negative, but we keep it for backwards compatibility
+                approx_kl_continuous = (old_continuous_log_prob - new_continuous_log_prob)
             
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_continuous_log_prob - old_continuous_log_prob, -20.0, 20.0)
@@ -2853,7 +2885,8 @@ class DurotaxisTrainer:
     
     def update_policy(self, states: List[Dict], actions: List[Dict], 
                      returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
-                     old_log_probs: List[Dict], episode: int = 0) -> Dict[str, float]:
+                     old_log_probs: List[Dict], continuous_mu: List[torch.Tensor], 
+                     continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
         """Update policy using PPO with efficient batched re-evaluation and enhanced entropy"""
         if not states or not actions:
             return {}
@@ -2938,8 +2971,12 @@ class DurotaxisTrainer:
             advantage = total_advantages[i]
             
             # Compute hybrid policy loss with continuous-only handling
+            # Pass old distribution parameters for proper KL divergence
+            old_mu = continuous_mu[i] if i < len(continuous_mu) else None
+            old_std = continuous_std[i] if i < len(continuous_std) else None
+            
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
-                old_log_probs_dict, eval_output, advantage, episode
+                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std
             )
             
             hybrid_policy_losses.append(hybrid_loss_dict)
@@ -3054,7 +3091,8 @@ class DurotaxisTrainer:
 
     def update_policy_minibatch(self, states: List[Dict], actions: List[Dict], 
                                returns: Dict[str, List[torch.Tensor]], advantages: Dict[str, List[torch.Tensor]],
-                               old_log_probs: List[Dict], old_values: List[Dict], episode: int = 0) -> Dict[str, float]:
+                               old_log_probs: List[Dict], old_values: List[Dict], continuous_mu: List[torch.Tensor], 
+                               continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
         """Update policy using a minibatch of data from the trajectory buffer with per-component structure"""
         if not states or not actions:
             return {}
@@ -3098,11 +3136,12 @@ class DurotaxisTrainer:
                 old_values_dict[component] = torch.zeros(len(states), device=self.device)
         
         # Call the original update_policy method with per-component data
-        return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, episode)
+        return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, continuous_mu, continuous_std, episode)
 
     def update_policy_with_value_clipping(self, states: List[Dict], actions: List[Dict], 
                                         returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
-                                        old_log_probs: List[Dict], old_values: Dict[str, torch.Tensor], episode: int = 0) -> Dict[str, float]:
+                                        old_log_probs: List[Dict], old_values: Dict[str, torch.Tensor], 
+                                        continuous_mu: List[torch.Tensor], continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
         """Update policy using PPO with value clipping for stable critic updates"""
         if not states or not actions:
             return {}
@@ -3187,8 +3226,12 @@ class DurotaxisTrainer:
             advantage = total_advantages[i]
             
             # Compute hybrid policy loss with continuous-only handling
+            # Pass old distribution parameters for proper KL divergence
+            old_mu = continuous_mu[i] if i < len(continuous_mu) else None
+            old_std = continuous_std[i] if i < len(continuous_std) else None
+            
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
-                old_log_probs_dict, eval_output, advantage, episode
+                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std
             )
             
             hybrid_policy_losses.append(hybrid_loss_dict)
@@ -3562,14 +3605,15 @@ class DurotaxisTrainer:
         """Helper function to collect an episode and add it to the buffer."""
         self.trajectory_buffer.start_episode()
         
-        states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode(episode_count)
+        states, actions, rewards, values, log_probs, continuous_mu_list, continuous_std_list, final_values, terminated, success = self.collect_episode(episode_count)
         
         if not rewards:
             return [], [], [], [], [], None, False, False
         
         for i in range(len(states)):
             self.trajectory_buffer.add_step(
-                states[i], actions[i], rewards[i], values[i], log_probs[i], values[i]
+                states[i], actions[i], rewards[i], values[i], log_probs[i], values[i],
+                continuous_mu_list[i], continuous_std_list[i]
             )
         
         self.trajectory_buffer.finish_episode(final_values, terminated, success)
