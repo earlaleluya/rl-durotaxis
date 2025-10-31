@@ -252,6 +252,10 @@ class DurotaxisEnv(gym.Env):
         # Centroid-to-goal distance-only mode flag
         self.centroid_distance_only_mode = config.get('centroid_distance_only_mode', False)
         
+        # Simple spawn-only mode flag
+        self.simple_spawn_only_mode = config.get('simple_spawn_only_mode', False)
+        self.spawn_reward = float(config.get('spawn_reward', 2.0))
+        
         # Include termination rewards flag (for special modes)
         # Default behavior:
         #   - If both modes are False: Always use termination rewards (default True, ignored)
@@ -417,6 +421,12 @@ class DurotaxisEnv(gym.Env):
         self._pbrs_centroid_enabled = pbrs_centroid.get('enabled', False)
         self._pbrs_centroid_coeff = float(pbrs_centroid.get('shaping_coeff', 0.0))
         self._pbrs_centroid_scale = float(pbrs_centroid.get('phi_distance_scale', 1.0))
+        
+        # Spawn reward PBRS parameters
+        pbrs_spawn = self.spawn_rewards.get('pbrs', {})
+        self._pbrs_spawn_enabled = pbrs_spawn.get('enabled', False)
+        self._pbrs_spawn_coeff = float(pbrs_spawn.get('shaping_coeff', 0.0))
+        self._pbrs_spawn_w_spawnable = float(pbrs_spawn.get('phi_weight_spawnable', 1.0))
 
         self.current_step = 0
         self.current_episode = 0
@@ -879,39 +889,30 @@ class DurotaxisEnv(gym.Env):
             reward_components['termination_reward'] = termination_reward
             
             # Determine if termination rewards should be included
-            is_normal_mode = not self.simple_delete_only_mode and not self.centroid_distance_only_mode
-            is_combined_mode = self.simple_delete_only_mode and self.centroid_distance_only_mode
-            is_special_mode_with_termination = (self.simple_delete_only_mode or self.centroid_distance_only_mode) and self.include_termination_rewards
+            # Check which special modes are enabled
+            has_delete_mode = self.simple_delete_only_mode
+            has_centroid_mode = self.centroid_distance_only_mode
+            has_spawn_mode = self.simple_spawn_only_mode
+            num_special_modes = sum([has_delete_mode, has_centroid_mode, has_spawn_mode])
+            
+            is_normal_mode = num_special_modes == 0
+            is_special_mode_with_termination = num_special_modes > 0 and self.include_termination_rewards
             
             # Include termination rewards if:
-            # 1. Normal mode (both special modes disabled), OR
+            # 1. Normal mode (all special modes disabled), OR
             # 2. Special mode with include_termination_rewards=True
             if is_normal_mode or is_special_mode_with_termination:
-                if is_combined_mode:
-                    # Combined mode: Distance + Delete + Scaled Termination
-                    # Apply scaled and clipped termination (prioritize distance signal)
+                # Apply termination reward scaling/clipping if centroid mode is enabled
+                if has_centroid_mode:
+                    # Centroid mode(s): Apply scaled and clipped termination (prioritize distance signal)
                     scaled_termination = termination_reward * self.dm_term_scale
                     if self.dm_term_clip:
                         scaled_termination = max(-self.dm_term_clip_val, 
                                                  min(self.dm_term_clip_val, scaled_termination))
                     reward_components['total_reward'] += scaled_termination
-                    reward_components['termination_reward_scaled'] = scaled_termination
-                elif self.simple_delete_only_mode:
-                    # Simple delete mode only: Replace total with graph_reward + termination
-                    reward_components['total_reward'] = (
-                        reward_components.get('graph_reward', 0.0) + termination_reward
-                    )
-                elif self.centroid_distance_only_mode:
-                    # Centroid distance mode only: Apply scaled and clipped termination
-                    scaled_termination = termination_reward * self.dm_term_scale
-                    if self.dm_term_clip:
-                        scaled_termination = max(-self.dm_term_clip_val, 
-                                                 min(self.dm_term_clip_val, scaled_termination))
-                    reward_components['total_reward'] += scaled_termination
-                    # Store the scaled version for logging
                     reward_components['termination_reward_scaled'] = scaled_termination
                 else:
-                    # Normal mode: Add termination reward to existing total
+                    # Normal mode or delete/spawn modes: Add full termination reward
                     reward_components['total_reward'] += termination_reward
             # else: Special mode without include_termination_rewards flag - ignore termination rewards
         
@@ -1184,146 +1185,83 @@ class DurotaxisEnv(gym.Env):
         # Add milestone rewards for reaching distance thresholds
         milestone_reward = self._calculate_milestone_reward(new_state)
         
-        # Final combined reward
+        # Final combined reward (default for normal mode)
         total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
         
-        # === COMBINED MODE: Distance Shaping + Delete Penalties ===
-        # When BOTH modes are enabled, combine distance shaping with delete penalties
-        if self.simple_delete_only_mode and self.centroid_distance_only_mode:
-            # === 1. Calculate Distance Signal (Dense, Directional) ===
-            centroid_x = 0.0
-            if num_nodes > 0:
-                try:
-                    graph_features = new_state.get('graph_features')
-                    if graph_features is not None:
-                        if isinstance(graph_features, torch.Tensor):
-                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
-                        else:
-                            centroid_x = graph_features[3]
-                except (IndexError, TypeError):
-                    # Fallback: calculate centroid from node positions
-                    node_features = new_state.get('node_features', [])
-                    if len(node_features) > 0:
-                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
-                                     for node in node_features]
-                        centroid_x = sum(x_positions) / len(x_positions)
+        # === MODE COMBINATIONS (8 total: 2^3 for delete/centroid/spawn) ===
+        # Check which special modes are enabled
+        has_delete_mode = self.simple_delete_only_mode
+        has_centroid_mode = self.centroid_distance_only_mode
+        has_spawn_mode = self.simple_spawn_only_mode
+        
+        # Count how many special modes are enabled
+        num_special_modes = sum([has_delete_mode, has_centroid_mode, has_spawn_mode])
+        
+        # If any special mode is enabled, override the normal reward composition
+        if num_special_modes > 0:
+            # Initialize distance_signal (will be used if centroid_mode is enabled)
+            distance_signal = 0.0
             
-            # Use delta distance shaping (potential-based) for rightward migration
-            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
-                # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
-                # Positive when moving right, negative when moving left
-                delta_x = centroid_x - self._prev_centroid_x
-                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
-            else:
-                # Fallback: static distance penalty
-                if self.goal_x > 0:
-                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
+            # === STEP 1: Calculate distance signal (if needed) ===
+            if has_centroid_mode:
+                # Calculate centroid x position
+                centroid_x = 0.0
+                if num_nodes > 0:
+                    try:
+                        graph_features = new_state.get('graph_features')
+                        if graph_features is not None:
+                            if isinstance(graph_features, torch.Tensor):
+                                centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                            else:
+                                centroid_x = graph_features[3]
+                    except (IndexError, TypeError):
+                        # Fallback: calculate centroid from node positions
+                        node_features = new_state.get('node_features', [])
+                        if len(node_features) > 0:
+                            x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                         for node in node_features]
+                            centroid_x = sum(x_positions) / len(x_positions)
+                
+                # Use delta distance shaping (potential-based) for rightward migration
+                if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
+                    # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
+                    # Positive when moving right, negative when moving left
+                    delta_x = centroid_x - self._prev_centroid_x
+                    distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
                 else:
-                    distance_signal = 0.0
+                    # Fallback: static distance penalty
+                    if self.goal_x > 0:
+                        distance_signal = -(self.goal_x - centroid_x) / self.goal_x
+                    else:
+                        distance_signal = 0.0
+                
+                # Update previous centroid for next step
+                self._prev_centroid_x = centroid_x
             
-            # Update previous centroid for next step
-            self._prev_centroid_x = centroid_x
+            # === STEP 2: Compose reward from enabled special modes ===
+            # Build total_reward by adding ONLY the enabled mode components
+            mode_reward = 0.0
             
-            # === 2. Calculate Delete Rewards/Penalties (Efficient Node Management) ===
-            # Use the full delete_reward which now includes:
-            # - Rule 1 (Persistence Penalty): to_delete=1 but still exists → -reward
-            # - Rule 2 (Improper Deletion): to_delete=0 but deleted → -reward
-            # - Proper Deletion: to_delete=1 and deleted → +reward
-            # - Proper Persistence: to_delete=0 and still exists → +reward
+            if has_delete_mode:
+                mode_reward += delete_reward
             
-            # NO growth penalty - Rule 0 removed per user requirements
-            # When num_nodes > max_critical_nodes, it only signals tagging (no reward/penalty)
+            if has_centroid_mode:
+                mode_reward += distance_signal
             
-            # === 3. Combine Distance + Delete ===
-            total_reward = distance_signal + delete_reward
-            graph_reward = distance_signal + delete_reward
+            if has_spawn_mode:
+                mode_reward += spawn_reward
             
-            # Zero out all other components (keep reward focused)
-            spawn_reward = 0.0
-            # delete_reward already calculated above, keep for logging
-            efficiency_reward = 0.0
-            edge_reward = 0.0
-            centroid_reward = 0.0
-            milestone_reward = 0.0
-            total_node_reward = 0.0
-            survival_reward = 0.0
-        
-        # === SIMPLE DELETE-ONLY MODE ===
-        # When enabled, use ONLY delete rewards/penalties (Rule 1 & 2)
-        # Rule 0 (growth penalty) is REMOVED - no penalty/reward when num_nodes > max_critical_nodes
-        # Instead, excess nodes trigger tagging logic: nodes with intensity < avg are marked to_delete=1
-        elif self.simple_delete_only_mode:
-            # Use the full delete_reward which now includes:
-            # - Rule 1 (Persistence Penalty): to_delete=1 but still exists → -reward
-            # - Rule 2 (Improper Deletion): to_delete=0 but deleted → -reward
-            # - Proper Deletion: to_delete=1 and deleted → +reward
-            # - Proper Persistence: to_delete=0 and still exists → +reward
+            # Override total_reward with special mode composition
+            total_reward = mode_reward
+            graph_reward = mode_reward
             
-            # NO growth penalty - Rule 0 removed per user requirements
-            # When num_nodes > max_critical_nodes, it only signals tagging (no reward/penalty)
+            # Zero out components NOT in special modes
+            if not has_spawn_mode:
+                spawn_reward = 0.0
+            if not has_delete_mode:
+                delete_reward = 0.0
             
-            total_reward = delete_reward
-            graph_reward = delete_reward
-            
-            # Zero out all other components
-            spawn_reward = 0.0
-            efficiency_reward = 0.0
-            edge_reward = 0.0
-            centroid_reward = 0.0
-            milestone_reward = 0.0
-            total_node_reward = 0.0
-            survival_reward = 0.0
-        
-        
-        # === CENTROID-TO-GOAL DISTANCE-ONLY MODE ===
-        # When enabled, provide ONLY distance-based penalty from centroid to goal
-        elif self.centroid_distance_only_mode:
-            # Calculate centroid x position
-            centroid_x = 0.0
-            if num_nodes > 0:
-                try:
-                    graph_features = new_state.get('graph_features')
-                    if graph_features is not None:
-                        if isinstance(graph_features, torch.Tensor):
-                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
-                        else:
-                            centroid_x = graph_features[3]
-                except (IndexError, TypeError) as e:
-                    # Fallback: calculate centroid from node positions
-                    node_features = new_state.get('node_features', [])
-                    if len(node_features) > 0:
-                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
-                                     for node in node_features]
-                        centroid_x = sum(x_positions) / len(x_positions)
-            
-            # === DISTANCE MODE OPTIMIZATION ===
-            # Use delta distance shaping (potential-based) for faster learning
-            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
-                # Delta distance shaping: reward = scale × (cx_t - cx_{t-1}) / goal_x
-                # Potential-based: Φ(s) = cx / goal_x, preserves optimal policy
-                # Positive when moving right, negative when moving left
-                delta_x = centroid_x - self._prev_centroid_x
-                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
-            else:
-                # Fallback: Static distance penalty (original behavior)
-                # Calculate distance penalty: -(goal_x - centroid_x) / goal_x
-                # As centroid approaches goal, penalty approaches 0
-                # If centroid is at or past goal, penalty is 0 or positive (reward)
-                if self.goal_x > 0:
-                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
-                else:
-                    distance_signal = 0.0
-            
-            # Update previous centroid for next step
-            self._prev_centroid_x = centroid_x
-            
-            # Set total reward to distance signal only
-            total_reward = distance_signal
-            graph_reward = distance_signal
-            
-            # Zero out all other components
-            spawn_reward = 0.0
-            delete_reward = 0.0
+            # Always zero these in special modes
             efficiency_reward = 0.0
             edge_reward = 0.0
             centroid_reward = 0.0
@@ -1547,9 +1485,17 @@ class DurotaxisEnv(gym.Env):
         """
         Calculate reward for durotaxis-based spawning.
         
-        Reward rule: If a node spawns a new node and the substrate intensity 
-        of the new node is >= delta_intensity higher than the spawning node,
-        then reward += spawn_success_reward, otherwise penalty -= spawn_failure_penalty
+        Two modes:
+        1. Normal mode: 
+           - Reward += spawn_success_reward if ΔI >= delta_intensity
+           - Penalty -= spawn_failure_penalty otherwise
+           - Includes boundary checking penalties
+        
+        2. Simple spawn-only mode:
+           - Reward += spawn_reward if ΔI >= delta_intensity
+           - Penalty -= spawn_reward if ΔI < delta_intensity
+           - NO boundary checking
+           - Includes PBRS shaping term
         
         Args:
             prev_state: Previous topology state
@@ -1586,7 +1532,8 @@ class DurotaxisEnv(gym.Env):
                             new_node_y = new_node_pos[1].item()
                             
                             # Check if spawned near boundary (boundary-aware spawning)
-                            if self.spawn_boundary_check:
+                            # Skip boundary checking in simple_spawn_only_mode
+                            if self.spawn_boundary_check and not self.simple_spawn_only_mode:
                                 substrate_height = self.substrate.height
                                 
                                 # Calculate distance from top/bottom boundaries
@@ -1628,16 +1575,32 @@ class DurotaxisEnv(gym.Env):
                             if best_parent_intensity is not None:
                                 intensity_difference = new_node_intensity - best_parent_intensity
                                 
-                                if intensity_difference >= self.delta_intensity:
-                                    spawn_reward += self.spawn_success_reward
-                                    # print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
-                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
-                                    #       f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
+                                # Use different reward values depending on mode
+                                if self.simple_spawn_only_mode:
+                                    # Simple mode: single reward value for both success and failure
+                                    if intensity_difference >= self.delta_intensity:
+                                        spawn_reward += self.spawn_reward
+                                    else:
+                                        spawn_reward -= self.spawn_reward
                                 else:
-                                    spawn_reward -= self.spawn_failure_penalty
-                                    # print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
-                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
-                                    #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
+                                    # Normal mode: different values for success and failure
+                                    if intensity_difference >= self.delta_intensity:
+                                        spawn_reward += self.spawn_success_reward
+                                        # print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
+                                        #       f"Parent intensity: {best_parent_intensity:.3f}, "
+                                        #       f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
+                                    else:
+                                        spawn_reward -= self.spawn_failure_penalty
+                                        # print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
+                                        #       f"Parent intensity: {best_parent_intensity:.3f}, "
+                                        #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
+        
+        # Add PBRS shaping term for simple_spawn_only_mode
+        if self.simple_spawn_only_mode and self._pbrs_spawn_enabled and self._pbrs_spawn_coeff != 0.0:
+            phi_prev = self._phi_spawn_potential(prev_state)
+            phi_new = self._phi_spawn_potential(new_state)
+            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
+            spawn_reward += self._pbrs_spawn_coeff * pbrs_shaping
         
         return spawn_reward
     
@@ -1722,6 +1685,53 @@ class DurotaxisEnv(gym.Env):
             distance_to_goal = goal_x - centroid_x
             phi = -self._pbrs_centroid_scale * distance_to_goal
             
+            return float(phi)
+            
+        except Exception as e:
+            # Fail gracefully
+            return 0.0
+    
+    def _phi_spawn_potential(self, state):
+        """
+        Compute potential function Phi(s) for spawn reward shaping.
+        
+        Uses only current state (Markov property):
+        - spawnable_nodes(s): count of nodes on high-intensity substrate
+        - high-intensity: substrate_intensity >= spawn intensity threshold
+        
+        Phi(s) = w_spawnable * spawnable_nodes(s)
+        
+        Spawning on high-intensity substrate increases spawnable count → Phi increases → positive shaping
+        Spawning on low-intensity substrate doesn't increase count → no Phi change → no shaping bonus
+        
+        Args:
+            state: State dict containing node intensities
+            
+        Returns:
+            float: Potential value Phi(s)
+        """
+        try:
+            if state['num_nodes'] == 0:
+                return 0.0
+            
+            # Get intensities from state
+            intensities = state.get('intensity', None)
+            if intensities is None:
+                return 0.0
+            
+            # Convert to numpy for device-agnostic computation
+            if hasattr(intensities, 'detach'):
+                intensities_np = intensities.detach().cpu().numpy()
+            else:
+                intensities_np = np.asarray(intensities)
+            
+            intensities_np = intensities_np.astype(np.float32)
+            
+            # Count nodes with high substrate intensity (spawnable candidates)
+            # Use self.delta_intensity as threshold (same as spawn success criterion)
+            spawnable_count = float((intensities_np >= self.delta_intensity).sum())
+            
+            phi = self._pbrs_spawn_w_spawnable * spawnable_count
             return float(phi)
             
         except Exception as e:

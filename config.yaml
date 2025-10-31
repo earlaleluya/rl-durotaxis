@@ -328,6 +328,20 @@ environment:
   simple_delete_only_mode: false  # Set to true to enable simplified reward system
   
   # ============================================================================
+  # EXPERIMENTAL: Simple Spawn-Only Mode
+  # ============================================================================
+  # When enabled, this mode provides ONLY spawn-based reward feedback:
+  # The agent receives ONLY:
+  #   - +spawn_reward if ΔI ≥ delta_intensity (successful spawn on good substrate)
+  #   - -spawn_reward if ΔI < delta_intensity (failed to improve intensity)
+  # NO boundary checking penalties are applied in this mode.
+  # ALL other rewards/penalties are disabled (movement, delete, milestones, termination, etc.)
+  # Use this to test if the agent can learn spawn quality optimization from intensity feedback alone.
+  # Can be combined with simple_delete_only_mode and/or centroid_distance_only_mode.
+  simple_spawn_only_mode: false  # Set to true to enable spawn-only reward mode
+  spawn_reward: 2.0               # Single reward/penalty value for spawn success/failure
+  
+  # ============================================================================
   # Observation Selection (Fast Fixed-Size Approach)
   # ============================================================================
   # When num_nodes > max_critical_nodes, select representative nodes using fast topk (O(N log K))
@@ -494,6 +508,13 @@ environment:
     spawn_near_boundary_penalty: 3.0  # Strong penalty for spawning nodes near boundaries
     spawn_in_danger_zone_penalty: 8.0 # SEVERE penalty for spawning in danger zone
     spawn_boundary_check: true    # Enable boundary checking for new spawns
+    
+    # Potential-Based Reward Shaping (PBRS) for spawn quality optimization
+    # Preserves optimal policy while improving credit assignment for spawnable nodes
+    pbrs:
+      enabled: false              # Set to true to enable PBRS for spawn reward
+      shaping_coeff: 0.0          # Shaping coefficient (0.0 = OFF, try 0.05-0.2)
+      phi_weight_spawnable: 1.0   # Weight for spawnable nodes (high-intensity positions)
   
   # Reward structure - Delete rewards
   delete_reward:

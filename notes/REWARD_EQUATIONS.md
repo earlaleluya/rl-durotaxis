@@ -46,11 +46,13 @@ Optional PBRS shaping (if enabled):
 - Shaping: $$F_{cen}(s_t,s_{t+1}) = \gamma\,\Phi_{cen}(s_{t+1}) - \Phi_{cen}(s_t)$$
 - Applied as: $$R_{centroid} = R_{centroid}^{base} + \text{shaping\_coeff}_{cen}\cdot F_{cen}(s_t,s_{t+1})$$
 
-4) Spawn reward (durotaxis-based) with boundary checks
+4) Spawn reward (durotaxis-based) with boundary checks (+ PBRS)
 
 Let J_{new} be indices of nodes spawned at t+1 (new_node flag = 1). For each j ∈ J_{new}:
 - Find parent p in s_t minimizing Euclidean distance to j
 - Intensity difference: ΔI_j = I_j^{t+1} − I_p^{t}
+
+Normal mode (simple_spawn_only_mode = False):
 - Intensity term:
   $$r^{intensity}_j = \begin{cases}
   +\text{spawn\_success\_reward}, & \Delta I_j \ge \Delta I_{\min}~(\text{delta\_intensity}) \\
@@ -62,8 +64,23 @@ Let J_{new} be indices of nodes spawned at t+1 (new_node flag = 1). For each j �
   -\text{spawn\_near\_boundary\_penalty}, & \text{danger\_zone\_threshold} \le d_j < \text{edge\_zone\_threshold} \\
   0, & \text{otherwise}
   \end{cases}$$
-Total spawn reward:
-$$R_{spawn} = \sum_{j\in J_{new}} \big( r^{intensity}_j + r^{bound}_j \big)$$
+
+Simple spawn-only mode (simple_spawn_only_mode = True):
+- Intensity term (simplified, no boundary checks):
+  $$r^{intensity}_j = \begin{cases}
+  +\text{spawn\_reward}, & \Delta I_j \ge \Delta I_{\min} \\
+  -\text{spawn\_reward}, & \text{otherwise}
+  \end{cases}$$
+- Boundary penalty: \(r^{bound}_j = 0\) (skipped in simple mode)
+
+Base spawn reward:
+$$R_{spawn}^{base} = \sum_{j\in J_{new}} \big( r^{intensity}_j + r^{bound}_j \big)$$
+
+Optional PBRS shaping (if enabled in simple_spawn_only_mode):
+- Potential with count over s: spawnable_nodes(s) = number of nodes with \(I_i \ge \Delta I_{\min}\)
+  $$\Phi_{spawn}(s) = w_{spawn}\,\mathrm{spawnable\_nodes}(s)$$
+- Shaping: $$F_{spawn}(s_t,s_{t+1}) = \gamma\,\Phi_{spawn}(s_{t+1}) - \Phi_{spawn}(s_t)$$
+- Applied as: $$R_{spawn} = R_{spawn}^{base} + \text{shaping\_coeff}_{spawn}\cdot F_{spawn}(s_t,s_{t+1})$$
 
 5) Delete compliance reward (+ PBRS)
 
@@ -177,32 +194,56 @@ $$R_{base} = R_{graph} + R_{node} + R_{survival(t)} + R_{milestone}$$
 where
 $$R_{graph} = R_{conn/grow/survive} + R_{act} + R_{centroid} + R_{spawn} + R_{delete} + R_{efficiency} + R_{edge}$$
 
-Modes:
+The environment supports 3 special mode flags: `simple_delete_only_mode` (D), `centroid_distance_only_mode` (C), and `simple_spawn_only_mode` (S). This gives 8 possible combinations (2^3):
 
-1) Normal mode (both special modes disabled)
+### 1) Normal mode (D=False, C=False, S=False)
 - Use full composition: \(R_{total} = R_{base}\)
 - On termination, add termination reward directly: \(R_{total} \leftarrow R_{total} + R_{term}\)
 
-2) Simple delete-only mode (simple_delete_only_mode = True)
-- Step reward focuses on deletion only:
-  $$R_{total} = R_{delete}$$
-- On termination (if include_termination_rewards = True), the environment sets:
-  $$R_{total} = R_{graph} + R_{term}$$
-  where \(R_{graph}\) is as computed that step (kept for logging consistency)
+### Special Mode Compositions (at least one mode flag = True):
 
-3) Centroid-distance-only mode (centroid_distance_only_mode = True)
-- Step reward focuses on distance signal:
-  $$R_{total} = R_{distance\,signal}$$
-  where the implementation uses delta-based shaping when enabled:
-  $$R_{distance\,signal} = \text{dm\_dist\_scale}\cdot \frac{C_x(s_{t+1}) - C_x(s_t)}{G} \quad \text{(if delta enabled)}$$
-  else static penalty: \(R = -(G - C_x(s_{t+1}))/G\)
-- On termination (if include_termination_rewards = True), the environment adds scaled+clipped termination:
+When any special mode is enabled, \(R_{total}\) is composed ONLY from the enabled mode components:
+$$R_{total} = \sum_{\text{enabled modes}} R_{\text{mode}}$$
+
+Where:
+- D (delete mode): contributes \(R_{delete}\)
+- C (centroid mode): contributes \(R_{distance\,signal}\)
+  - \(R_{distance\,signal} = \text{dm\_dist\_scale}\cdot \frac{C_x(s_{t+1}) - C_x(s_t)}{G}\) (if delta enabled)
+  - else: \(R_{distance\,signal} = -(G - C_x(s_{t+1}))/G\) (static penalty)
+- S (spawn mode): contributes \(R_{spawn}\) (using simplified spawn_reward, no boundary checks)
+
+All other components (survival, milestone, node rewards, etc.) are zeroed in special modes.
+
+### 2) Delete-only (D=True, C=False, S=False)
+$$R_{total} = R_{delete}$$
+
+### 3) Centroid-only (D=False, C=True, S=False)
+$$R_{total} = R_{distance\,signal}$$
+
+### 4) Spawn-only (D=False, C=False, S=True)
+$$R_{total} = R_{spawn}$$
+
+### 5) Delete + Centroid (D=True, C=True, S=False)
+$$R_{total} = R_{delete} + R_{distance\,signal}$$
+
+### 6) Delete + Spawn (D=True, C=False, S=True)
+$$R_{total} = R_{delete} + R_{spawn}$$
+
+### 7) Centroid + Spawn (D=False, C=True, S=True)
+$$R_{total} = R_{distance\,signal} + R_{spawn}$$
+
+### 8) All three modes (D=True, C=True, S=True)
+$$R_{total} = R_{delete} + R_{distance\,signal} + R_{spawn}$$
+
+### Termination Reward Handling in Special Modes:
+
+On termination, if `include_termination_rewards = True`:
+- If C (centroid mode) is enabled: apply scaled+clipped termination:
   $$R_{total} \leftarrow R_{total} + \mathrm{clip}\big(\text{dm\_term\_scale}\cdot R_{term},\, -\text{dm\_term\_clip\_val},\, \text{dm\_term\_clip\_val}\big)$$
+- Otherwise (only D and/or S): add full termination reward:
+  $$R_{total} \leftarrow R_{total} + R_{term}$$
 
-4) Combined mode (both special modes True)
-- Step reward combines distance signal and delete reward:
-  $$R_{total} = R_{distance\,signal} + R_{delete}$$
-- On termination (if include_termination_rewards = True), same scaled+clipped termination as above is added to \(R_{total}\).
+If `include_termination_rewards = False` in special modes, termination rewards are ignored.
 
 ## Termination reward/penalty
 
