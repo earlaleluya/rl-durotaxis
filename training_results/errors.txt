@@ -1,0 +1,3 @@
+ Ep525 Step 24: N=64 E=57 | R=+64.808 (D:+64.784 S:+0.000 Dist:+0.049) | C=180.0→ | Actions: dr=0.001 γ=8.07 α=3.66 n=0.398 θ=-0.430 | Termi=False Trunc=False
+🚨 Episode terminated: Too many nodes (256 > 200 critical threshold)
+📊 Ep525 Step 25: N=256 E=249 | R=+244.169 (D:+259.136 S:+0.000 Dist:+0.066) | C=187.9→ | Actions: dr=0.000 γ=12.65 α=2.80 n=0.449 θ=-0.493 | Termi=True Trunc=False
