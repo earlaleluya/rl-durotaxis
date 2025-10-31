@@ -134,7 +134,7 @@ actor_critic:
   
   # Action parameter bounds
   action_parameter_bounds:
-    delete_ratio: [0.0, 0.9]
+    delete_ratio: [0.0, 0.7]
     gamma: [0.5, 15.0]
     alpha: [0.5, 4.0]
     noise: [0.05, 0.5]
@@ -169,7 +169,7 @@ algorithm:
 # TRAINER CONFIGURATION
 # ============================================================================
 trainer:
-  substrate_type: random
+  substrate_type: linear
   total_episodes: 1000
   max_steps: 1000
   learning_rate: 0.0001

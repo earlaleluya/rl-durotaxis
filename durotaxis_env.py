@@ -1278,6 +1278,10 @@ class DurotaxisEnv(gym.Env):
         if new_num_nodes == 0:
             return spawn_reward
         
+        # DEBUG: Count new nodes and check flag values
+        num_new_nodes = 0
+        all_new_node_flags = []
+        
         # Use new_node flag to identify newly spawned nodes
         # The new_node flag is the last feature in the node feature vector
         for node_idx in range(new_num_nodes):
@@ -1285,10 +1289,14 @@ class DurotaxisEnv(gym.Env):
                 node_feature_vector = new_node_features[node_idx]
                 
                 # Check if this is a newly spawned node (new_node flag = 1.0)
-                if len(node_feature_vector) > 0:
-                    new_node_flag = node_feature_vector[-1].item()  # Last feature is new_node flag
+                # Node features: [x, y, intensity, in_deg, out_deg, centrality, centroid_dist, boundary, new_node, age, stagnation]
+                # new_node is at index 8 (0-indexed), NOT the last feature
+                if len(node_feature_vector) > 8:
+                    new_node_flag = node_feature_vector[8].item()  # Index 8 is new_node flag
+                    all_new_node_flags.append(new_node_flag)
                     
                     if new_node_flag == 1.0:  # This is a newly spawned node
+                        num_new_nodes += 1
                         # Get substrate intensity (3rd feature, index 2)
                         if len(node_feature_vector) > 2:
                             new_node_intensity = node_feature_vector[2].item()
@@ -1330,6 +1338,11 @@ class DurotaxisEnv(gym.Env):
                                     # print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
                                     #       f"Parent intensity: {best_parent_intensity:.3f}, "
                                     #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
+        
+        # DEBUG: Print spawn detection and reward
+        if not hasattr(self, '_debug_spawn_count'):
+            self._debug_spawn_count = 0
+            self._debug_no_spawn_count = 0
         
         # Add PBRS shaping term for simple_spawn_only_mode
         if self.simple_spawn_only_mode and self._pbrs_spawn_enabled and self._pbrs_spawn_coeff != 0.0:

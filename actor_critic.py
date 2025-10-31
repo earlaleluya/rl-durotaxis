@@ -858,13 +858,6 @@ class HybridPolicyAgent:
         # Store continuous actions for logging
         self.last_continuous_actions = output['continuous_actions']  # [5] tensor (single global action)
         
-        # Debug: print first few times to verify storage
-        if not hasattr(self, '_debug_count'):
-            self._debug_count = 0
-        if self._debug_count < 3:
-            print(f"🐛 DEBUG[{self._debug_count}]: Storing continuous_actions: {self.last_continuous_actions}")
-            self._debug_count += 1
-        
         # OPTIMIZATION 1: Use argpartition for O(n) selection instead of O(n log n) sort
         # Get node x-positions directly from node features
         node_features = state['node_features']

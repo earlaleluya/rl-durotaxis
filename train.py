@@ -146,7 +146,7 @@ class TrajectoryBuffer:
         self.episodes.append(self.current_episode)
     
     def get_batch_data(self):
-        """Get all trajectories as batch data"""
+        """Get all trajectories as batch data with per-component returns/advantages"""
         if not self.episodes:
             return None
             
@@ -157,8 +157,10 @@ class TrajectoryBuffer:
         all_values = []
         all_old_values = []
         all_log_probs = []
-        all_returns = []
-        all_advantages = []
+        
+        # Per-component returns and advantages (dict of lists)
+        all_returns = {}
+        all_advantages = {}
         
         for episode in self.episodes:
             all_states.extend(episode['states'])
@@ -167,8 +169,26 @@ class TrajectoryBuffer:
             all_values.extend(episode['values'])
             all_old_values.extend(episode['old_values'])
             all_log_probs.extend(episode['log_probs'])
-            all_returns.extend(episode['returns'])
-            all_advantages.extend(episode['advantages'])
+            
+            # Handle per-component returns and advantages
+            if isinstance(episode['returns'], dict):
+                # Per-component structure
+                for component, component_returns in episode['returns'].items():
+                    if component not in all_returns:
+                        all_returns[component] = []
+                    all_returns[component].extend(component_returns)
+                
+                for component, component_advantages in episode['advantages'].items():
+                    if component not in all_advantages:
+                        all_advantages[component] = []
+                    all_advantages[component].extend(component_advantages)
+            else:
+                # Legacy scalar structure - convert to dict with 'total_reward' key
+                if 'total_reward' not in all_returns:
+                    all_returns['total_reward'] = []
+                    all_advantages['total_reward'] = []
+                all_returns['total_reward'].extend(episode['returns'])
+                all_advantages['total_reward'].extend(episode['advantages'])
         
         return {
             'states': all_states,
@@ -177,12 +197,12 @@ class TrajectoryBuffer:
             'values': all_values,
             'old_values': all_old_values,
             'log_probs': all_log_probs,
-            'returns': all_returns,
-            'advantages': all_advantages
+            'returns': all_returns,  # Dict[component_name, List[Tensor]]
+            'advantages': all_advantages  # Dict[component_name, List[Tensor]]
         }
     
     def create_minibatches(self, minibatch_size: int):
-        """Create random minibatches from the buffer data"""
+        """Create random minibatches from the buffer data with per-component structure"""
         batch_data = self.get_batch_data()
         if not batch_data:
             return []
@@ -198,132 +218,119 @@ class TrajectoryBuffer:
             
             minibatch = {}
             for key, data in batch_data.items():
-                minibatch[key] = [data[idx] for idx in batch_indices]
+                if key in ['returns', 'advantages']:
+                    # Handle per-component dict structure
+                    minibatch[key] = {}
+                    for component, component_data in data.items():
+                        minibatch[key][component] = [component_data[idx] for idx in batch_indices]
+                else:
+                    # Regular list data
+                    minibatch[key] = [data[idx] for idx in batch_indices]
             
             minibatches.append(minibatch)
         
         return minibatches
     
-    def compute_returns_and_advantages_for_all_episodes(self, gamma: float, gae_lambda: float):
+    def compute_returns_and_advantages_for_all_episodes(self, gamma: float, gae_lambda: float, component_names: List[str] = None):
         """
-        OPTIMIZATION 4: GPU-vectorized GAE computation for all episodes.
-        Preallocates tensors and keeps computation on device for better performance.
+        PER-COMPONENT GAE: Compute returns and advantages separately for each reward component.
+        
+        This allows the critic's value heads to learn component-specific value estimates,
+        enabling the agent to improve on specific components (e.g., if delete_reward is lacking,
+        the agent can learn to prioritize actions that improve deletion).
+        
+        Args:
+            gamma: Discount factor
+            gae_lambda: GAE lambda parameter
+            component_names: List of component names to compute returns for
         """
+        if component_names is None:
+            component_names = ['total_reward', 'graph_reward', 'spawn_reward', 'delete_reward', 'edge_reward', 'total_node_reward']
+        
         for episode in self.episodes:
             rewards = episode['rewards']
             values = episode['values']
             final_values = episode['final_values']
             terminated = episode['terminated']
 
-            # Extract tensor from dict if needed
-            processed_values = []
-            for v in values:
-                if isinstance(v, dict):
-                    # Try 'total_value' first, fallback to 'total_reward', else error
-                    if 'total_value' in v:
-                        processed_values.append(v['total_value'])
-                    elif 'total_reward' in v:
-                        processed_values.append(v['total_reward'])
-                    else:
-                        raise ValueError(f"Value dict missing 'total_value' and 'total_reward': {v}")
-                else:
-                    processed_values.append(v)
-
             # Early exit for empty episodes
-            if not processed_values:
-                episode['returns'] = []
-                episode['advantages'] = []
+            if not values or not rewards:
+                episode['returns'] = {comp: [] for comp in component_names}
+                episode['advantages'] = {comp: [] for comp in component_names}
                 continue
 
-            # OPTIMIZATION 4a: Convert everything to tensors on device immediately
             T = len(rewards)
             device = self.device
             
-            # Preallocate tensors on device
-            values_tensor = torch.stack([v.to(device) if isinstance(v, torch.Tensor) else torch.tensor(v, device=device) 
-                                        for v in processed_values])
-            rewards_tensor = torch.tensor([r.get('total_reward', 0.0) if isinstance(r, dict) else r 
-                                          for r in rewards], device=device, dtype=torch.float32)
+            # Initialize per-component returns and advantages as dicts
+            episode['returns'] = {comp: [] for comp in component_names}
+            episode['advantages'] = {comp: [] for comp in component_names}
             
-            # Handle final value
-            if isinstance(final_values, dict):
-                if 'total_value' in final_values:
-                    final_value = final_values['total_value']
-                elif 'total_reward' in final_values:
-                    final_value = final_values['total_reward']
-                else:
-                    final_value = torch.tensor(0.0, device=device)
-            else:
-                final_value = final_values if final_values is not None else torch.tensor(0.0, device=device)
-            
-            # Ensure final_value is on device
-            if isinstance(final_value, torch.Tensor):
-                final_value = final_value.to(device)
-            else:
-                final_value = torch.tensor(final_value, device=device, dtype=torch.float32)
-            
-            # Ensure final_value has the same shape as values_tensor entries
-            # If values_tensor is 2D [T, num_components], final_value should match
-            if values_tensor.dim() > 1:
-                # Multi-dimensional values - ensure final_value matches
-                if final_value.dim() == 0:  # Scalar
-                    final_value = final_value.unsqueeze(0).expand(values_tensor.shape[1])
-                elif final_value.dim() == 1 and final_value.shape[0] != values_tensor.shape[1]:
-                    # Wrong size - pad or truncate
-                    if final_value.shape[0] == 1:
-                        final_value = final_value.expand(values_tensor.shape[1])
-                    else:
-                        # This shouldn't happen, but handle gracefully
-                        final_value = final_value[:values_tensor.shape[1]]
-            else:
-                # 1D values - ensure final_value is scalar
-                if final_value.dim() > 0:
-                    final_value = final_value.mean()  # Collapse to scalar
-
-            # OPTIMIZATION 4b: Vectorized GAE computation on GPU
-            # Preallocate output tensors
-            returns = torch.empty(T, device=device, dtype=torch.float32)
-            advantages = torch.empty(T, device=device, dtype=torch.float32)
-            
-            # Compute next values vector
-            # Handle both 1D and 2D values_tensor
-            if values_tensor.dim() == 1:
-                # Simple 1D case
-                next_values = torch.cat([values_tensor[1:], final_value.unsqueeze(0)])
-            else:
-                # 2D case: [T, num_components]
-                # Expand final_value to [1, num_components] to match
-                final_value_expanded = final_value.unsqueeze(0)
-                next_values = torch.cat([values_tensor[1:], final_value_expanded], dim=0)
-                # For GAE, we need scalar values, so take mean/sum across components
-                # Use the first component (total_value) or mean
-                values_tensor = values_tensor.mean(dim=1) if values_tensor.shape[1] > 1 else values_tensor.squeeze(1)
-                next_values = next_values.mean(dim=1) if next_values.shape[1] > 1 else next_values.squeeze(1)
-            
-            if terminated:
-                next_values[-1] = 0.0  # Zero out bootstrap if terminated
-            
-            # Vectorized backward pass for GAE
-            gae = torch.tensor(0.0, device=device, dtype=torch.float32)
-            for t in range(T - 1, -1, -1):
-                # TD error: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
-                delta = rewards_tensor[t] + gamma * next_values[t] - values_tensor[t]
+            # Compute GAE separately for each component
+            for component in component_names:
+                # Extract component-specific rewards
+                component_rewards = torch.tensor(
+                    [r.get(component, 0.0) if isinstance(r, dict) else 0.0 for r in rewards],
+                    device=device, dtype=torch.float32
+                )
                 
-                # GAE: A_t = δ_t + γλ * A_{t+1}
-                gae = delta + gamma * gae_lambda * gae
-                advantages[t] = gae
-                returns[t] = gae + values_tensor[t]
-
-            # OPTIMIZATION 4c: Normalize advantages on GPU
-            if T > 0:
-                adv_mean = advantages.mean()
-                adv_std = advantages.std(unbiased=False)
-                adv_std = torch.clamp(adv_std, min=1e-8)
-                advantages = (advantages - adv_mean) / adv_std
-
-            # Convert to list for backward compatibility (but keep tensors)
-            episode['returns'] = [returns[i] for i in range(T)]
-            episode['advantages'] = [advantages[i] for i in range(T)]
+                # Extract component-specific values
+                component_values = []
+                for v in values:
+                    if isinstance(v, dict):
+                        component_values.append(v.get(component, 0.0))
+                    else:
+                        # Fallback: use total value if dict not available
+                        component_values.append(v if component == 'total_reward' else 0.0)
+                
+                component_values = torch.stack([
+                    torch.tensor(cv, device=device, dtype=torch.float32) if not isinstance(cv, torch.Tensor)
+                    else cv.to(device) 
+                    for cv in component_values
+                ])
+                
+                # Handle final value for this component
+                if isinstance(final_values, dict):
+                    final_value = final_values.get(component, 0.0)
+                else:
+                    final_value = final_values if final_values is not None and component == 'total_reward' else 0.0
+                
+                if isinstance(final_value, torch.Tensor):
+                    final_value = final_value.to(device)
+                else:
+                    final_value = torch.tensor(final_value, device=device, dtype=torch.float32)
+                
+                # Preallocate output tensors for this component
+                returns = torch.empty(T, device=device, dtype=torch.float32)
+                advantages = torch.empty(T, device=device, dtype=torch.float32)
+                
+                # Build next_values vector
+                next_values = torch.cat([component_values[1:], final_value.unsqueeze(0) if final_value.dim() == 0 else final_value])
+                
+                if terminated:
+                    next_values[-1] = 0.0  # Terminal state has zero value
+                
+                # Vectorized backward pass for GAE
+                gae = torch.tensor(0.0, device=device, dtype=torch.float32)
+                for t in range(T - 1, -1, -1):
+                    # TD error: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
+                    delta = component_rewards[t] + gamma * next_values[t] - component_values[t]
+                    
+                    # GAE: A_t = δ_t + γλ * A_{t+1}
+                    gae = delta + gamma * gae_lambda * gae
+                    advantages[t] = gae
+                    returns[t] = gae + component_values[t]
+                
+                # Normalize advantages for this component
+                if T > 0:
+                    adv_mean = advantages.mean()
+                    adv_std = advantages.std(unbiased=False)
+                    adv_std = torch.clamp(adv_std, min=1e-8)
+                    advantages = (advantages - adv_mean) / adv_std
+                
+                # Store as lists of tensors for backward compatibility
+                episode['returns'][component] = [returns[i] for i in range(T)]
+                episode['advantages'][component] = [advantages[i] for i in range(T)]
     
     def clear(self):
         """Clear all episodes from the buffer"""
@@ -3046,39 +3053,51 @@ class DurotaxisTrainer:
         return losses
 
     def update_policy_minibatch(self, states: List[Dict], actions: List[Dict], 
-                               returns: List[torch.Tensor], advantages: List[torch.Tensor],
+                               returns: Dict[str, List[torch.Tensor]], advantages: Dict[str, List[torch.Tensor]],
                                old_log_probs: List[Dict], old_values: List[Dict], episode: int = 0) -> Dict[str, float]:
-        """Update policy using a minibatch of data from the trajectory buffer"""
+        """Update policy using a minibatch of data from the trajectory buffer with per-component structure"""
         if not states or not actions:
             return {}
         
-        # Convert list data back to the format expected by original update_policy
-        # Group returns and advantages by component
-        returns_dict = {component: [] for component in self.component_names}
-        advantages_dict = {component: [] for component in self.component_names}
+        # Convert per-component lists to tensors
+        # returns and advantages are now Dict[component, List[Tensor]], need Dict[component, Tensor]
+        returns_dict = {}
+        advantages_dict = {}
         old_values_dict = {component: [] for component in self.component_names}
         
-        # For minibatch training, we need to reconstruct the component-wise format
-        # Since returns and advantages are already computed as scalars in the buffer,
-        # we'll use them directly as total values
-        for i, (ret_val, adv_val, old_val) in enumerate(zip(returns, advantages, old_values)):
-            # Use the total values for all components (they're already weighted)
-            for component in self.component_names:
-                returns_dict[component].append(ret_val)
-                advantages_dict[component].append(adv_val)
-                # Handle old values - if it's a dict, extract component, otherwise use as total
-                if isinstance(old_val, dict):
-                    old_values_dict[component].append(old_val.get(component, old_val.get('total_reward', ret_val)))
-                else:
-                    old_values_dict[component].append(old_val)
-        
-        # Convert to tensors
+        # Stack component returns and advantages
         for component in self.component_names:
-            returns_dict[component] = torch.stack(returns_dict[component])
-            advantages_dict[component] = torch.stack(advantages_dict[component])
-            old_values_dict[component] = torch.stack(old_values_dict[component])
+            if component in returns and returns[component]:
+                returns_dict[component] = torch.stack(returns[component])
+            else:
+                # Fallback: create zeros if component missing
+                returns_dict[component] = torch.zeros(len(states), device=self.device)
+            
+            if component in advantages and advantages[component]:
+                advantages_dict[component] = torch.stack(advantages[component])
+            else:
+                advantages_dict[component] = torch.zeros(len(states), device=self.device)
         
-        # Call the original update_policy method with old values
+        # Extract old values per component
+        for i, old_val in enumerate(old_values):
+            for component in self.component_names:
+                if isinstance(old_val, dict):
+                    old_values_dict[component].append(old_val.get(component, 0.0))
+                else:
+                    # Fallback: use total value for all components if not dict
+                    old_values_dict[component].append(old_val if component == 'total_reward' else 0.0)
+        
+        # Convert old values to tensors
+        for component in self.component_names:
+            if old_values_dict[component]:
+                old_values_dict[component] = torch.stack([
+                    torch.tensor(v, device=self.device) if not isinstance(v, torch.Tensor) else v.to(self.device)
+                    for v in old_values_dict[component]
+                ])
+            else:
+                old_values_dict[component] = torch.zeros(len(states), device=self.device)
+        
+        # Call the original update_policy method with per-component data
         return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, episode)
 
     def update_policy_with_value_clipping(self, states: List[Dict], actions: List[Dict], 
@@ -3682,7 +3701,7 @@ class DurotaxisTrainer:
                 gamma = algorithm_config.get('gamma', 0.99)
                 gae_lambda = algorithm_config.get('gae_lambda', 0.95)
                 
-                self.trajectory_buffer.compute_returns_and_advantages_for_all_episodes(gamma, gae_lambda)
+                self.trajectory_buffer.compute_returns_and_advantages_for_all_episodes(gamma, gae_lambda, self.component_names)
                 
                 # ==========================================
                 # PHASE 3: BATCH POLICY UPDATES
