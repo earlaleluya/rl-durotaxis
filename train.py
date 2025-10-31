@@ -294,8 +294,8 @@ class TrajectoryBuffer:
                         component_values.append(v if component == 'total_reward' else 0.0)
                 
                 component_values = torch.stack([
-                    torch.tensor(cv, device=device, dtype=torch.float32) if not isinstance(cv, torch.Tensor)
-                    else cv.to(device) 
+                    torch.tensor(cv, device=device, dtype=torch.float32).squeeze() if not isinstance(cv, torch.Tensor)
+                    else cv.to(device).squeeze() 
                     for cv in component_values
                 ])
                 
@@ -306,16 +306,24 @@ class TrajectoryBuffer:
                     final_value = final_values if final_values is not None and component == 'total_reward' else 0.0
                 
                 if isinstance(final_value, torch.Tensor):
-                    final_value = final_value.to(device)
+                    final_value = final_value.to(device).squeeze()
                 else:
-                    final_value = torch.tensor(final_value, device=device, dtype=torch.float32)
+                    final_value = torch.tensor(final_value, device=device, dtype=torch.float32).squeeze()
+                
+                # Ensure final_value is scalar (0-dim tensor)
+                if final_value.dim() > 0:
+                    final_value = final_value.squeeze()
                 
                 # Preallocate output tensors for this component
                 returns = torch.empty(T, device=device, dtype=torch.float32)
                 advantages = torch.empty(T, device=device, dtype=torch.float32)
                 
-                # Build next_values vector
-                next_values = torch.cat([component_values[1:], final_value.unsqueeze(0) if final_value.dim() == 0 else final_value])
+                # Build next_values vector - ensure both parts are 1D
+                if final_value.dim() == 0:
+                    next_values = torch.cat([component_values[1:], final_value.unsqueeze(0)])
+                else:
+                    # If final_value somehow still has dimensions, handle it
+                    next_values = torch.cat([component_values[1:], final_value.flatten()[:1]])
                 
                 if terminated:
                     next_values[-1] = 0.0  # Terminal state has zero value
