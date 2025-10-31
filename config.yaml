@@ -538,7 +538,7 @@ actor_critic:
   
   # Action parameter bounds [min, max]
   action_parameter_bounds:
-    delete_ratio: [0.0, 0.5]    # Fraction of nodes to delete (sorted leftmost first)
+    delete_ratio: [0.0, 0.9]    # Fraction of nodes to delete (sorted leftmost first)
     gamma: [0.5, 15.0]          # Spawn: WIDENED from [2.0, 8.0] for more expressive control
     alpha: [0.5, 4.0]           # Spawn: Directional bias strength
     noise: [0.05, 0.5]          # Spawn: Stochastic noise level
