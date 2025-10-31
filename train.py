@@ -2578,7 +2578,7 @@ class DurotaxisTrainer:
             # Validate reward components (optional, controlled by config flag)
             self.validate_reward_components(
                 reward_components, 
-                step_info=f"(Episode {self.current_episode}, Step {episode_length})"
+                step_info=f"(Episode {episode_num}, Step {episode_length})"
             )
 
             # Track environment-side empty graph recoveries for logging consistency
@@ -3567,7 +3567,7 @@ class DurotaxisTrainer:
         robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
         self.smoothed_rewards.append(robust_ma)
         
-        self.scheduler.step()
+        self.lr_scheduler.step()
         self.save_spawn_statistics(episode_count)
         self.save_reward_statistics(episode_count)
         
@@ -4359,7 +4359,7 @@ class DurotaxisTrainer:
         checkpoint = {
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_state_dict': self.lr_scheduler.state_dict(),
             'episode_rewards': dict(self.episode_rewards),
             'losses': dict(self.losses),
             'best_reward': self.best_total_reward,
@@ -4434,7 +4434,7 @@ class DurotaxisTrainer:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     print(f"   ✅ Loaded optimizer state")
                 if 'scheduler_state_dict' in checkpoint:
-                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                     print(f"   ✅ Loaded scheduler state")
             else:
                 print(f"   ⚠️ Optimizer state reset (as configured)")
@@ -4519,7 +4519,7 @@ class DurotaxisTrainer:
         
         # Load scheduler state if available (for backward compatibility)
         if 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         else:
             print("⚠️ No scheduler state found in checkpoint (older checkpoint format)")
         
