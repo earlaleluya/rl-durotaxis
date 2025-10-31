@@ -129,14 +129,18 @@ digraph RLDurotaxis {
         >, fillcolor="white"];
         
         gae [label=<
-            <b>GAE Computation</b><br/>
+            <b>Per-Component GAE</b><br/>
             <br/>
-            For each of 5 components:<br/>
-            • δ<sub>t</sub> = r + γV' - V<br/>
-            • A<sub>t</sub> = Σ (γλ)<sup>l</sup> · δ<sub>t+l</sub><br/>
-            • G<sub>t</sub> = A<sub>t</sub> + V<br/>
+            <u>For EACH component c separately:</u><br/>
+            1. Extract r<sub>t</sub><sup>c</sup> from reward dict<br/>
+            2. Extract V<sup>c</sup>(s) from critic head c<br/>
+            3. δ<sub>t</sub><sup>c</sup> = r<sub>t</sub><sup>c</sup> + γV<sup>c</sup>' - V<sup>c</sup><br/>
+            4. A<sub>t</sub><sup>c</sup> = Σ (γλ)<sup>l</sup> · δ<sub>t+l</sub><sup>c</sup><br/>
+            5. G<sub>t</sub><sup>c</sup> = A<sub>t</sub><sup>c</sup> + V<sup>c</sup><br/>
+            6. Normalize A<sub>t</sub><sup>c</sup> per component<br/>
             <br/>
-            → 5 independent advantage streams
+            → 5 independent {returns, advantages}<br/>
+            <font color="darkgreen"><b>Benefit:</b> Component-specific learning!</font>
         >, fillcolor="#ccffcc"];
         
         policy_loss [label=<
@@ -153,10 +157,13 @@ digraph RLDurotaxis {
         >, fillcolor="#99ff99"];
         
         value_loss [label=<
-            <b>Value Loss (Weighted)</b><br/>
+            <b>Value Loss (Component-Specific)</b><br/>
             <br/>
-            For each component:<br/>
-            L<sub>c</sub> = MSE(V<sub>c</sub>, G<sub>c</sub>)<br/>
+            <u>For each component c:</u><br/>
+            L<sub>c</sub> = MSE(V<sub>c</sub>, G<sub>c</sub><sup>component</sup>)<br/>
+            <br/>
+            <font color="darkred">V<sub>spawn</sub> → G<sub>spawn</sub> (spawn-only)</font><br/>
+            <font color="darkblue">V<sub>delete</sub> → G<sub>delete</sub> (delete-only)</font><br/>
             <br/>
             L<sub>value</sub> = Σ w<sub>c</sub> · L<sub>c</sub><br/>
             <br/>
@@ -250,8 +257,16 @@ digraph RLDurotaxis {
             Uses weighted sum of<br/>
             ALL 5 component advantages
         >, shape=note, fillcolor="lightgreen"];
+        
+        leg4 [label=<
+            <b>Per-Component GAE (NEW):</b><br/>
+            Each critic head learns<br/>
+            component-specific values<br/>
+            → Agent can identify &amp;<br/>
+            improve weak components!
+        >, shape=note, fillcolor="lightpink"];
     }
     
     // Position legend at bottom
-    {rank=same; metrics; leg1; leg2; leg3;}
+    {rank=same; metrics; leg1; leg2; leg3; leg4;}
 }

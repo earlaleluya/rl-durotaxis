@@ -240,26 +240,43 @@ This diagram shows the detailed RL interaction cycle between the environment, ac
                          │
                          ▼
         ┌─────────────────────────────────────────────────────────┐
-        │         COMPUTE ADVANTAGES & RETURNS                     │
-        │         (Generalized Advantage Estimation - GAE)         │
+        │  COMPUTE PER-COMPONENT ADVANTAGES & RETURNS              │
+        │  (Generalized Advantage Estimation - GAE)                │
         │                                                           │
-        │  For each component c in {total, graph, spawn,           │
+        │  **PER-COMPONENT GAE** (NEW IMPLEMENTATION):             │
+        │                                                           │
+        │  For EACH component c in {total, graph, spawn,           │
         │                           delete, distance}:             │
         │                                                           │
-        │  1. Compute TD errors δ_t^c:                             │
+        │  1. Extract component-specific rewards r_t^c             │
+        │     (from reward dict for each timestep)                 │
+        │                                                           │
+        │  2. Extract component-specific values V^c(s_t)           │
+        │     (from critic's 5 independent value heads)            │
+        │                                                           │
+        │  3. Compute TD errors δ_t^c:                             │
         │     δ_t^c = r_t^c + γ*V^c(s_{t+1}) - V^c(s_t)           │
         │                                                           │
-        │  2. Compute GAE advantages A_t^c:                        │
+        │  4. Compute GAE advantages A_t^c:                        │
         │     A_t^c = Σ_{l=0}^∞ (γλ)^l * δ_{t+l}^c                │
-        │     (exponentially weighted sum of TD errors)            │
+        │     (exponentially weighted sum of component TD errors)  │
         │                                                           │
-        │  3. Compute returns G_t^c:                               │
+        │  5. Compute returns G_t^c:                               │
         │     G_t^c = A_t^c + V^c(s_t)                             │
-        │     (advantage + baseline = target for value function)   │
+        │     (component-specific advantage + baseline)            │
         │                                                           │
-        │  4. Normalize advantages (optional):                     │
-        │     A_t = (A_t - mean(A)) / (std(A) + ε)                │
-        │     (improves training stability)                        │
+        │  6. Normalize advantages per component:                  │
+        │     A_t^c = (A_t^c - mean(A^c)) / (std(A^c) + ε)        │
+        │     (separate normalization for each component)          │
+        │                                                           │
+        │  **RESULT**: 5 independent {returns, advantages} dicts   │
+        │    returns[component] = List[Tensor]                     │
+        │    advantages[component] = List[Tensor]                  │
+        │                                                           │
+        │  **BENEFIT**: Critic learns component-specific values    │
+        │    • spawn_value head → spawn-only returns               │
+        │    • delete_value head → delete-only returns             │
+        │    → Agent can identify weak components & improve!       │
         └─────────────────────────┬───────────────────────────────┘
                                   │
                                   ▼
@@ -1050,11 +1067,144 @@ $ python train_cli.py --total-episodes 2000 --learning-rate 0.0003
 
 ---
 
+## Per-Component GAE Implementation (2025-11-01)
+
+### Overview
+
+The training system now uses **per-component Generalized Advantage Estimation (GAE)** instead of scalar total-reward GAE. This enables the critic's value heads to learn component-specific value estimates, allowing the agent to identify and improve on weak reward components.
+
+### Architecture
+
+```
+TrajectoryBuffer.compute_returns_and_advantages_for_all_episodes()
+│
+├─ For EACH reward component c in {total, graph, spawn, delete, distance}:
+│   │
+│   ├─ Extract component rewards: r_t^c from reward dict
+│   ├─ Extract component values: V^c(s_t) from critic head
+│   │
+│   ├─ Compute TD errors: δ_t^c = r_t^c + γ*V^c(s_{t+1}) - V^c(s_t)
+│   ├─ Compute GAE advantages: A_t^c = Σ_{l=0}^∞ (γλ)^l * δ_{t+l}^c
+│   ├─ Compute returns: G_t^c = A_t^c + V^c(s_t)
+│   └─ Normalize: A_t^c = (A_t^c - mean(A^c)) / (std(A^c) + ε)
+│
+└─ Store as dicts:
+    episode['returns'][component] = List[Tensor]
+    episode['advantages'][component] = List[Tensor]
+```
+
+### Data Flow
+
+**Before (Scalar GAE)**:
+```python
+# Single scalar GAE computation
+rewards_tensor = [r['total_reward'] for r in rewards]  # [T]
+advantages = compute_gae(rewards_tensor, values)  # [T]
+returns = advantages + values  # [T]
+
+# Duplicated to all components
+for component in components:
+    returns_dict[component] = returns  # Same value!
+    advantages_dict[component] = advantages  # Same value!
+```
+
+**After (Per-Component GAE)**:
+```python
+# Separate GAE per component
+for component in ['total', 'graph', 'spawn', 'delete', 'distance']:
+    rewards_c = [r[component] for r in rewards]  # Component-specific
+    values_c = [v[component] for v in values]    # Component-specific
+    
+    advantages_c = compute_gae(rewards_c, values_c)  # Independent GAE
+    returns_c = advantages_c + values_c
+    
+    returns_dict[component] = returns_c  # Different per component!
+    advantages_dict[component] = advantages_c  # Different per component!
+```
+
+### Training Impact
+
+**Critic Training**:
+- `spawn_value` head → trained on `G_t^spawn` (spawn-only returns)
+- `delete_value` head → trained on `G_t^delete` (delete-only returns)
+- Each head learns what its component is actually worth
+
+**Policy Learning**:
+- Advantages are weighted-combined: `A_weighted = Σ w_i * A_i`
+- Policy gradient uses all components, but now with accurate per-component signals
+- Agent can identify: "My delete rewards are low, I should improve deletion"
+
+### Example Scenario
+
+**Before**: Agent with poor deletion
+```
+Episode rewards: spawn=+20, delete=-10, total=+10
+All value heads predict: ~10
+
+Critic: "Everything is worth ~10"
+Policy: "Total is positive, keep doing what I'm doing" ❌
+```
+
+**After**: Same agent
+```
+Episode rewards: spawn=+20, delete=-10, total=+10
+spawn_value predicts: +20 ✓
+delete_value predicts: -10 ✓
+
+Critic: "Spawn is valuable (+20), delete is bad (-10)"
+Policy: "Delete component is negative, adjust delete behavior" ✅
+```
+
+### Code Changes
+
+**Key files modified**:
+1. `train.py::TrajectoryBuffer.compute_returns_and_advantages_for_all_episodes()`
+   - Added `component_names` parameter
+   - Loop over components instead of single scalar computation
+   - Store results as dicts instead of lists
+
+2. `train.py::TrajectoryBuffer.get_batch_data()`
+   - Return `returns` and `advantages` as dicts
+   - Handle per-component concatenation across episodes
+
+3. `train.py::TrajectoryBuffer.create_minibatches()`
+   - Preserve dict structure when creating minibatches
+   - Slice component-wise lists correctly
+
+4. `train.py::update_policy_minibatch()`
+   - Accept dict-structured returns/advantages
+   - Stack per-component tensors
+   - No longer duplicate scalar values
+
+### Testing
+
+**Test file**: `tools/test_per_component_training.py`
+
+Verifies:
+- Returns/advantages are dicts with per-component structure
+- Component-specific values differ (spawn ≠ delete)
+- Batch data and minibatches preserve structure
+
+**Test output**:
+```
+Component-specific returns at step 0:
+  Spawn return:  15.415
+  Delete return: 11.021
+✅ Component-specific returns are different
+```
+
+---
+
 ## Key Design Patterns
 
-### 1. **Multi-Component Value Learning**
+### 1. **Multi-Component Value Learning with Per-Component GAE**
 - Separate value heads for 5 reward components:
   - total_reward, graph_reward (alias), delete_reward, spawn_reward, distance_signal
+- **Per-component GAE computation** (NEW):
+  - Each component gets independent TD errors, advantages, and returns
+  - spawn_value head trained on spawn-only returns
+  - delete_value head trained on delete-only returns
+  - Enables agent to identify and improve weak components
 - Environment priority weights: delete=1.0 > spawn=0.75 > distance=0.5
 - Critic learning weights: total=1.0, graph=0.4, others=0.3
 - Policy uses weighted composition of ALL component advantages
