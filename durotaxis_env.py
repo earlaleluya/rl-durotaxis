@@ -831,11 +831,24 @@ class DurotaxisEnv(gym.Env):
                 self.state_extractor.set_topology(self.topology)
 
         # Execute actions using the policy network (now guaranteed to have nodes)
+        # Store action parameters for logging
+        action_params = {'delete_ratio': 0.0, 'gamma': 0.0, 'alpha': 0.0, 'noise': 0.0, 'theta': 0.0}
+        
         if self.policy_agent is not None and prev_num_nodes > 0:
             try:
                 executed_actions = self.policy_agent.act_with_policy(
                     deterministic=False
                 )
+                # Try to extract action parameters if available
+                if hasattr(self.policy_agent, 'last_continuous_actions') and self.policy_agent.last_continuous_actions is not None:
+                    last_actions = self.policy_agent.last_continuous_actions
+                    if len(last_actions) > 0:
+                        # Average across all nodes to get representative values
+                        action_params['delete_ratio'] = float(last_actions[:, 0].mean().item())
+                        action_params['gamma'] = float(last_actions[:, 1].mean().item())
+                        action_params['alpha'] = float(last_actions[:, 2].mean().item())
+                        action_params['noise'] = float(last_actions[:, 3].mean().item())
+                        action_params['theta'] = float(last_actions[:, 4].mean().item())
             except Exception as e:
                 print(f"⚠️  Policy execution failed: {e}")
                 executed_actions = {}
@@ -974,12 +987,20 @@ class DurotaxisEnv(gym.Env):
                 boundary_warning = f" ⚠️DANGER:{nodes_in_danger}"
         
         recovery_flag = " ♻️" if empty_graph_recovered else ""
+        
+        # Extract reward components
+        delete_r = reward_components.get('delete_reward', 0.0)
+        spawn_r = reward_components.get('spawn_reward', 0.0)
+        distance_r = reward_components.get('distance_signal', 0.0)
+        
         print(
             f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
             f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
-            f"R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | "
+            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.1f} S:{spawn_r:+4.1f} Dist:{distance_r:+4.1f}) | "
             f"C={centroid_x:5.1f}{centroid_direction}{boundary_warning}{recovery_flag} | "
-            f"A={len(executed_actions):2d} | T={terminated} {truncated}"
+            f"Actions: dr={action_params['delete_ratio']:.3f} γ={action_params['gamma']:.2f} "
+            f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f} | "
+            f"Termi={terminated} Trunc={truncated}"
         )
         
         # Auto-render after each step to ensure visualization is always updated
