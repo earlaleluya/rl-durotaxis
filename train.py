@@ -828,8 +828,7 @@ class DurotaxisTrainer:
             'graph_reward': [],
             'spawn_reward': [],
             'delete_reward': [],
-            'edge_reward': [],
-            'total_node_reward': [],
+            'distance_signal': [],
             'total_reward': []
         }
 
@@ -2442,8 +2441,7 @@ class DurotaxisTrainer:
             'graph_reward': [],
             'spawn_reward': [],
             'delete_reward': [],
-            'edge_reward': [],
-            'total_node_reward': [],
+            'distance_signal': [],
             'total_reward': []
         }
         
@@ -4400,7 +4398,8 @@ class DurotaxisTrainer:
             json.dump(episode_history, f, indent=2)
         
         # Store reward summary for consolidated logging (silent for one-line logging)
-        key_components = ['total_reward', 'graph_reward', 'spawn_reward', 'edge_reward']
+        # DELETE RATIO ARCHITECTURE: Only track current reward components
+        key_components = ['total_reward', 'graph_reward', 'spawn_reward', 'delete_reward', 'distance_signal']
         active_components = []
         
         for comp in key_components:
