@@ -3078,8 +3078,11 @@ class DurotaxisTrainer:
             losses['entropy_bonus'] = 0.0
         
         # === TOTAL LOSS AND OPTIMIZATION ===
-        total_loss = avg_total_policy_loss + 0.5 * total_value_loss + avg_entropy_loss + entropy_bonus
+        # FIX: Reduce value loss weight to prevent value loss from dominating training
+        value_loss_weight = 0.25  # Down from 0.5 to reduce impact of large value losses
+        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss + entropy_bonus
         losses['total_loss'] = total_loss.item()
+        losses['value_loss_weight'] = value_loss_weight
         
         # Update learnable component weights based on policy performance
         self.update_learnable_weights(advantages, avg_total_policy_loss)
@@ -3402,8 +3405,11 @@ class DurotaxisTrainer:
             losses['entropy_bonus'] = 0.0
         
         # === TOTAL LOSS AND OPTIMIZATION ===
-        total_loss = avg_total_policy_loss + 0.5 * total_value_loss + avg_entropy_loss + entropy_bonus
+        # FIX: Reduce value loss weight to prevent value loss from dominating training  
+        value_loss_weight = 0.25  # Down from 0.5 to reduce impact of large value losses
+        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss + entropy_bonus
         losses['total_loss'] = total_loss.item()
+        losses['value_loss_weight'] = value_loss_weight
         
         # Update learnable component weights based on policy performance
         self.update_learnable_weights(advantages, avg_total_policy_loss)

@@ -210,6 +210,11 @@ trainer:
   # Value clipping
   enable_value_clipping: true
   value_clip_epsilon: 0.2
+  use_relative_value_clip: true  # FIX: Use relative clipping (% of old value)
+  
+  # Return normalization (prevents value loss explosion)
+  normalize_returns: true
+  return_scale: 10.0
   
   # Logging
   moving_avg_window: 20
