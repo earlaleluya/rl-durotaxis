@@ -172,13 +172,13 @@ trainer:
   substrate_type: linear
   total_episodes: 1000
   max_steps: 1000
-  learning_rate: 0.0001
+  learning_rate: 0.000001
   save_dir: "./training_results"
   
   # Resume training
   resume_training:
-    enabled: false
-    checkpoint_path: ""
+    enabled: true
+    checkpoint_path: "training_results/run0018/best_model_batch2.pt"
     resume_from_best: false
     reset_optimizer: true
     reset_episode_count: true
