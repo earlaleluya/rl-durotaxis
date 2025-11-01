@@ -594,6 +594,23 @@ class DurotaxisTrainer:
         self.enable_value_clipping = config.get('enable_value_clipping', True)
         self.value_clip_epsilon = config.get('value_clip_epsilon', 0.2)
         
+        # FIX: Use relative value clipping if enabled (more robust for varying return scales)
+        self.use_relative_value_clip = config.get('use_relative_value_clip', True)
+        if self.use_relative_value_clip and self.value_clip_epsilon < 1.0:
+            # Interpret small epsilon as relative (e.g., 0.2 = 20% of old value)
+            print(f"   Using relative value clipping: ±{self.value_clip_epsilon*100}% of old value")
+        elif not self.use_relative_value_clip and self.value_clip_epsilon < 10.0:
+            # Warn if absolute clipping with small epsilon (likely misconfigured)
+            print(f"   ⚠️  WARNING: Absolute value clipping with small epsilon ({self.value_clip_epsilon}) may be too restrictive!")
+            print(f"   Consider setting value_clip_epsilon > 100 or enabling use_relative_value_clip")
+        
+        # Return normalization configuration (prevents value loss explosion)
+        self.normalize_returns = config.get('normalize_returns', True)
+        self.return_scale = config.get('return_scale', 10.0)  # Scale normalized returns to this magnitude
+        if self.normalize_returns:
+            print(f"   Return normalization enabled (scale={self.return_scale})")
+
+        
         # Adaptive gradient scaling configuration
         gradient_config = config.get('gradient_scaling', {})
         self.enable_gradient_scaling = gradient_config.get('enable_adaptive_scaling', True)
@@ -2758,6 +2775,14 @@ class DurotaxisTrainer:
             # Safe normalization of component advantages (critical for stability)
             component_advantages = safe_standardize(component_advantages, eps=1e-8)
             
+            # FIX: Normalize returns to prevent value loss explosion
+            # Returns can grow very large (1000+) causing value loss to explode
+            # Normalize to reasonable scale while preserving relative differences
+            if self.normalize_returns:
+                component_returns = safe_standardize(component_returns, eps=1e-8)
+                # Re-scale to typical return magnitude to help value network learning
+                component_returns = component_returns * self.return_scale
+            
             returns[component] = component_returns
             advantages[component] = component_advantages
         
@@ -3253,11 +3278,25 @@ class DurotaxisTrainer:
                     
                     if self.enable_value_clipping:
                         # PPO-style value clipping to prevent large critic updates
-                        value_pred_clipped = old_value + torch.clamp(
-                            predicted_value - old_value, 
-                            -self.value_clip_epsilon, 
-                            self.value_clip_epsilon
-                        )
+                        # Use relative or absolute clipping based on configuration
+                        if self.use_relative_value_clip:
+                            # Relative clipping: clip as percentage of old value (more robust)
+                            # Prevents tiny absolute clips when returns are large
+                            old_value_abs = torch.abs(old_value) + 1e-8  # Avoid division by zero
+                            value_delta_relative = (predicted_value - old_value) / old_value_abs
+                            value_delta_clipped = torch.clamp(
+                                value_delta_relative,
+                                -self.value_clip_epsilon,
+                                self.value_clip_epsilon
+                            )
+                            value_pred_clipped = old_value + value_delta_clipped * old_value_abs
+                        else:
+                            # Absolute clipping: original PPO method
+                            value_pred_clipped = old_value + torch.clamp(
+                                predicted_value - old_value,
+                                -self.value_clip_epsilon,
+                                self.value_clip_epsilon
+                            )
                         
                         # Compute both clipped and unclipped value losses
                         v_loss1 = (predicted_value - target_return) ** 2
