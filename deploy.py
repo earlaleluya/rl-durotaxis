@@ -11,14 +11,16 @@ Delete Ratio Architecture:
 - Applies global spawn parameters to remaining nodes
 
 Usage:
-    python deploy.py --model_path ./training_results/run0014/best_model_batch11.pt \
-                     --substrate_type linear --m 0.05 --b 1.0 \
+    python deploy.py --substrate_type linear --m 0.05 --b 1.0 \
+                     --substrate_width 200 --substrate_height 100 \
                      --deterministic --max_episodes 10 --max_steps 1000 \
-                     --max_critical_nodes 75 --threshold_critical_nodes 500
+                     --max_critical_nodes 50 --threshold_critical_nodes 200 \
+                     --model_path ./training_results/run0018/best_model_batch2.pt 
     
-    # Without visualization
-    python deploy.py --model_path ./training_results/run0004/best_model_batch4.pt \
+    # Without visualization, custom substrate size
+    python deploy.py --model_path ./training_results/run0018/best_model_batch2.pt \
                      --substrate_type linear --m 0.05 --b 1.0 \
+                     --substrate_width 400 --substrate_height 300 \
                      --deterministic --max_episodes 10 --max_steps 1000 --no_viz \
                      --max_critical_nodes 100 --threshold_critical_nodes 600
 """
@@ -268,13 +270,17 @@ class DurotaxisDeployment:
             next_obs, reward_components, terminated, truncated, info = env.step(0)
             done = terminated or truncated
             
+            # Add node count to reward components for tracking
+            num_nodes = env.topology.graph.num_nodes()
+            num_edges = env.topology.graph.num_edges()
+            reward_components['num_nodes'] = num_nodes
+            reward_components['num_edges'] = num_edges
+            
             # Store rewards
             episode_rewards.append(reward_components)
             
             if verbose:
                 total_reward = reward_components.get('total_reward', 0.0)
-                num_nodes = env.topology.graph.num_nodes()
-                num_edges = env.topology.graph.num_edges()
                 print(f"   Step {step_count+1}: N={num_nodes:3d} E={num_edges:3d} | R={total_reward:+7.3f} | Done={done}")
             
             # Show topology visualization if enabled (independent of verbose)
@@ -319,6 +325,7 @@ class DurotaxisDeployment:
     
     def run_evaluation(self,
                       substrate_type: str = "linear",
+                      substrate_size: Tuple[int, int] = (200, 200),
                       m: float = 0.05,
                       b: float = 1.0,
                       max_episodes: int = 10,
@@ -333,6 +340,7 @@ class DurotaxisDeployment:
         
         Args:
             substrate_type: Type of substrate ('linear', 'exponential', 'random')
+            substrate_size: Tuple of (width, height) for substrate dimensions
             m: Substrate parameter m
             b: Substrate parameter b
             max_episodes: Number of episodes to run
@@ -350,7 +358,7 @@ class DurotaxisDeployment:
         
         if verbose_eval:
             print(f"\n🧪 Running evaluation:")
-            print(f"   Substrate: {substrate_type} (m={m}, b={b})")
+            print(f"   Substrate: {substrate_type} (size={substrate_size}, m={m}, b={b})")
             print(f"   Episodes: {max_episodes}, Max steps: {max_steps}")
             print(f"   Policy: {'Deterministic' if deterministic else 'Stochastic'}")
             print(f"   Node limits: max_critical={max_critical_nodes}, threshold={threshold_critical_nodes}")
@@ -360,6 +368,7 @@ class DurotaxisDeployment:
         env = DurotaxisEnv(
             config_path=self.config_path,
             substrate_type=substrate_type,
+            substrate_size=substrate_size,
             substrate_m=m,
             substrate_b=b,
             max_critical_nodes=max_critical_nodes,
@@ -396,6 +405,7 @@ class DurotaxisDeployment:
         evaluation_results = {
             'substrate_config': {
                 'type': substrate_type,
+                'size': substrate_size,
                 'm': m,
                 'b': b
             },
@@ -427,33 +437,225 @@ class DurotaxisDeployment:
         
         # Save results
         if save_results:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            results_filename = f"evaluation_{substrate_type}_m{m}_b{b}_{timestamp}.json"
-            results_path = os.path.join(os.path.dirname(self.model_path), results_filename)
-            
-            # Convert numpy types to native Python types for JSON serialization
-            def convert_numpy(obj):
-                if isinstance(obj, np.integer):
-                    return int(obj)
-                elif isinstance(obj, np.floating):
-                    return float(obj)
-                elif isinstance(obj, np.ndarray):
-                    return obj.tolist()
-                elif isinstance(obj, torch.Tensor):
-                    return obj.cpu().numpy().tolist()
-                return obj
-            
-            # Deep convert the results
-            import json
-            serializable_results = json.loads(json.dumps(evaluation_results, default=convert_numpy))
-            
-            with open(results_path, 'w') as f:
-                json.dump(serializable_results, f, indent=2)
-            
-            if verbose_eval:
-                print(f"💾 Results saved to: {results_path}")
+            self._save_comprehensive_results(
+                evaluation_results, 
+                episode_stats, 
+                substrate_type, 
+                m, 
+                b, 
+                verbose_eval
+            )
         
         return evaluation_results
+    
+    def _save_comprehensive_results(self, 
+                                    evaluation_results: Dict,
+                                    episode_stats: List[Dict],
+                                    substrate_type: str,
+                                    m: float,
+                                    b: float,
+                                    verbose: bool = True):
+        """
+        Save comprehensive evaluation results in multiple JSON files for analysis.
+        
+        Creates the following files:
+        - evaluation_[config]_[timestamp].json: Overall evaluation summary
+        - detailed_nodes_all_episodes.json: Node count evolution per episode
+        - spawn_parameters_stats.json: Spawn parameter statistics per episode
+        - reward_components_stats.json: Reward component statistics per episode
+        - training_metrics.json: Episode-level metrics (rewards, lengths)
+        - loss_metrics.json: Placeholder for consistency with training format
+        
+        Args:
+            evaluation_results: Overall evaluation results dictionary
+            episode_stats: List of per-episode statistics
+            substrate_type: Type of substrate used
+            m: Substrate parameter m
+            b: Substrate parameter b
+            verbose: Whether to print save confirmations
+        """
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.dirname(self.model_path)
+        
+        # Helper function to convert numpy/torch types
+        def convert_numpy(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, torch.Tensor):
+                return obj.cpu().numpy().tolist()
+            return obj
+        
+        # 1. Main evaluation results file
+        results_filename = f"evaluation_{substrate_type}_m{m}_b{b}_{timestamp}.json"
+        results_path = os.path.join(output_dir, results_filename)
+        serializable_results = json.loads(json.dumps(evaluation_results, default=convert_numpy))
+        
+        with open(results_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        if verbose:
+            print(f"\n💾 Saving comprehensive evaluation results:")
+            print(f"   Main results: {results_filename}")
+        
+        # 2. Detailed nodes evolution (all episodes)
+        detailed_nodes = []
+        for ep_idx, ep_stats in enumerate(episode_stats):
+            episode_entry = {
+                'episode': ep_idx,
+                'nodes_per_step': []
+            }
+            
+            # Extract node counts from rewards_per_step if available
+            for step_idx, reward_dict in enumerate(ep_stats.get('rewards_per_step', [])):
+                # Node count should be tracked; if not available, use final count
+                episode_entry['nodes_per_step'].append({
+                    'step': step_idx,
+                    'nodes': reward_dict.get('num_nodes', ep_stats.get('final_nodes', 0))
+                })
+            
+            detailed_nodes.append(episode_entry)
+        
+        detailed_nodes_path = os.path.join(output_dir, f"detailed_nodes_all_episodes_{timestamp}.json")
+        with open(detailed_nodes_path, 'w') as f:
+            json.dump(detailed_nodes, f, indent=2)
+        
+        if verbose:
+            print(f"   Node evolution: detailed_nodes_all_episodes_{timestamp}.json")
+        
+        # 3. Spawn parameters statistics per episode
+        spawn_params_stats = []
+        for ep_idx, ep_stats in enumerate(episode_stats):
+            actions_per_step = ep_stats.get('actions_per_step', [])
+            
+            if actions_per_step:
+                # Extract spawn parameters (gamma, alpha, noise, theta) from continuous actions
+                # Continuous actions: [delete_ratio, gamma, alpha, noise, theta]
+                gamma_values = []
+                alpha_values = []
+                noise_values = []
+                theta_values = []
+                
+                for action_dict in actions_per_step:
+                    cont_actions = action_dict.get('continuous', [])
+                    if len(cont_actions) >= 5:
+                        gamma_values.append(float(cont_actions[1]))
+                        alpha_values.append(float(cont_actions[2]))
+                        noise_values.append(float(cont_actions[3]))
+                        theta_values.append(float(cont_actions[4]))
+                
+                # Compute statistics
+                episode_entry = {
+                    'episode': ep_idx,
+                    'parameters': {
+                        'gamma': {
+                            'mean': float(np.mean(gamma_values)) if gamma_values else 0.0,
+                            'std': float(np.std(gamma_values)) if gamma_values else 0.0,
+                            'min': float(np.min(gamma_values)) if gamma_values else 0.0,
+                            'max': float(np.max(gamma_values)) if gamma_values else 0.0
+                        },
+                        'alpha': {
+                            'mean': float(np.mean(alpha_values)) if alpha_values else 0.0,
+                            'std': float(np.std(alpha_values)) if alpha_values else 0.0,
+                            'min': float(np.min(alpha_values)) if alpha_values else 0.0,
+                            'max': float(np.max(alpha_values)) if alpha_values else 0.0
+                        },
+                        'noise': {
+                            'mean': float(np.mean(noise_values)) if noise_values else 0.0,
+                            'std': float(np.std(noise_values)) if noise_values else 0.0,
+                            'min': float(np.min(noise_values)) if noise_values else 0.0,
+                            'max': float(np.max(noise_values)) if noise_values else 0.0
+                        },
+                        'theta': {
+                            'mean': float(np.mean(theta_values)) if theta_values else 0.0,
+                            'std': float(np.std(theta_values)) if theta_values else 0.0,
+                            'min': float(np.min(theta_values)) if theta_values else 0.0,
+                            'max': float(np.max(theta_values)) if theta_values else 0.0
+                        }
+                    }
+                }
+                spawn_params_stats.append(episode_entry)
+        
+        spawn_params_path = os.path.join(output_dir, f"spawn_parameters_stats_{timestamp}.json")
+        with open(spawn_params_path, 'w') as f:
+            json.dump(spawn_params_stats, f, indent=2)
+        
+        if verbose:
+            print(f"   Spawn parameters: spawn_parameters_stats_{timestamp}.json")
+        
+        # 4. Reward components statistics per episode
+        reward_components_stats = []
+        for ep_idx, ep_stats in enumerate(episode_stats):
+            rewards_per_step = ep_stats.get('rewards_per_step', [])
+            
+            # Aggregate rewards across steps
+            component_aggregates = {}
+            for component in self.component_names:
+                values = [r.get(component, 0.0) for r in rewards_per_step]
+                component_aggregates[component] = {
+                    'mean': float(np.mean(values)) if values else 0.0,
+                    'std': float(np.std(values)) if values else 0.0,
+                    'min': float(np.min(values)) if values else 0.0,
+                    'max': float(np.max(values)) if values else 0.0,
+                    'sum': float(np.sum(values)) if values else 0.0
+                }
+            
+            episode_entry = {
+                'episode': ep_idx,
+                'reward_components': component_aggregates
+            }
+            reward_components_stats.append(episode_entry)
+        
+        reward_components_path = os.path.join(output_dir, f"reward_components_stats_{timestamp}.json")
+        with open(reward_components_path, 'w') as f:
+            json.dump(reward_components_stats, f, indent=2)
+        
+        if verbose:
+            print(f"   Reward components: reward_components_stats_{timestamp}.json")
+        
+        # 5. Training metrics (episode-level summary)
+        training_metrics = []
+        for ep_idx, ep_stats in enumerate(episode_stats):
+            episode_entry = {
+                'episode': ep_idx,
+                'total_reward': float(ep_stats['total_reward']),
+                'episode_length': int(ep_stats['episode_length']),
+                'final_nodes': int(ep_stats['final_nodes']),
+                'final_edges': int(ep_stats['final_edges']),
+                'terminated': bool(ep_stats['terminated']),
+                'component_rewards': {k: float(v) for k, v in ep_stats['component_rewards'].items()}
+            }
+            training_metrics.append(episode_entry)
+        
+        training_metrics_path = os.path.join(output_dir, f"training_metrics_{timestamp}.json")
+        with open(training_metrics_path, 'w') as f:
+            json.dump(training_metrics, f, indent=2)
+        
+        if verbose:
+            print(f"   Training metrics: training_metrics_{timestamp}.json")
+        
+        # 6. Loss metrics (placeholder for evaluation - no actual loss in deployment)
+        loss_metrics = []
+        for ep_idx in range(len(episode_stats)):
+            # In evaluation mode, we don't have loss, but create placeholder for compatibility
+            episode_entry = {
+                'episode': ep_idx,
+                'loss': 0.0,  # No loss in evaluation
+                'smoothed_loss': 0.0,
+                'note': 'Evaluation mode - no loss computed'
+            }
+            loss_metrics.append(episode_entry)
+        
+        loss_metrics_path = os.path.join(output_dir, f"loss_metrics_{timestamp}.json")
+        with open(loss_metrics_path, 'w') as f:
+            json.dump(loss_metrics, f, indent=2)
+        
+        if verbose:
+            print(f"   Loss metrics: loss_metrics_{timestamp}.json (placeholder)")
+            print(f"   ✅ All evaluation files saved successfully!")
 
 
 def main():
@@ -473,6 +675,10 @@ def main():
     parser.add_argument('--substrate_type', type=str, default='linear',
                        choices=['linear', 'exponential', 'random'],
                        help='Type of substrate')
+    parser.add_argument('--substrate_width', type=int, default=600,
+                       help='Substrate width')
+    parser.add_argument('--substrate_height', type=int, default=400,
+                       help='Substrate height')
     parser.add_argument('--m', type=float, default=0.05,
                        help='Substrate parameter m')
     parser.add_argument('--b', type=float, default=1.0,
@@ -526,6 +732,7 @@ def main():
         # Run evaluation
         results = deployment.run_evaluation(
             substrate_type=args.substrate_type,
+            substrate_size=(args.substrate_width, args.substrate_height),
             m=args.m,
             b=args.b,
             max_episodes=args.max_episodes,
