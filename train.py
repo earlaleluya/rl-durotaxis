@@ -518,6 +518,8 @@ class DurotaxisTrainer:
         self.encoder_output_dim = config.get('encoder_output_dim', 64)
         self.encoder_num_layers = config.get('encoder_num_layers', 4)
         
+        print(f"🖥️  Using device: {self.device}")
+        
         # Random substrate parameter ranges
         self.linear_m_range = tuple(config.get('linear_m_range', [0.01, 0.1]))
         self.linear_b_range = tuple(config.get('linear_b_range', [0.5, 2.0]))
@@ -685,6 +687,7 @@ class DurotaxisTrainer:
 
         self.env = DurotaxisEnv(
             config_path=config_path,
+            device=self.device,  # Pass device to environment
             **env_overrides  # Allow overrides for environment parameters too
         )
         
@@ -4115,16 +4118,6 @@ class DurotaxisTrainer:
                     'max': 0.0,
                     'sum': 0.0
                 }
-                stats['parameters'][param_name] = {
-                    'count': 0,
-                    'mean': None,
-                    'std': None,
-                    'min': None,
-                    'max': None,
-                    'median': None,
-                    'range': None,
-                    'variance': None
-                }
         
         return stats
     
@@ -4609,23 +4602,34 @@ class DurotaxisTrainer:
     def save_metrics(self):
         """Save training metrics"""
         import json
+        import math
+        
+        # Helper function to safely convert to float, handling NaN/Inf
+        def safe_float(val, default=0.0):
+            try:
+                f = float(val)
+                if math.isnan(f) or math.isinf(f):
+                    return default
+                return f
+            except (ValueError, TypeError):
+                return default
         
         # Prepare scaling statistics for saving
         scaling_stats = {}
         for component, stats in self.component_running_stats.items():
             scaling_stats[component] = {
-                'final_mean': float(stats['mean']),
-                'final_std': float(stats.get('std', 1.0)),
+                'final_mean': safe_float(stats['mean']),
+                'final_std': safe_float(stats.get('std', 1.0), 1.0),
                 'sample_count': int(stats['count']),
-                'recent_rewards': [float(x) for x in list(stats['raw_rewards'])]
+                'recent_rewards': [safe_float(x) for x in list(stats['raw_rewards'])]
             }
         
         metrics = {
-            'episode_rewards': {k: [float(x) for x in v] for k, v in self.episode_rewards.items()},
-            'losses': {k: [float(x) for x in v] for k, v in self.losses.items()},
+            'episode_rewards': {k: [safe_float(x) for x in v] for k, v in self.episode_rewards.items()},
+            'losses': {k: [safe_float(x) for x in v] for k, v in self.losses.items()},
             'component_weights': self.component_weights,
             'policy_loss_weights': self.policy_loss_weights,  # Save hybrid policy config
-            'best_reward': float(self.best_total_reward),
+            'best_reward': safe_float(self.best_total_reward),
             'adaptive_scaling_enabled': self.enable_adaptive_scaling,
             'scaling_warmup_episodes': self.scaling_warmup_episodes,
             'component_scaling_stats': scaling_stats,

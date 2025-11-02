@@ -29,6 +29,7 @@ import argparse
 import os
 import sys
 import torch
+from device import cpu_numpy
 import numpy as np
 import json
 from typing import Dict, List, Optional, Tuple
@@ -64,12 +65,14 @@ class DurotaxisDeployment:
             config_path: Path to configuration file
             device: Device to run on ('cpu', 'cuda', or None for auto)
         """
+        from device import get_device
+        
         self.model_path = model_path
         self.config_path = config_path
         
-        # Set device
+        # Set device using centralized logic
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = get_device()
         else:
             self.device = torch.device(device)
         
@@ -235,7 +238,7 @@ class DurotaxisDeployment:
                 continuous_actions = output['continuous_actions']
                 
                 episode_actions.append({
-                    'continuous': continuous_actions.cpu().numpy(),
+                    'continuous': cpu_numpy(continuous_actions),
                     'num_nodes': state_dict['num_nodes']
                 })
                 
@@ -486,7 +489,7 @@ class DurotaxisDeployment:
             elif isinstance(obj, np.ndarray):
                 return obj.tolist()
             elif isinstance(obj, torch.Tensor):
-                return obj.cpu().numpy().tolist()
+                return cpu_numpy(obj).tolist()
             return obj
         
         # 1. Main evaluation results file

@@ -260,6 +260,7 @@ class DurotaxisEnv(gym.Env):
 
     def __init__(self, 
                  config_path: str | dict | None = None,
+                 device=None,
                  **kwargs):
         """
         Initialize DurotaxisEnv with configuration from YAML file
@@ -268,10 +269,16 @@ class DurotaxisEnv(gym.Env):
         ----------
         config_path : str
             Path to configuration YAML file
+        device : torch.device or str, optional
+            Device to use for tensors ('cpu', 'cuda', or None for auto-detect)
         **overrides
             Parameter overrides for any configuration values
         """
         super().__init__()
+        
+        # Set device first
+        from device import get_device
+        self.device = device if device is not None else get_device()
         
         # Load configuration
         config_loader = ConfigLoader(config_path)
@@ -571,12 +578,12 @@ class DurotaxisEnv(gym.Env):
         
         # 4. Rendering setup complete
         
-        # Create GraphInputEncoder for observations
+        # Create GraphInputEncoder for observations and move to device
         self.observation_encoder = GraphInputEncoder(
             hidden_dim=self.encoder_hidden_dim,
             out_dim=self.encoder_out_dim,
             num_layers=self.encoder_num_layers
-        )
+        ).to(self.device)
 
         # Store encoder output dimension for observation processing
 
@@ -586,8 +593,8 @@ class DurotaxisEnv(gym.Env):
         self.substrate = Substrate(self.substrate_size)
         self.substrate.create(self.substrate_type, **self.substrate_params)
         
-        # Create topology
-        self.topology = Topology(substrate=self.substrate, flush_delay=self.flush_delay)
+        # Create topology with device
+        self.topology = Topology(substrate=self.substrate, flush_delay=self.flush_delay, device=self.device)
         
         # Create state extractor
         self.state_extractor = TopologyState(self.topology)

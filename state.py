@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import dgl 
 from scipy.spatial import ConvexHull
+from device import cpu_numpy
 
 
 class TopologyState:
@@ -330,11 +331,11 @@ class TopologyState:
         # 3. Convex hull area
         try:
             if num_nodes >= 3:
-                hull = ConvexHull(positions.cpu().numpy())  # Convert to CPU for scipy
+                hull = ConvexHull(cpu_numpy(positions))  # Convert to CPU for scipy safely
                 hull_area = torch.tensor([hull.volume], dtype=torch.float32, device=device)  # [1]
             else:
                 hull_area = torch.tensor([0.0], device=device)  # [1]
-        except:
+        except Exception:
             hull_area = torch.tensor([0.0], device=device)  # [1]
         
         features.append(hull_area)
