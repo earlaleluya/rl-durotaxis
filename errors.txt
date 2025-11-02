@@ -1,0 +1,8 @@
+revise the reward function
+- remove spawn reward
+- check if graph reward is the same with total reward (supposedly, total reward is for the sum of all reward components, graph reward is for centroid distance)
+- make all reward components to be on clipped range [-1, 1]
+- new propose components [delete_reward, distance_reward, status_reward (N>Nc, etc.), termination_reward)
+- for delete reward: max(Nc, reward) / Nc, but if negative -reward, min(-Nc, reward) / Nc 
+- for distance reward: max(dx, Nc) / Nc, but if -dc, then min(dx/ -Nc) / Nc
+- status reward and termination reward are sparse

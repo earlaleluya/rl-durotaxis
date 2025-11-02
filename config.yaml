@@ -177,8 +177,8 @@ trainer:
   
   # Resume training
   resume_training:
-    enabled: true
-    checkpoint_path: "training_results/run0018/best_model_batch2.pt"
+    enabled: false
+    checkpoint_path: ""
     resume_from_best: false
     reset_optimizer: true
     reset_episode_count: true
@@ -210,7 +210,7 @@ trainer:
   # Value clipping
   enable_value_clipping: true
   value_clip_epsilon: 0.2
-  use_relative_value_clip: true  # FIX: Use relative clipping (% of old value)
+  use_relative_value_clip: true 
   
   # Return normalization (prevents value loss explosion)
   normalize_returns: true
