@@ -4315,7 +4315,7 @@ class DurotaxisTrainer:
                     'progress': float(kpis['progress']),
                     'return_mean': float(kpis['return_mean'])
                 },
-                'best_kpis': self.best_model_metrics.copy() if self.best_model_metrics else None
+                'best_kpis': self.best_model_metrics.copy() if isinstance(self.best_model_metrics, dict) else {}
             }
         }
         # Append to file
@@ -4440,9 +4440,9 @@ class DurotaxisTrainer:
             'smoothed_losses': self.smoothed_losses,
             # Model selection metrics (for preserving across restarts)
             'best_model_score': self.best_model_score,
-            'best_model_metrics': self.best_model_metrics.copy() if self.best_model_metrics else {},
+            'best_model_metrics': self.best_model_metrics.copy() if isinstance(self.best_model_metrics, dict) else {},
             'best_model_filename': self.best_model_filename,
-            'episode_history': self.episode_history.copy() if self.episode_history else [],
+            'episode_history': self.episode_history.copy() if isinstance(self.episode_history, list) else [],
         }
         
         filepath = os.path.join(self.run_dir, filename)
