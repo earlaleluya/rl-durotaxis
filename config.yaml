@@ -40,42 +40,40 @@ environment:
   include_termination_rewards: false
   
   # ============================================================================
-  # REWARD WEIGHTS (Priority: Delete > Spawn > Distance)
+  # REWARD WEIGHTS (Components: Delete, Distance, Termination)
   # ============================================================================
   # Environment-level weights applied when composing total reward
   # Makes priority explicit in the task reward, not just critic loss weights
   reward_weights:
-    delete_weight: 1.0      # Priority 1: Full weight for deletion compliance
-    spawn_weight: 0.75      # Priority 2: Reduced weight for spawning behavior
-    distance_weight: 0.5    # Priority 3: Lower weight for distance signal
+    delete_weight: 1.0         
+    distance_weight: 1.0       
+    termination_weight: 1.0   
   
   # ============================================================================
-  # CORE REWARD COMPONENTS (Refactored System)
+  # CORE REWARD COMPONENTS 
   # ============================================================================
-  # Priority: Delete > Spawn > Distance
   
   # Delete Reward (Priority 1: Proper deletion compliance)
+  # Scaled to [-1, 1] by dividing by num_nodes
+  # Use proper_deletion=1.0 for clean [-1, 1] range
   delete_reward:
-    proper_deletion: 2.0
-    persistence_penalty: 2.0
-    improper_deletion_penalty: 2.0
+    proper_deletion: 1.0
+    persistence_penalty: 1.0
+    improper_deletion_penalty: 1.0
     
     # PBRS: Potential-Based Reward Shaping (optional)
-    # Higher shaping_coeff reinforces priority when enabled
     pbrs:
       enabled: true
-      shaping_coeff: 0.1              # Higher than spawn (0.1 vs 0.05)
+      shaping_coeff: 0.1              
       phi_weight_pending_marked: 1.0
       phi_weight_safe_unmarked: 0.25
   
   # Spawn Reward (Priority 2: Intensity-based spawning)
-  # Uses same magnitude for both simple and normal modes
   spawn_rewards:
-    spawn_success_reward: 2.0     
-    spawn_failure_penalty: 2.0     
+    spawn_success_reward: 1.0     
+    spawn_failure_penalty: 1.0     
     
     # PBRS: Potential-Based Reward Shaping (optional)
-    # Lower shaping_coeff than delete reinforces priority when enabled
     pbrs:
       enabled: true
       shaping_coeff: 0.05             # Lower than delete (0.05 vs 0.1)
@@ -86,22 +84,29 @@ environment:
     use_delta_distance: true
     distance_reward_scale: 5.0
     
-    # Termination reward handling
-    terminal_reward_scale: 0.02
-    clip_terminal_rewards: true
-    terminal_reward_clip_value: 10.0
-
+    # Substrate-aware normalization (bounds distance reward to [-1, 1])
+    substrate_aware_scaling: true      # Use substrate gradient for scaling
+    use_tanh_normalization: true       # Use tanh (true) or softsign (false)
+    target_delta_x: 0.05              # Expected good step size for tuning
+    tanh_scale: 1.4722                # atanh(0.9) ≈ 1.4722 for sensitivity tuning
+    gradient_cap: null                # Optional: cap gradient for exponential substrates (e.g., 10.0)
+    
+    # PBRS: Potential-Based Reward Shaping (optional)
+    pbrs:
+      enabled: false
+      shaping_coeff: 0.05             # Lowest among all components
+      phi_distance_scale: 1.0         # Scale for distance-to-goal potential
   
-  # ============================================================================
-  # TERMINATION REWARDS
-  # ============================================================================
+  # Termination Reward (Priority 4: Sparse terminal signals)
+  # Sparse binary rewards: +1 for success, -1 for failures
+  # Applied only at episode termination
   termination_rewards:
-    success_reward: 500.0
-    out_of_bounds_penalty: -100.0
-    no_nodes_penalty: -100.0
-    leftward_drift_penalty: -50.0
-    timeout_penalty: 0.0
-    critical_nodes_penalty: -15.0
+    success_reward: 1.0                      # Node reaches rightmost area
+    critical_nodes_penalty: -1.0             # Too many nodes (> threshold)
+    no_nodes_penalty: -1.0                   # Graph collapses to 0 nodes
+    out_of_bounds_penalty: -1.0              # Node escapes substrate bounds
+    leftward_drift_penalty: -1.0             # Centroid drifts left consecutively
+    timeout_penalty: 0.0                     # Max steps reached (neutral)
   
   # ============================================================================
   # OBSERVATION SELECTION
@@ -143,10 +148,9 @@ actor_critic:
   # Value function components
   value_components:
     - 'total_reward'
-    - 'graph_reward'
-    - 'spawn_reward'
     - 'delete_reward'
-    - 'distance_signal'
+    - 'distance_reward'
+    - 'termination_reward'
   
   # Simplicial Embedding
   simplicial_embedding:
@@ -253,12 +257,12 @@ trainer:
   normalize_weights_every: 10
   
   # Component weights (for multi-head value function)
+  # Normalized to sum to 1.0 for balanced critic head learning
   component_weights:
-    total_reward: 1.0
-    graph_reward: 0.4
-    spawn_reward: 0.3
-    delete_reward: 0.3
-    distance_signal: 0.3
+    total_reward: 0.25
+    delete_reward: 0.25
+    distance_reward: 0.25
+    termination_reward: 0.25
   
   # Policy loss weights
   policy_loss_weights:
@@ -319,16 +323,3 @@ logging:
   save_model_every: null
   save_best_model: true
   verbose: true
-
-# ============================================================================
-# EXPERIMENTAL FEATURES
-# ============================================================================
-experimental:
-  # Multiple success criteria for episode evaluation
-  # Used in train.py to determine if episode is successful beyond just reaching goal
-  success_criteria:
-    enable_multiple_criteria: true
-    survival_success_steps: 10        # Episode length threshold for survival success
-    reward_success_threshold: -20     # Total reward threshold for reward-based success
-    growth_success_nodes: 2           # Node count threshold for growth success
-    exploration_success_steps: 15     # Episode length threshold for exploration success

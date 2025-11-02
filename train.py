@@ -255,7 +255,7 @@ class TrajectoryBuffer:
             component_names: List of component names to compute returns for
         """
         if component_names is None:
-            component_names = ['total_reward', 'graph_reward', 'spawn_reward', 'delete_reward', 'edge_reward', 'total_node_reward']
+            component_names = ['total_reward', 'delete_reward', 'distance_reward', 'termination_reward']
         
         for episode in self.episodes:
             rewards = episode['rewards']
@@ -525,13 +525,12 @@ class DurotaxisTrainer:
         self.exponential_b_range = tuple(config.get('exponential_b_range', [0.5, 1.5]))
         
         # Component weights and policy weights from config
+        # Default: Equal weights normalized to sum to 1.0
         self.component_weights = config.get('component_weights', {
-            'total_reward': 1.0,
-            'graph_reward': 0.4,
-            'spawn_reward': 0.3,
-            'delete_reward': 0.2,
-            'edge_reward': 0.2,
-            'total_node_reward': 0.3
+            'total_reward': 0.25,
+            'delete_reward': 0.25,
+            'distance_reward': 0.25,
+            'termination_reward': 0.25
         })
         
         self.policy_loss_weights = config.get('policy_loss_weights', {
@@ -666,14 +665,6 @@ class DurotaxisTrainer:
                 # Non-fatal: leave curriculum_stages empty and fallback to legacy behavior
                 self.curriculum_stages = []
         
-        # NEW: Success criteria configuration
-        success_config = experimental_config.get('success_criteria', {})
-        self.enable_multiple_criteria = success_config.get('enable_multiple_criteria', False)
-        self.survival_success_steps = success_config.get('survival_success_steps', 10)
-        self.reward_success_threshold = success_config.get('reward_success_threshold', -20)
-        self.growth_success_nodes = success_config.get('growth_success_nodes', 2)
-        self.exploration_success_steps = success_config.get('exploration_success_steps', 15)
-        
         # Initialize trajectory buffer for batch training
         self.trajectory_buffer = TrajectoryBuffer(device=self.device)
         
@@ -713,11 +704,9 @@ class DurotaxisTrainer:
         # Component configuration - match your environment's components
         self.component_names = [
             'total_reward',
-            'graph_reward', 
-            'spawn_reward',
             'delete_reward',
-            'edge_reward',
-            'total_node_reward'
+            'distance_reward',
+            'termination_reward'
         ]
         
         # Create network
@@ -842,10 +831,8 @@ class DurotaxisTrainer:
         
         # Reward component tracking for each episode
         self.current_episode_rewards = {
-            'graph_reward': [],
-            'spawn_reward': [],
             'delete_reward': [],
-            'distance_signal': [],
+            'distance_reward': [],
             'total_reward': []
         }
 
@@ -1102,9 +1089,9 @@ class DurotaxisTrainer:
         Validate reward components from environment to ensure consistency.
         
         Guards against:
-        1. Legacy components (edge_reward, total_node_reward) being returned
+        1. Legacy components (edge_reward, total_node_reward, graph_reward) being returned
         2. Missing expected components
-        3. graph_reward != total_reward inconsistency
+        3. total_reward != weighted sum of component rewards
         4. Unexpected components from environment
         
         Args:
@@ -1167,20 +1154,26 @@ class DurotaxisTrainer:
                 f"   Actual: {actual_components}"
             )
         
-        # Check 4: Verify graph_reward == total_reward (must be exactly equal)
-        if 'total_reward' in reward_components and 'graph_reward' in reward_components:
+        # Check 4: Verify total_reward is sum of component rewards (delete + distance + termination)
+        if 'total_reward' in reward_components and 'delete_reward' in reward_components and 'distance_reward' in reward_components and 'termination_reward' in reward_components:
             total = float(reward_components['total_reward'])
-            graph = float(reward_components['graph_reward'])
+            delete = float(reward_components['delete_reward'])
+            distance = float(reward_components['distance_reward'])
+            termination = float(reward_components['termination_reward'])
+            
+            # Calculate expected total from weighted sum
+            expected_total = self._w_delete * delete + self._w_distance * distance + self._w_termination * termination
             
             # Allow tiny floating point differences
-            if abs(total - graph) > 1e-6:
+            if abs(total - expected_total) > 1e-6:
                 raise ValueError(
                     f"❌ ENV VALIDATION ERROR {step_info}: "
-                    f"graph_reward != total_reward inconsistency!\n"
+                    f"total_reward != weighted sum of components!\n"
                     f"   total_reward: {total}\n"
-                    f"   graph_reward: {graph}\n"
-                    f"   difference: {abs(total - graph)}\n"
-                    f"   Check durotaxis_env.py ensures graph_reward = total_reward."
+                    f"   expected (w_delete*delete + w_distance*distance + w_termination*termination): {expected_total}\n"
+                    f"   delete_reward: {delete}, distance_reward: {distance}, termination_reward: {termination}\n"
+                    f"   w_delete: {self._w_delete}, w_distance: {self._w_distance}, w_termination: {self._w_termination}\n"
+                    f"   difference: {abs(total - expected_total)}"
                 )
 
     def get_component_scaling_factors(self) -> Dict[str, float]:
@@ -1689,14 +1682,17 @@ class DurotaxisTrainer:
             # Combined entropy for continuous actions
             total_entropy = eval_output['entropy'].mean()
             
+            # Main entropy regularization (encourage exploration)
+            entropy_loss = -entropy_coeff * total_entropy
+            
             # Minimum entropy protection (prevent complete collapse)
             if total_entropy < self.min_entropy_threshold:
                 # Boost entropy if too low
                 entropy_penalty = (self.min_entropy_threshold - total_entropy) * 2.0
                 entropy_losses['entropy_penalty'] = entropy_penalty
-            
-            # Main entropy regularization (encourage exploration)
-            entropy_losses['total'] = -entropy_coeff * total_entropy
+                entropy_losses['total'] = entropy_loss + entropy_penalty
+            else:
+                entropy_losses['total'] = entropy_loss
             
         elif 'continuous_entropy' in eval_output:
             # Continuous entropy only (delete ratio architecture)
@@ -2417,29 +2413,6 @@ class DurotaxisTrainer:
         if 'init_num_nodes' in curriculum_config:
             self.init_num_nodes = curriculum_config['init_num_nodes']
     
-    def _evaluate_episode_success(self, episode_rewards: List[Dict], episode_length: int, 
-                                 final_state: Dict) -> Tuple[bool, Dict[str, bool]]:
-        """Evaluate if an episode was successful using multiple criteria."""
-        if not self.enable_multiple_criteria:
-            # Use traditional success evaluation (if any)
-            return False, {}
-            
-        total_reward = sum(r.get('total_reward', 0) for r in episode_rewards)
-        num_nodes = final_state.get('num_nodes', 0)
-        
-        # Multiple success criteria (easier to achieve)
-        success_criteria = {
-            'survival_success': episode_length >= self.survival_success_steps and num_nodes > 0,
-            'reward_success': total_reward > self.reward_success_threshold,
-            'growth_success': episode_length >= 5 and num_nodes >= self.growth_success_nodes,
-            'exploration_success': episode_length >= self.exploration_success_steps,
-        }
-        
-        # Episode is successful if it meets any criterion
-        is_successful = any(success_criteria.values())
-        
-        return is_successful, success_criteria
-    
     def collect_episode(self, episode_num: int = 0) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], List[Dict], List[torch.Tensor], List[torch.Tensor], Optional[Dict], bool, bool]:
         """Collect one episode of experience with curriculum learning support"""
         # Apply curriculum learning configuration
@@ -2455,10 +2428,8 @@ class DurotaxisTrainer:
         }
         
         self.current_episode_rewards = {
-            'graph_reward': [],
-            'spawn_reward': [],
             'delete_reward': [],
-            'distance_signal': [],
+            'distance_reward': [],
             'total_reward': []
         }
         
@@ -2651,12 +2622,12 @@ class DurotaxisTrainer:
                 reward_components['milestone_bonus'] += 10.0  # Deep exploration with nodes
             
             # Stage 3: Node management skill rewards
-            spawn_count = len(self.current_episode_rewards['spawn_reward'])
+            # Note: Spawn reward tracking removed - milestone bonuses based on delete actions only
             delete_count = len(self.current_episode_rewards['delete_reward'])
             
-            if spawn_count >= 1 and delete_count >= 1:
+            if delete_count >= 1:
                 reward_components['milestone_bonus'] += 3.0  # Basic node management
-            if spawn_count >= 3 and delete_count >= 2:
+            if delete_count >= 3:
                 reward_components['milestone_bonus'] += 7.0  # Advanced node management
             
             # Stage 4: Efficiency and optimization rewards
@@ -3068,19 +3039,10 @@ class DurotaxisTrainer:
         
         losses['total_value_loss'] = total_value_loss.item()
         
-        # === ENTROPY BONUS FOR EXPLORATION ===
-        # Encourage exploration to prevent premature convergence
-        entropy_bonus = torch.tensor(0.0, device=self.device)
-        if 'entropy' in batched_eval_output:
-            entropy_bonus = -self.entropy_bonus_coeff * batched_eval_output['entropy']
-            losses['entropy_bonus'] = entropy_bonus.item()
-        else:
-            losses['entropy_bonus'] = 0.0
-        
         # === TOTAL LOSS AND OPTIMIZATION ===
-        # FIX: Reduce value loss weight to prevent value loss from dominating training
-        value_loss_weight = 0.25  # Down from 0.5 to reduce impact of large value losses
-        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss + entropy_bonus
+        # Value loss weight (after normalizing component weights)
+        value_loss_weight = 0.5  # Standard PPO value loss weight
+        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss
         losses['total_loss'] = total_loss.item()
         losses['value_loss_weight'] = value_loss_weight
         
@@ -3091,7 +3053,7 @@ class DurotaxisTrainer:
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"⚠️  WARNING: Invalid loss detected (NaN or Inf): {total_loss.item()}")
             print(f"   Policy loss: {avg_total_policy_loss.item()}, Value loss: {total_value_loss.item()}")
-            print(f"   Entropy loss: {avg_entropy_loss.item()}, Entropy bonus: {entropy_bonus.item()}")
+            print(f"   Entropy loss: {avg_entropy_loss.item()}")
             return losses  # Skip this update
         
         # Backward pass
@@ -3395,19 +3357,10 @@ class DurotaxisTrainer:
         except Exception:
             losses['explained_variance'] = 0.0
         
-        # === ENTROPY BONUS FOR EXPLORATION ===
-        # Encourage exploration to prevent premature convergence
-        entropy_bonus = torch.tensor(0.0, device=self.device)
-        if 'entropy' in batched_eval_output:
-            entropy_bonus = -self.entropy_bonus_coeff * batched_eval_output['entropy']
-            losses['entropy_bonus'] = entropy_bonus.item()
-        else:
-            losses['entropy_bonus'] = 0.0
-        
         # === TOTAL LOSS AND OPTIMIZATION ===
-        # FIX: Reduce value loss weight to prevent value loss from dominating training  
-        value_loss_weight = 0.25  # Down from 0.5 to reduce impact of large value losses
-        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss + entropy_bonus
+        # Use standard PPO weight for value loss (after component weights are normalized)
+        value_loss_weight = 0.5  # Standard PPO value
+        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss
         losses['total_loss'] = total_loss.item()
         losses['value_loss_weight'] = value_loss_weight
         
@@ -3418,7 +3371,7 @@ class DurotaxisTrainer:
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"⚠️  WARNING: Invalid loss detected (NaN or Inf): {total_loss.item()}")
             print(f"   Policy loss: {avg_total_policy_loss.item()}, Value loss: {total_value_loss.item()}")
-            print(f"   Entropy loss: {avg_entropy_loss.item()}, Entropy bonus: {entropy_bonus.item()}")
+            print(f"   Entropy loss: {avg_entropy_loss.item()}")
             return losses  # Skip this update
         
         # Backward pass
@@ -3866,7 +3819,7 @@ class DurotaxisTrainer:
                     ratio_continuous = final_losses.get('ratio_continuous', 1.0)
                     value_loss = final_losses.get('total_value_loss', 0.0)
                     policy_loss = final_losses.get('total_policy_loss', 0.0)
-                    entropy = final_losses.get('entropy_bonus', 0.0)
+                    entropy = final_losses.get('entropy_loss', 0.0)
                     explained_var = final_losses.get('explained_variance', 0.0)
                     
                     print(f"   📊 PPO Health Metrics (Delete Ratio Architecture):")
@@ -4010,7 +3963,7 @@ class DurotaxisTrainer:
                     recent_reward = moving_average(self.episode_rewards['total_reward'], min(20, len(self.episode_rewards['total_reward'])))
                     best_so_far = max(self.episode_rewards['total_reward']) if self.episode_rewards['total_reward'] else 0.0
                     total_loss = final_losses.get('total_loss', 0.0)
-                    entropy_bonus = final_losses.get('entropy_bonus', 0.0)
+                    entropy_loss = final_losses.get('entropy_loss', 0.0)
                     dominant_comp = max(self.component_weights.items(), key=lambda x: x[1])[0]
                     dominant_weight = self.component_weights[dominant_comp]
                     
@@ -4029,7 +3982,7 @@ class DurotaxisTrainer:
                     
                     current_lr = self.lr_scheduler.get_last_lr()[0] if hasattr(self, 'lr_scheduler') else self.optimizer.param_groups[0]['lr']
                     print(f"Batch {batch_count:3d} | R: {batch_stats['avg_reward']:6.3f} (MA: {recent_reward:6.3f}, Best: {best_so_far:6.3f}) | "
-                          f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {current_lr:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
+                          f"Loss: {total_loss:7.4f} | Entropy: {entropy_loss:7.4f} | LR: {current_lr:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
                           f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
                 
                 # ==========================================
@@ -4444,7 +4397,7 @@ class DurotaxisTrainer:
         
         # Store reward summary for consolidated logging (silent for one-line logging)
         # DELETE RATIO ARCHITECTURE: Only track current reward components
-        key_components = ['total_reward', 'graph_reward', 'spawn_reward', 'delete_reward', 'distance_signal']
+        key_components = ['total_reward', 'delete_reward', 'distance_reward', 'termination_reward']
         active_components = []
         
         for comp in key_components:

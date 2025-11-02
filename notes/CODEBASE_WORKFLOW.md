@@ -9,9 +9,10 @@ This codebase implements a **Reinforcement Learning (RL) system** for simulating
 - **Graph Transformer Encoder:** PyTorch Geometric TransformerConv with edge-aware attention
 - **Edge Features (`edge_attr`):** 3D edge properties [distance, direction_x, direction_y] used in attention mechanism
 - **Continuous Action Space:** Delete-ratio architecture (5D: delete_ratio, gamma, alpha, noise, theta)
-- **Simplified Reward System:** Weighted composition of 3 core components (Delete > Spawn > Distance)
-- **Multi-Head Critic:** 5-head value function (total_reward, graph_reward, delete_reward, spawn_reward, distance_signal)
+- **3-Component Reward System:** Delete > Distance > Termination with optional PBRS (Potential-Based Reward Shaping)
+- **Multi-Head Critic:** 4-head value function (total_reward, delete_reward, distance_reward, termination_reward)
 - **Special Ablation Modes:** Configurable modes to isolate specific reward components for targeted studies
+- **PBRS Integration:** Optional per-component potential-based shaping for smoother learning signals
 
 ---
 
@@ -552,35 +553,49 @@ STEP FUNCTION WORKFLOW:
   ┌─────────────────────────────────────────────────────────┐
   │ 3. COMPUTE REWARD COMPONENTS                             │
   │                                                           │
-  │    **SIMPLIFIED REWARD SYSTEM**:                         │
+  │    **3-COMPONENT REWARD SYSTEM WITH OPTIONAL PBRS**:     │
   │                                                           │
   │    Three core components with explicit priority:         │
   │                                                           │
-  │    A) DELETE REWARD (weight: 1.0) - Highest priority     │
-  │       ├─▶ Proper deletion bonus (remove leftmost)        │
-  │       ├─▶ Improper deletion penalty                      │
-  │       └─▶ Persistence penalty (keeping flagged nodes)    │
+  │    A) DELETE REWARD (Priority 1)                         │
+  │       ├─▶ Proper deletion: +1/num_nodes per correct del  │
+  │       ├─▶ Persistence penalty: -1/num_nodes per kept node│
+  │       ├─▶ Improper deletion: -1/num_nodes per wrong del  │
+  │       ├─▶ Scaled to [-1, 1] range                        │
+  │       └─▶ Optional PBRS (φ: pending/marked vs unmarked)  │
+  │           shaping_coeff: 0.1 (configurable)              │
   │                                                           │
-  │    B) SPAWN REWARD (weight: 0.75) - Medium priority      │
-  │       ├─▶ Spawn success reward                           │
-  │       ├─▶ Spawn failure penalty                          │
-  │       └─▶ Near-boundary spawn penalty                    │
+  │    B) DISTANCE REWARD (Priority 2)                       │
+  │       ├─▶ Delta-distance (centroid movement)             │
+  │       ├─▶ Substrate-aware scaling (gradient-based)       │
+  │       ├─▶ Bounded to [-1, 1] via tanh/softsign          │
+  │       ├─▶ Encourages rightward progress                  │
+  │       └─▶ Optional PBRS (φ: distance-to-goal potential)  │
+  │           shaping_coeff: 0.05 (configurable)             │
   │                                                           │
-  │    C) DISTANCE SIGNAL (weight: 0.5) - Lower priority     │
-  │       ├─▶ Centroid movement (rightward progress)         │
-  │       ├─▶ Milestone rewards (25%, 50%, 75%, 90%)         │
-  │       └─▶ Termination rewards (success/failure)          │
+  │    C) TERMINATION REWARD (Priority 3)                    │
+  │       ├─▶ Binary sparse signals (applied at episode end) │
+  │       ├─▶ Success: +1 (node reaches goal)                │
+  │       ├─▶ Failures: -1 (too many nodes, no nodes, etc.)  │
+  │       ├─▶ Timeout: 0 (neutral, no penalty)               │
+  │       └─▶ Always 0 during episode (sparse terminal only) │
   │                                                           │
-  │    Total reward composition:                             │
-  │    total_reward = 1.0*delete + 0.75*spawn + 0.5*distance │
-  │    graph_reward = total_reward (explicit alias)          │
+  │    Reward Composition (configurable weights):            │
+  │    total_reward = w_d*delete + w_dist*distance + w_t*term│
+  │    Default weights: delete=1.0, distance=1.0, term=1.0   │
+  │                                                           │
+  │    **PBRS (Potential-Based Reward Shaping)**:            │
+  │    ├─▶ Policy-invariant shaping (doesn't change optimal) │
+  │    ├─▶ Provides denser learning signals                  │
+  │    ├─▶ Per-component enable/disable (optional)           │
+  │    └─▶ Formula: F(s,a,s') = γ·φ(s') - φ(s)              │
   │                                                           │
   │    **SPECIAL ABLATION MODES**:                           │
   │    Configurable modes to isolate components for study:   │
-  │    - Centroid distance only mode                         │
-  │    - Delete-only mode                                    │
-  │    - Spawn-only mode                                     │
-  │    (See reward_mode CLI guide for details)               │
+  │    - simple_delete_only_mode: Delete reward only         │
+  │    - centroid_distance_only_mode: Distance reward only   │
+  │    - simple_spawn_only_mode: Spawn reward only (legacy)  │
+  │    (See config.yaml: environment.reward_modes)           │
   └─────────────────────────────────────────────────────────┘
         │
         ▼
@@ -961,22 +976,27 @@ action_bounds = {
     'theta': [-0.5236, 0.5236]         # Migration angle (-π/6 to π/6, -30° to +30°)
 }
 
-# Reward Dictionary (5 components, graph=total alias)
+# Reward Dictionary (4 components: Delete > Distance > Termination)
 rewards = {
-    'total_reward': float,              # Weighted sum (1.0*d + 0.75*s + 0.5*dist)
-    'graph_reward': float,              # Explicit alias of total_reward
-    'spawn_reward': float,              # Spawn component (weight: 0.75)
-    'delete_reward': float,             # Delete component (weight: 1.0)
-    'distance_signal': float            # Distance component (weight: 0.5)
+    'total_reward': float,              # Weighted sum: w_d*delete + w_dist*distance + w_t*term
+    'delete_reward': float,             # Delete component (Priority 1, scaled to [-1,1])
+    'distance_reward': float,           # Distance component (Priority 2, bounded to [-1,1])
+    'termination_reward': float         # Termination component (Priority 3, binary ±1 or 0)
 }
 
-# Value Predictions (5 independent heads)
+# Environment Reward Weights (configurable in config.yaml)
+reward_weights = {
+    'delete_weight': 1.0,               # Weight for delete component
+    'distance_weight': 1.0,             # Weight for distance component
+    'termination_weight': 1.0           # Weight for termination component
+}
+
+# Value Predictions (4 independent heads for multi-component critic)
 value_predictions = {
-    'total_reward': torch.Tensor,       # [1] - Critic weight: 1.0
-    'graph_reward': torch.Tensor,       # [1] - Critic weight: 0.4
-    'spawn_reward': torch.Tensor,       # [1] - Critic weight: 0.3
-    'delete_reward': torch.Tensor,      # [1] - Critic weight: 0.3
-    'distance_signal': torch.Tensor     # [1] - Critic weight: 0.3
+    'total_reward': torch.Tensor,       # [1] - Critic weight: 0.25 (normalized)
+    'delete_reward': torch.Tensor,      # [1] - Critic weight: 0.25 (normalized)
+    'distance_reward': torch.Tensor,    # [1] - Critic weight: 0.25 (normalized)
+    'termination_reward': torch.Tensor  # [1] - Critic weight: 0.25 (normalized)
 }
 ```
 
@@ -1198,15 +1218,18 @@ Component-specific returns at step 0:
 ## Key Design Patterns
 
 ### 1. **Multi-Component Value Learning with Per-Component GAE**
-- Separate value heads for 5 reward components:
-  - total_reward, graph_reward (alias), delete_reward, spawn_reward, distance_signal
-- **Per-component GAE computation** (NEW):
+- Separate value heads for 4 reward components:
+  - total_reward, delete_reward, distance_reward, termination_reward
+- **Per-component GAE computation**:
   - Each component gets independent TD errors, advantages, and returns
-  - spawn_value head trained on spawn-only returns
   - delete_value head trained on delete-only returns
+  - distance_value head trained on distance-only returns
+  - termination_value head trained on termination-only returns
   - Enables agent to identify and improve weak components
-- Environment priority weights: delete=1.0 > spawn=0.75 > distance=0.5
-- Critic learning weights: total=1.0, graph=0.4, others=0.3
+- Environment composition weights (configurable):
+  - delete_weight: 1.0, distance_weight: 1.0, termination_weight: 1.0 (default)
+- Critic learning weights (normalized):
+  - All components: 0.25 each (total=0.25, delete=0.25, distance=0.25, termination=0.25)
 - Policy uses weighted composition of ALL component advantages
 - Value clipping for stable PPO updates
 
@@ -1224,15 +1247,23 @@ Component-specific returns at step 0:
 - **Optional Simplicial Embedding (SEM):** Group-wise softmax for geometric constraints
 
 ### 4. **Reward System Architecture**
-- **Core Components:** 3 weighted components (Delete, Spawn, Distance)
-  - Environment priority weights: delete=1.0 > spawn=0.75 > distance=0.5
-  - Critic learning weights: total=1.0, graph=0.4, others=0.3
-  - graph_reward = total_reward (explicit alias prevents contradictory signals)
+- **Core Components:** 3 components with equal default weights (Delete > Distance > Termination)
+  - Delete Reward (Priority 1): Proper deletion compliance, scaled to [-1, 1]
+  - Distance Reward (Priority 2): Centroid movement, bounded to [-1, 1] via tanh/softsign
+  - Termination Reward (Priority 3): Binary sparse terminal signals (±1 or 0)
+  - Environment composition weights (configurable): delete=1.0, distance=1.0, termination=1.0
+  - Critic learning weights (normalized): all components 0.25 each
+- **Potential-Based Reward Shaping (PBRS):**
+  - Optional per-component shaping for smoother learning
+  - Policy-invariant (doesn't change optimal policy)
+  - Configurable shaping coefficients (delete: 0.1, distance: 0.05)
+  - Delete φ: based on pending/marked vs. safe/unmarked nodes
+  - Distance φ: based on distance-to-goal
 - **Special Ablation Modes:** Configurable modes to isolate components:
-  - Centroid distance only mode: `environment.centroid_distance_only_mode: true`
-  - Delete-only mode: Isolate deletion behavior
-  - Spawn-only mode: Isolate spawning behavior
-  - (See REWARD_MODE_CLI_GUIDE.md for detailed usage)
+  - simple_delete_only_mode: `environment.simple_delete_only_mode: true`
+  - centroid_distance_only_mode: `environment.centroid_distance_only_mode: true`
+  - simple_spawn_only_mode: `environment.simple_spawn_only_mode: true` (legacy)
+  - (See config.yaml for configuration options)
 
 ### 5. **Curriculum Learning**
 - 3 progressive stages with adaptive transitions
@@ -1332,12 +1363,13 @@ python train_cli.py --learning-rate 0.0003 --total-episodes 2000
 
 This codebase implements a sophisticated **graph-based RL system** for durotaxis simulation with:
 
-✅ **Multi-component reward system** (6 components with adaptive weighting)  
+✅ **3-component reward system** (Delete > Distance > Termination with optional PBRS)  
+✅ **Potential-Based Reward Shaping (PBRS)** (policy-invariant shaping per component)  
 ✅ **Delete-ratio continuous action architecture** (5D continuous: delete_ratio + spawn params)  
 ✅ **Graph Transformer encoder** (PyTorch Geometric TransformerConv with edge features)  
 ✅ **Enriched feature representations** (19 graph-level, 11 node-level, 3 edge-level)  
 ✅ **Simplicial Embedding (SEM)** (optional geometric constraint for ablation studies)  
-✅ **Experimental reward modes** (Centroid Distance Only with adaptive scaling)  
+✅ **Multi-component value function** (4-head critic with per-component GAE)  
 ✅ **Two-stage training curriculum** (Stage 1: delete_ratio only, Stage 2: full 5D)  
 ✅ **ResNet18 backbone** (ImageNet pretrained, configurable freezing modes)  
 ✅ **Curriculum learning** (3-stage progressive difficulty with overlap)  
