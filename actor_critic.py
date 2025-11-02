@@ -952,7 +952,7 @@ if __name__ == '__main__':
     try:
         encoder = GraphInputEncoder(hidden_dim=128, out_dim=64, num_layers=2)
         
-        reward_components = ['total_value', 'graph_value', 'spawn_value', 'node_value', 'edge_value']
+        reward_components = ['total_reward', 'delete_reward', 'distance_reward', 'termination_reward']
         network = HybridActorCritic(
             encoder=encoder,
             hidden_dim=128,

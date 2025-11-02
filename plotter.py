@@ -8,7 +8,7 @@ plots with error bands, statistical summaries, and multiple visualization modes.
 
 FEATURES:
     • Spawn Parameter Evolution: gamma, alpha, noise, theta parameters with ±1σ error bands
-    • Reward Components Analysis: graph, spawn, delete, edge, total node, and total rewards
+    • Reward Components Analysis: total_reward, delete_reward, distance_reward, termination_reward
     • Combined Normalized Views: overlay plots for parameter comparison
     • Interactive Display: matplotlib interactive viewing
     • High-Resolution Output: publication-ready PNG files (300 DPI)
@@ -62,8 +62,8 @@ COMMAND LINE ARGUMENTS:
                         
     --rewards           Generate reward components evolution plot.
                         • Requires reward_components_stats.json in the same directory
-                        • Plots all 6 reward components: graph, spawn, delete, edge, total_node, total
-                        • 3x2 subplot grid with ±1σ error bands
+                        • Plots 4 reward components: total_reward, delete_reward, distance_reward, termination_reward
+                        • 2x2 subplot grid with ±1σ error bands
                         • Zero reference lines for positive/negative reward identification
                         
     --loss              Generate loss evolution plot.
@@ -392,27 +392,24 @@ def create_loss_plot(episodes, losses, smoothed_losses, title_suffix="", save_pa
 def extract_reward_components(data):
     """Extract reward component means and standard deviations for each episode.
     
-    DELETE RATIO ARCHITECTURE: Now tracks 5 components:
-    - graph_reward (alias for centroid movement)
-    - spawn_reward
-    - delete_reward  
-    - distance_signal
-    - total_reward
+    Tracks 4 components:
+    - delete_reward (Priority 1: Deletion compliance)
+    - distance_reward (Priority 2: Centroid movement)
+    - termination_reward (Priority 3: Terminal signals)
+    - total_reward (Weighted composition)
     """
     episodes = []
     
-    # Reward components (DELETE RATIO ARCHITECTURE)
-    graph_reward_means = []
-    spawn_reward_means = []
+    # Reward components
     delete_reward_means = []
-    distance_signal_means = []
+    distance_reward_means = []
+    termination_reward_means = []
     total_reward_means = []
     
     # Standard deviations
-    graph_reward_stds = []
-    spawn_reward_stds = []
     delete_reward_stds = []
-    distance_signal_stds = []
+    distance_reward_stds = []
+    termination_reward_stds = []
     total_reward_stds = []
     
     for episode_data in data:
@@ -420,131 +417,113 @@ def extract_reward_components(data):
         
         # Extract mean values for each reward component (handle None/null values)
         rewards = episode_data['reward_components']
-        graph_reward_means.append(rewards.get('graph_reward', {}).get('mean', 0.0) or 0.0)
-        spawn_reward_means.append(rewards.get('spawn_reward', {}).get('mean', 0.0) or 0.0)
         delete_reward_means.append(rewards.get('delete_reward', {}).get('mean', 0.0) or 0.0)
-        distance_signal_means.append(rewards.get('distance_signal', {}).get('mean', 0.0) or 0.0)
+        distance_reward_means.append(rewards.get('distance_reward', {}).get('mean', 0.0) or 0.0)
+        termination_reward_means.append(rewards.get('termination_reward', {}).get('mean', 0.0) or 0.0)
         total_reward_means.append(rewards.get('total_reward', {}).get('mean', 0.0) or 0.0)
         
         # Extract std values for each reward component (handle None/null values)
-        graph_reward_stds.append(rewards.get('graph_reward', {}).get('std', 0.0) or 0.0)
-        spawn_reward_stds.append(rewards.get('spawn_reward', {}).get('std', 0.0) or 0.0)
         delete_reward_stds.append(rewards.get('delete_reward', {}).get('std', 0.0) or 0.0)
-        distance_signal_stds.append(rewards.get('distance_signal', {}).get('std', 0.0) or 0.0)
+        distance_reward_stds.append(rewards.get('distance_reward', {}).get('std', 0.0) or 0.0)
+        termination_reward_stds.append(rewards.get('termination_reward', {}).get('std', 0.0) or 0.0)
         total_reward_stds.append(rewards.get('total_reward', {}).get('std', 0.0) or 0.0)
     
     return (episodes, 
-            graph_reward_means, spawn_reward_means, delete_reward_means, 
-            distance_signal_means, total_reward_means,
-            graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-            distance_signal_stds, total_reward_stds)
+            delete_reward_means, distance_reward_means, termination_reward_means, total_reward_means,
+            delete_reward_stds, distance_reward_stds, termination_reward_stds, total_reward_stds)
 
 
-def create_reward_components_plot(episodes, graph_reward_means, spawn_reward_means, delete_reward_means,
-                                 distance_signal_means, total_reward_means,
-                                 graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-                                 distance_signal_stds, total_reward_stds,
+def create_reward_components_plot(episodes, delete_reward_means, distance_reward_means, 
+                                 termination_reward_means, total_reward_means,
+                                 delete_reward_stds, distance_reward_stds, 
+                                 termination_reward_stds, total_reward_stds,
                                  title_suffix="", save_path=None):
     """Create and display/save plots for reward components with standard deviation bands.
     
-    DELETE RATIO ARCHITECTURE: Plots 5 reward components in a 3x2 grid:
-    - graph_reward (centroid movement)
-    - spawn_reward
-    - delete_reward
-    - distance_signal
-    - total_reward
+    Plots 4 reward components in a 2x2 grid:
+    - delete_reward (Priority 1: Deletion compliance)
+    - distance_reward (Priority 2: Centroid movement)
+    - termination_reward (Priority 3: Terminal signals)
+    - total_reward (Weighted composition)
     """
     
     # Convert to numpy arrays for easier math
     episodes = np.array(episodes)
     
-    # Means (DELETE RATIO ARCHITECTURE)
-    graph_reward_means = np.array(graph_reward_means)
-    spawn_reward_means = np.array(spawn_reward_means)
+    # Means
     delete_reward_means = np.array(delete_reward_means)
-    distance_signal_means = np.array(distance_signal_means)
+    distance_reward_means = np.array(distance_reward_means)
+    termination_reward_means = np.array(termination_reward_means)
     total_reward_means = np.array(total_reward_means)
     
     # Standard deviations
-    graph_reward_stds = np.array(graph_reward_stds)
-    spawn_reward_stds = np.array(spawn_reward_stds)
     delete_reward_stds = np.array(delete_reward_stds)
-    distance_signal_stds = np.array(distance_signal_stds)
+    distance_reward_stds = np.array(distance_reward_stds)
+    termination_reward_stds = np.array(termination_reward_stds)
     total_reward_stds = np.array(total_reward_stds)
     
     # Set up the plot style
     plt.style.use('default')
-    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
-    fig.suptitle(f'Reward Components Evolution - Delete Ratio Architecture{title_suffix}', fontsize=16, fontweight='bold')
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Reward Components Evolution (Delete > Distance > Termination){title_suffix}', 
+                 fontsize=16, fontweight='bold')
     
-    # Colors for each reward component (DELETE RATIO ARCHITECTURE: 5 components)
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b']
+    # Flatten axes for easier indexing
+    axes = axes.flatten()
     
-    # Plot Graph Reward (centroid movement)
-    axes[0, 0].plot(episodes, graph_reward_means, 'o-', color=colors[0], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[0, 0].fill_between(episodes, graph_reward_means - graph_reward_stds, graph_reward_means + graph_reward_stds, 
+    # Colors for each reward component (4 components)
+    colors = ['#2ca02c', '#9467bd', '#ff7f0e', '#8c564b']
+    
+    # Plot Delete Reward (Priority 1)
+    axes[0].plot(episodes, delete_reward_means, 'o-', color=colors[0], linewidth=2, markersize=4, alpha=0.8, label='Mean')
+    axes[0].fill_between(episodes, delete_reward_means - delete_reward_stds, delete_reward_means + delete_reward_stds,
                            color=colors[0], alpha=0.2, label='±1 std')
-    axes[0, 0].set_title('Graph Reward (Centroid Movement) per Episode', fontsize=12, fontweight='bold')
-    axes[0, 0].set_xlabel('Episode')
-    axes[0, 0].set_ylabel('Graph Reward')
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].legend(fontsize=9)
-    axes[0, 0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    axes[0].set_title('Delete Reward (Priority 1)', fontsize=12, fontweight='bold')
+    axes[0].set_xlabel('Episode')
+    axes[0].set_ylabel('Delete Reward')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=9)
+    axes[0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
-    # Plot Spawn Reward
-    axes[0, 1].plot(episodes, spawn_reward_means, 'o-', color=colors[1], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[0, 1].fill_between(episodes, spawn_reward_means - spawn_reward_stds, spawn_reward_means + spawn_reward_stds,
+    # Plot Distance Reward (Priority 2)
+    axes[1].plot(episodes, distance_reward_means, 'o-', color=colors[1], linewidth=2, markersize=4, alpha=0.8, label='Mean')
+    axes[1].fill_between(episodes, distance_reward_means - distance_reward_stds, distance_reward_means + distance_reward_stds,
                            color=colors[1], alpha=0.2, label='±1 std')
-    axes[0, 1].set_title('Spawn Reward per Episode', fontsize=12, fontweight='bold')
-    axes[0, 1].set_xlabel('Episode')
-    axes[0, 1].set_ylabel('Spawn Reward')
-    axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].legend(fontsize=9)
-    axes[0, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    axes[1].set_title('Distance Reward (Priority 2)', fontsize=12, fontweight='bold')
+    axes[1].set_xlabel('Episode')
+    axes[1].set_ylabel('Distance Reward')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=9)
+    axes[1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
-    # Plot Delete Reward
-    axes[1, 0].plot(episodes, delete_reward_means, 'o-', color=colors[2], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[1, 0].fill_between(episodes, delete_reward_means - delete_reward_stds, delete_reward_means + delete_reward_stds,
+    # Plot Termination Reward (Priority 3)
+    axes[2].plot(episodes, termination_reward_means, 'o-', color=colors[2], linewidth=2, markersize=4, alpha=0.8, label='Mean')
+    axes[2].fill_between(episodes, termination_reward_means - termination_reward_stds, termination_reward_means + termination_reward_stds,
                            color=colors[2], alpha=0.2, label='±1 std')
-    axes[1, 0].set_title('Delete Reward per Episode', fontsize=12, fontweight='bold')
-    axes[1, 0].set_xlabel('Episode')
-    axes[1, 0].set_ylabel('Delete Reward')
-    axes[1, 0].grid(True, alpha=0.3)
-    axes[1, 0].legend(fontsize=9)
-    axes[1, 0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    axes[2].set_title('Termination Reward (Priority 3)', fontsize=12, fontweight='bold')
+    axes[2].set_xlabel('Episode')
+    axes[2].set_ylabel('Termination Reward')
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend(fontsize=9)
+    axes[2].axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
-    # Plot Distance Signal
-    axes[1, 1].plot(episodes, distance_signal_means, 'o-', color=colors[3], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[1, 1].fill_between(episodes, distance_signal_means - distance_signal_stds, distance_signal_means + distance_signal_stds,
+    # Plot Total Reward (Weighted Composition)
+    axes[3].plot(episodes, total_reward_means, 'o-', color=colors[3], linewidth=2, markersize=4, alpha=0.8, label='Mean')
+    axes[3].fill_between(episodes, total_reward_means - total_reward_stds, total_reward_means + total_reward_stds,
                            color=colors[3], alpha=0.2, label='±1 std')
-    axes[1, 1].set_title('Distance Signal per Episode', fontsize=12, fontweight='bold')
-    axes[1, 1].set_xlabel('Episode')
-    axes[1, 1].set_ylabel('Distance Signal')
-    axes[1, 1].grid(True, alpha=0.3)
-    axes[1, 1].legend(fontsize=9)
-    axes[1, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    
-    # Plot Total Reward
-    axes[2, 0].plot(episodes, total_reward_means, 'o-', color=colors[4], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[2, 0].fill_between(episodes, total_reward_means - total_reward_stds, total_reward_means + total_reward_stds,
-                           color=colors[4], alpha=0.2, label='±1 std')
-    axes[2, 0].set_title('Total Reward per Episode', fontsize=12, fontweight='bold')
-    axes[2, 0].set_xlabel('Episode')
-    axes[2, 0].set_ylabel('Total Reward')
-    axes[2, 0].grid(True, alpha=0.3)
-    axes[2, 0].legend(fontsize=9)
-    axes[2, 0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    
-    # Hide unused subplot (we have 5 components, not 6)
-    axes[2, 1].axis('off')
+    axes[3].set_title('Total Reward (Weighted Sum)', fontsize=12, fontweight='bold')
+    axes[3].set_xlabel('Episode')
+    axes[3].set_ylabel('Total Reward')
+    axes[3].grid(True, alpha=0.3)
+    axes[3].legend(fontsize=9)
+    axes[3].axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
     # Add statistics text boxes
     reward_data = [
-        ('Graph', graph_reward_means, axes[0, 0]),
-        ('Spawn', spawn_reward_means, axes[0, 1]),
-        ('Delete', delete_reward_means, axes[1, 0]),
-        ('Distance', distance_signal_means, axes[1, 1]),
-        ('Total', total_reward_means, axes[2, 0])
+        ('Delete', delete_reward_means, axes[0]),
+        ('Distance', distance_reward_means, axes[1]),
+        ('Termination', termination_reward_means, axes[2]),
+        ('Total', total_reward_means, axes[3])
     ]
     
     for param_name, values, ax in reward_data:
@@ -645,17 +624,15 @@ def main():
         if reward_json_file.exists():
             print(f"Loading reward component data from: {reward_json_file}")
             reward_data = load_reward_stats(reward_json_file)
-            (reward_episodes, graph_reward_means, spawn_reward_means, delete_reward_means,
-             distance_signal_means, total_reward_means,
-             graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-             distance_signal_stds, total_reward_stds) = extract_reward_components(reward_data)
+            (reward_episodes, delete_reward_means, distance_reward_means, termination_reward_means, total_reward_means,
+             delete_reward_stds, distance_reward_stds, termination_reward_stds, total_reward_stds) = extract_reward_components(reward_data)
             
             print(f"Loaded reward data for {len(reward_episodes)} episodes")
             reward_save_path = output_dir / f'reward_components{f"_{run_name}" if run_name.startswith("run") else ""}.png'
-            fig3 = create_reward_components_plot(reward_episodes, graph_reward_means, spawn_reward_means, delete_reward_means,
-                                               distance_signal_means, total_reward_means,
-                                               graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-                                               distance_signal_stds, total_reward_stds,
+            fig3 = create_reward_components_plot(reward_episodes, delete_reward_means, distance_reward_means,
+                                               termination_reward_means, total_reward_means,
+                                               delete_reward_stds, distance_reward_stds, 
+                                               termination_reward_stds, total_reward_stds,
                                                title_suffix, reward_save_path)
         else:
             print(f"Warning: Reward components file not found: {reward_json_file}")

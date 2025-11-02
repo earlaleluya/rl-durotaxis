@@ -18,6 +18,9 @@ class Substrate:
         self.height = height
         self.width = width
         self.signal_matrix = None
+        self.current_type = None
+        self.current_m = None
+        self.current_b = None
 
 
     def create(self, kind, m=0.05, b=1.0):
@@ -29,6 +32,11 @@ class Substrate:
             self.signal_matrix = self._create_exponential(x_coords, m, b)
         else:
             raise ValueError("Invalid substrate kind. Choose 'linear' or 'exponential'.")
+        
+        # Store current substrate type and parameters for gradient computation
+        self.current_type = kind
+        self.current_m = m
+        self.current_b = b
    
 
     def _create_linear(self, x_coords, m, b):

@@ -23,16 +23,17 @@ class DurotaxisEnv(gym.Env):
     The environment employs reinforcement learning with graph neural networks to learn optimal cell migration,
     proliferation, and deletion strategies that maximize rightward movement along substrate gradients.
     
-    The environment features a multi-component reward system that balances graph-level constraints (connectivity,
-    growth control), node-level behaviors (movement, substrate interaction), edge directionality preferences,
-    and sophisticated termination conditions. It uses fast topk selection for handling variable graph sizes
-    and run-based model organization for systematic experiment management.
+    The environment features a streamlined 3-component reward system with Potential-Based Reward Shaping (PBRS):
+    Delete Reward (Priority 1), Distance Reward (Priority 2), and Termination Reward (Priority 3). Each component
+    can optionally include PBRS terms for smoother learning signals. The reward system is designed to balance
+    proper node deletion, centroid progression toward the goal, and sparse terminal success/failure signals.
     
     Key Features
     ------------
     - **Dynamic Graph Topology**: Real-time node spawn/delete operations with persistent node tracking
     - **Substrate Gradients**: Configurable intensity fields (linear, exponential, custom) for durotaxis simulation
-    - **Multi-Component Rewards**: Graph, node, edge, spawn, deletion, and termination reward components
+    - **3-Component Reward System**: Delete > Distance > Termination with optional PBRS for each component
+    - **Potential-Based Reward Shaping (PBRS)**: Optional per-component shaping terms for smoother learning
     - **Fast TopK Selection**: O(N log K) node selection for fixed-size observations when graphs exceed max_critical_nodes
     - **Termination Conditions**: Success (rightmost boundary), failure (node limits, drift), and timeout scenarios
     - **Run Organization**: Automatic model saving with run directories (run0001, run0002, etc.)
@@ -65,56 +66,64 @@ class DurotaxisEnv(gym.Env):
     delta_intensity : float, default=2.50
         Minimum intensity difference required for successful durotaxis spawning.
     
-    graph_rewards : dict, default={'connectivity_penalty': 10.0, 'growth_penalty': 10.0, 'survival_reward': 0.01, 'action_reward': 0.005}
-        Graph-level reward components:
+    reward_weights : dict, default={'delete_weight': 1.0, 'distance_weight': 1.0, 'termination_weight': 1.0}
+        Environment-level weights for reward component composition:
         
-        - 'connectivity_penalty': Penalty when nodes < 2 (loss of connectivity)
-        - 'growth_penalty': Penalty when nodes > max_critical_nodes (excessive growth)
-        - 'survival_reward': Base reward for maintaining valid topology
-        - 'action_reward': Reward multiplier per action taken (encourages exploration)
+        - 'delete_weight': Weight for delete reward component (Priority 1)
+        - 'distance_weight': Weight for distance reward component (Priority 2)
+        - 'termination_weight': Weight for termination reward component (Priority 3)
+        
+        Total reward = delete_weight * delete + distance_weight * distance + termination_weight * termination
     
-    node_rewards : dict, default={'movement_reward': 0.01, 'intensity_penalty': 5.0, 'intensity_bonus': 0.01, 'substrate_reward': 0.05}
-        Node-level reward components:
+    delete_reward : dict, default={'proper_deletion': 1.0, 'persistence_penalty': 1.0, 'improper_deletion_penalty': 1.0}
+        Delete reward configuration (Priority 1: Proper deletion compliance):
         
-        - 'movement_reward': Reward multiplier for rightward movement (durotaxis)
-        - 'intensity_penalty': Penalty for nodes below average substrate intensity
-        - 'intensity_bonus': Bonus for nodes at/above average substrate intensity
-        - 'substrate_reward': Reward multiplier for substrate intensity values
-    
-    edge_reward : dict, default={'rightward_bonus': 0.1, 'leftward_penalty': 0.1}
-        Edge direction rewards:
+        - 'proper_deletion': Reward for proper node deletion (scaled by 1/num_nodes for [-1, 1] range)
+        - 'persistence_penalty': Penalty for keeping nodes that should be deleted
+        - 'improper_deletion_penalty': Penalty for deleting nodes that should be kept
         
-        - 'rightward_bonus': Reward for edges pointing rightward (positive x-direction)
-        - 'leftward_penalty': Penalty for edges pointing leftward (negative x-direction)
+        Optional PBRS shaping terms:
+        - 'pbrs.enabled': Enable potential-based reward shaping
+        - 'pbrs.shaping_coeff': Scaling factor for shaping term (default: 0.1)
+        - 'pbrs.phi_weight_pending_marked': Weight for pending/marked nodes in potential
+        - 'pbrs.phi_weight_safe_unmarked': Weight for safe/unmarked nodes in potential
     
     spawn_rewards : dict, default={'spawn_success_reward': 1.0, 'spawn_failure_penalty': 1.0}
-        Spawning behavior rewards:
+        Spawn reward configuration (for spawn action implementation):
         
-        - 'spawn_success_reward': Reward for successful durotaxis-based spawning
+        - 'spawn_success_reward': Reward for successful durotaxis-based spawning (ΔI ≥ delta_intensity)
         - 'spawn_failure_penalty': Penalty for spawning without sufficient intensity gradient
-    
-    delete_reward : dict, default={'proper_deletion': 2.0, 'persistence_penalty': 2.0}
-        Deletion compliance rewards:
         
-        - 'proper_deletion': Reward for deleting nodes marked with to_delete flag
-        - 'persistence_penalty': Penalty for keeping nodes marked for deletion
+        Optional PBRS shaping terms:
+        - 'pbrs.enabled': Enable potential-based reward shaping
+        - 'pbrs.shaping_coeff': Scaling factor for shaping term (default: 0.05)
+        - 'pbrs.phi_weight_spawnable': Weight for spawnable nodes in potential
     
-    position_rewards : dict, default={'boundary_bonus': 0.1, 'left_edge_penalty': 0.2, 'edge_position_penalty': 0.1}
-        Positional behavior rewards:
+    distance_mode : dict, default={'use_delta_distance': True, 'distance_reward_scale': 5.0}
+        Distance reward configuration (Priority 2: Centroid movement toward goal):
         
-        - 'boundary_bonus': Bonus for nodes on topology boundary (frontier exploration)
-        - 'left_edge_penalty': Penalty for nodes near left substrate edge
-        - 'edge_position_penalty': Penalty for nodes near top/bottom substrate edges
+        - 'use_delta_distance': Use delta-distance (change in centroid position)
+        - 'distance_reward_scale': Scaling factor for distance reward
+        - 'substrate_aware_scaling': Use substrate gradient for normalization
+        - 'use_tanh_normalization': Use tanh (True) or softsign (False) for bounding
+        - 'target_delta_x': Expected good step size for tuning (default: 0.05)
+        - 'tanh_scale': atanh(0.9) ≈ 1.4722 for sensitivity tuning
+        - 'gradient_cap': Optional cap for exponential substrate gradients
+        
+        Optional PBRS shaping terms:
+        - 'pbrs.enabled': Enable potential-based reward shaping
+        - 'pbrs.shaping_coeff': Scaling factor for shaping term (default: 0.05)
+        - 'pbrs.phi_distance_scale': Scale for distance-to-goal potential
     
-    termination_rewards : dict, default={'success_reward': 100.0, 'out_of_bounds_penalty': -30.0, 'no_nodes_penalty': -30.0, 'leftward_drift_penalty': -30.0, 'timeout_penalty': -10.0, 'critical_nodes_penalty': -25.0}
-        Episode termination rewards:
+    termination_rewards : dict, default={'success_reward': 1.0, 'critical_nodes_penalty': -1.0, 'no_nodes_penalty': -1.0, 'out_of_bounds_penalty': -1.0, 'leftward_drift_penalty': -1.0, 'timeout_penalty': 0.0}
+        Termination reward configuration (Priority 3: Sparse terminal signals):
         
-        - 'success_reward': Large reward for reaching rightmost substrate boundary
-        - 'out_of_bounds_penalty': Penalty for nodes moving outside substrate bounds
-        - 'no_nodes_penalty': Penalty for losing all nodes (topology collapse)
-        - 'leftward_drift_penalty': Penalty for consistent leftward centroid movement
-        - 'timeout_penalty': Small penalty for reaching maximum time steps
-        - 'critical_nodes_penalty': Penalty for exceeding critical node threshold
+        - 'success_reward': Binary +1 reward for reaching rightmost substrate boundary
+        - 'critical_nodes_penalty': Binary -1 penalty for exceeding critical node threshold
+        - 'no_nodes_penalty': Binary -1 penalty for losing all nodes (graph collapse)
+        - 'out_of_bounds_penalty': Binary -1 penalty for nodes moving outside substrate bounds
+        - 'leftward_drift_penalty': Binary -1 penalty for consistent leftward centroid movement
+        - 'timeout_penalty': Neutral 0 for reaching maximum time steps (no penalty)
     
     flush_delay : float, default=0.0001
         Delay between visualization updates (seconds) for rendering control.
@@ -154,12 +163,28 @@ class DurotaxisEnv(gym.Env):
     This efficiently selects representative nodes using O(N log K) torch.topk operation based on saliency scores,
     ensuring fixed-size observations for neural network compatibility.
     
-    **Reward System**: The multi-component reward system balances competing objectives:
+    **Reward System**: The 3-component reward system with optional PBRS shaping:
     
-    - Graph connectivity vs. growth control
-    - Individual cell movement vs. collective behavior  
-    - Exploration vs. exploitation of substrate gradients
-    - Short-term actions vs. long-term durotaxis success
+    1. **Delete Reward (Priority 1)**: Proper deletion compliance
+       - Scaled to [-1, 1] range by dividing by num_nodes
+       - Optional PBRS: Potential based on pending/marked vs. safe/unmarked nodes
+       - Encourages deleting marked nodes, keeping unmarked nodes
+    
+    2. **Distance Reward (Priority 2)**: Centroid movement toward goal
+       - Delta-distance with substrate-aware normalization
+       - Bounded to [-1, 1] range using tanh or softsign
+       - Optional PBRS: Potential based on distance-to-goal
+       - Encourages rightward centroid movement
+    
+    3. **Termination Reward (Priority 3)**: Sparse terminal signals
+       - Binary rewards: +1 for success, -1 for failures, 0 for timeout
+       - Applied only at episode termination
+       - Provides clear success/failure signals without shaping during episode
+    
+    **PBRS (Potential-Based Reward Shaping)**: Each component can optionally use PBRS for smoother learning:
+    - Maintains policy invariance (doesn't change optimal policy)
+    - Provides denser learning signals while preserving optimality
+    - Configurable shaping coefficients per component (delete: 0.1, spawn: 0.05, distance: 0.05)
     
     **Termination Logic**: Episodes can terminate due to:
     
@@ -172,31 +197,64 @@ class DurotaxisEnv(gym.Env):
     
     Examples
     --------
-    Basic environment setup:
+    Basic environment setup via config.yaml:
     
-    >>> env = Durotaxis(substrate_size=(800, 600), init_num_nodes=3, max_critical_nodes=30)
+    >>> from config_loader import ConfigLoader
+    >>> config_loader = ConfigLoader('config.yaml')
+    >>> env = DurotaxisEnv(config_loader.config.get('environment', {}))
     >>> obs, info = env.reset()
-    >>> obs, reward, terminated, truncated, info = env.step(0)  # Action ignored
+    >>> obs, reward_dict, terminated, truncated, info = env.step(actions)
     
-    Custom reward configuration:
+    Custom reward weights (environment-level composition):
     
-    >>> custom_rewards = {
-    ...     'graph_rewards': {'connectivity_penalty': 15.0, 'survival_reward': 0.02},
-    ...     'node_rewards': {'movement_reward': 0.02, 'substrate_reward': 0.1},
-    ...     'termination_rewards': {'success_reward': 200.0}
+    >>> env_config = {
+    ...     'reward_weights': {
+    ...         'delete_weight': 1.0,      # Priority 1: Deletion compliance
+    ...         'distance_weight': 1.0,    # Priority 2: Centroid movement  
+    ...         'termination_weight': 1.0  # Priority 3: Terminal signals
+    ...     }
     ... }
-    >>> env = Durotaxis(**custom_rewards)
+    >>> env = DurotaxisEnv(env_config)
     
-    Model saving and loading:
+    Enable PBRS for smoother learning:
+    
+    >>> env_config = {
+    ...     'delete_reward': {
+    ...         'pbrs': {
+    ...             'enabled': True,
+    ...             'shaping_coeff': 0.1,
+    ...             'phi_weight_pending_marked': 1.0,
+    ...             'phi_weight_safe_unmarked': 0.25
+    ...         }
+    ...     },
+    ...     'distance_mode': {
+    ...         'pbrs': {
+    ...             'enabled': True,
+    ...             'shaping_coeff': 0.05
+    ...         }
+    ...     }
+    ... }
+    >>> env = DurotaxisEnv(env_config)
+    
+    Special ablation modes (isolate specific components):
+    
+    >>> # Delete-only mode
+    >>> env_config = {'simple_delete_only_mode': True}
+    >>> env = DurotaxisEnv(env_config)
+    >>> 
+    >>> # Centroid distance-only mode
+    >>> env_config = {'centroid_distance_only_mode': True}
+    >>> env = DurotaxisEnv(env_config)
     
     Advanced substrate configuration:
     
-    >>> env = Durotaxis(
-    ...     substrate_type='exponential',
-    ...     substrate_params={'base': 1.0, 'rate': 0.02, 'direction': 'x'},
-    ...     delta_intensity=3.0,  # Higher threshold for durotaxis
-    ...     threshold_critical_nodes=150  # Lower critical limit
-    ... )
+    >>> env_config = {
+    ...     'substrate_size': [800, 600],
+    ...     'substrate_params': {'m': 0.01, 'b': 1.0},
+    ...     'delta_intensity': 3.0,
+    ...     'threshold_critical_nodes': 150
+    ... }
+    >>> env = DurotaxisEnv(env_config)
     """
     metadata = {"render_fps": 30}
 
@@ -266,8 +324,8 @@ class DurotaxisEnv(gym.Env):
         # Reward composition weights (Priority: Delete > Spawn > Distance)
         rw = config.get('reward_weights', {})
         self._w_delete = float(rw.get('delete_weight', 1.0))
-        self._w_spawn = float(rw.get('spawn_weight', 0.75))
         self._w_distance = float(rw.get('distance_weight', 0.5))
+        self._w_termination = float(rw.get('termination_weight', 0.25))
 
         # Distance-mode parameters
         dm = config.get('distance_mode', {})
@@ -325,12 +383,12 @@ class DurotaxisEnv(gym.Env):
         })
         
         self.termination_rewards = config.get('termination_rewards', {
-            'success_reward': 100.0,
-            'out_of_bounds_penalty': -30.0,
-            'no_nodes_penalty': -30.0,
-            'leftward_drift_penalty': -30.0,
-            'timeout_penalty': -10.0,
-            'critical_nodes_penalty': -25.0
+            'success_reward': 1.0,
+            'critical_nodes_penalty': -1.0,
+            'no_nodes_penalty': -1.0,
+            'out_of_bounds_penalty': -1.0,
+            'leftward_drift_penalty': -1.0,
+            'timeout_penalty': 0.0
         })
         
         # Unpack reward component values for direct access
@@ -428,6 +486,14 @@ class DurotaxisEnv(gym.Env):
         self._pbrs_centroid_enabled = pbrs_centroid.get('enabled', False)
         self._pbrs_centroid_coeff = float(pbrs_centroid.get('shaping_coeff', 0.0))
         self._pbrs_centroid_scale = float(pbrs_centroid.get('phi_distance_scale', 1.0))
+        
+        # Substrate-aware distance reward normalization parameters
+        distance_mode_cfg = config.get('distance_mode', {})
+        self._dist_substrate_aware = distance_mode_cfg.get('substrate_aware_scaling', True)
+        self._dist_use_tanh = distance_mode_cfg.get('use_tanh_normalization', True)
+        self._dist_target_dx = float(distance_mode_cfg.get('target_delta_x', 0.05))
+        self._dist_tanh_scale = float(distance_mode_cfg.get('tanh_scale', 1.4722))  # atanh(0.9) ≈ 1.4722
+        self._dist_gradient_cap = distance_mode_cfg.get('gradient_cap', None)  # Optional cap for exponential gradients
         
         # Spawn reward PBRS parameters
         pbrs_spawn = self.spawn_rewards.get('pbrs', {})
@@ -770,14 +836,11 @@ class DurotaxisEnv(gym.Env):
             Graph embedding observation from the encoder
         reward : dict
             Dictionary containing reward components with keys:
-            - 'total_reward': float - Total scalar reward (sum of all components)
-            - 'graph_reward': float - Graph-level rewards (connectivity, growth, actions)
-            - 'spawn_reward': float - Durotaxis-based spawning rewards
-            - 'delete_reward': float - Deletion compliance rewards
-            - 'edge_reward': float - Edge direction rewards
-            - 'total_node_reward': float - Aggregated node-level rewards
-            - 'node_rewards': list - Individual node reward values
+            - 'total_reward': float - Total scalar reward (weighted sum of components)
+            - 'delete_reward': float - Deletion compliance rewards (scaled to [-1, 1])
+            - 'distance_reward': float - Centroid movement toward goal
             - 'num_nodes': int - Number of nodes in current state
+            - 'empty_graph_recovery_penalty': float - Penalty if empty graph recovery occurred
             - 'termination_reward': float - Termination reward (only if episode terminated)
         terminated : bool
             True if episode terminated (success/failure conditions met)
@@ -788,10 +851,10 @@ class DurotaxisEnv(gym.Env):
             
         Notes
         -----
-        The reward system includes multiple components:
-        - Graph-level rewards (connectivity, growth penalties)
-        - Node-level rewards (movement, substrate interaction)
-        - Termination rewards (success/failure bonuses/penalties)
+        The reward system includes 3 components:
+        - Delete reward (deletion compliance, scaled to [-1, 1] range)
+        - Distance reward (centroid movement toward goal)
+        - Total reward (weighted combination of delete + distance)
         """
         self.current_step += 1
         
@@ -910,40 +973,14 @@ class DurotaxisEnv(gym.Env):
         # Reset new_node flags after reward calculation (they've served their purpose)
         self._reset_new_node_flags()
         
-        # Check termination conditions
-        terminated, termination_reward = self._check_terminated(new_state)
+        # Check termination conditions and update termination reward
+        terminated, termination_reward_value = self._check_terminated(new_state)
         
-        # Add termination reward to the reward components
+        # Update termination reward in reward_components (always included in composition)
         if terminated:
-            reward_components['termination_reward'] = termination_reward
-            
-            # Determine if termination rewards should be included
-            # Check which special modes are enabled
-            has_delete_mode = self.simple_delete_only_mode
-            has_centroid_mode = self.centroid_distance_only_mode
-            has_spawn_mode = self.simple_spawn_only_mode
-            num_special_modes = sum([has_delete_mode, has_centroid_mode, has_spawn_mode])
-            
-            is_normal_mode = num_special_modes == 0
-            is_special_mode_with_termination = num_special_modes > 0 and self.include_termination_rewards
-            
-            # Include termination rewards if:
-            # 1. Normal mode (all special modes disabled), OR
-            # 2. Special mode with include_termination_rewards=True
-            if is_normal_mode or is_special_mode_with_termination:
-                # Apply termination reward scaling/clipping if centroid mode is enabled
-                if has_centroid_mode:
-                    # Centroid mode(s): Apply scaled and clipped termination (prioritize distance signal)
-                    scaled_termination = termination_reward * self.dm_term_scale
-                    if self.dm_term_clip:
-                        scaled_termination = max(-self.dm_term_clip_val, 
-                                                 min(self.dm_term_clip_val, scaled_termination))
-                    reward_components['total_reward'] += scaled_termination
-                    reward_components['termination_reward_scaled'] = scaled_termination
-                else:
-                    # Normal mode or delete/spawn modes: Add full termination reward
-                    reward_components['total_reward'] += termination_reward
-            # else: Special mode without include_termination_rewards flag - ignore termination rewards
+            reward_components['termination_reward'] = termination_reward_value
+            # Add weighted termination reward to total_reward
+            reward_components['total_reward'] += self._w_termination * termination_reward_value
         
         # Accumulate episode total reward (using scalar total for tracking)
         scalar_reward = reward_components['total_reward']
@@ -999,13 +1036,13 @@ class DurotaxisEnv(gym.Env):
         
         # Extract reward components
         delete_r = reward_components.get('delete_reward', 0.0)
-        spawn_r = reward_components.get('spawn_reward', 0.0)
-        distance_r = reward_components.get('distance_signal', 0.0)
+        distance_r = reward_components.get('distance_reward', 0.0)
+        termination_r = reward_components.get('termination_reward', 0.0)
         
         print(
             f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
             f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
-            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.3f} S:{spawn_r:+4.3f} Dist:{distance_r:+4.3f}) | "
+            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.3f} Dist:{distance_r:+4.3f} Term:{termination_r:+4.3f}) | "
             f"C={centroid_x:5.1f}{centroid_direction}{boundary_warning}{recovery_flag} | "
             f"Actions: dr={action_params['delete_ratio']:.3f} γ={action_params['gamma']:.2f} "
             f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f} | "
@@ -1019,18 +1056,78 @@ class DurotaxisEnv(gym.Env):
         
         return observation, reward_components, terminated, truncated, info
 
+    def _compute_substrate_gradient(self, x_position):
+        """
+        Compute the local gradient magnitude |∂(substrate)/∂x| at position x.
+        
+        For linear substrate f(x) = m*x + b:
+            g(x) = |m| (constant)
+        
+        For exponential substrate f(x) = b * exp(m*x):
+            g(x) = |b * m * exp(m*x)|
+        
+        Args:
+            x_position: float, x-coordinate where gradient is computed
+            
+        Returns:
+            float: gradient magnitude at x_position
+        """
+        try:
+            # Get substrate parameters (prefer substrate's stored params for random mode)
+            if hasattr(self.substrate, 'current_m') and self.substrate.current_m is not None:
+                m = self.substrate.current_m
+                b = self.substrate.current_b
+            else:
+                m = self.substrate_params.get('m', 0.01)
+                b = self.substrate_params.get('b', 1.0)
+            
+            # Get current substrate type (handle trainer's random substrate mode)
+            substrate_type = self.substrate_type
+            if hasattr(self.substrate, 'current_type') and self.substrate.current_type is not None:
+                substrate_type = self.substrate.current_type
+            
+            # Compute gradient based on substrate type
+            if substrate_type == 'linear':
+                # Linear: f(x) = m*x + b → f'(x) = m
+                gradient = abs(m)
+            
+            elif substrate_type == 'exponential':
+                # Exponential: f(x) = b * exp(m*x) → f'(x) = b * m * exp(m*x)
+                import numpy as np
+                gradient = abs(b * m * np.exp(m * x_position))
+                
+                # Optional: cap gradient for exponential substrates to prevent explosion
+                if self._dist_gradient_cap is not None:
+                    gradient = min(gradient, self._dist_gradient_cap)
+            
+            else:
+                # Fallback for unknown types
+                gradient = 1.0
+            
+            # Ensure gradient is positive and non-zero
+            gradient = max(gradient, 1e-6)
+            
+            return gradient
+            
+        except Exception as e:
+            # Fallback to neutral gradient if computation fails
+            print(f"⚠️ Substrate gradient computation failed: {e}")
+            return 1.0
+
     def _calculate_reward(self, prev_state, new_state, actions):
         """
-        Calculate reward based on simplified composition: Delete > Spawn > Distance.
+        Calculate reward based on composition: Delete > Distance > Termination.
         
-        Refactored to use ONLY:
-        - Delete reward (Rule 1: proper deletion compliance)
-        - Spawn reward (Rule 2: intensity-based spawning, NO boundary checks)
-        - Distance reward (Rule 3: centroid movement toward goal)
-        - Termination rewards (applied at episode end)
+        Core reward components:
+        - Delete reward (Priority 1: proper deletion compliance)
+        - Distance reward (Priority 2: centroid movement toward goal)
+        - Termination reward (Priority 3: sparse terminal signals, always 0 during episode)
         
-        Special modes (delete-only, centroid-only, spawn-only, combinations) still work.
-        Priority: Delete > Spawn > Distance (assumption: good delete/spawn → better distance)
+        NOTE: Spawn reward calculation function (_calculate_spawn_reward) is preserved 
+        for potential future use but is NOT included in reward composition.
+        
+        Special modes (delete-only, centroid-only) still work.
+        Priority: Delete > Distance > Termination
         """
         # Initialize reward components
         num_nodes = new_state['num_nodes']
@@ -1040,51 +1137,15 @@ class DurotaxisEnv(gym.Env):
         # PRIORITY 1: Delete reward (proper deletion compliance)
         delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
         
-        # PRIORITY 2: Spawn reward (intensity-based, simplified - no boundary checks in refactored version)
-        spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
+        # NOTE: Spawn reward calculation function preserved but NOT used in composition
+        # spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
         
-        # PRIORITY 3: Distance reward (centroid movement toward goal)
-        # Calculate centroid x position for distance signal
-        centroid_x = 0.0
-        distance_signal = 0.0
+        # PRIORITY 2: Distance reward (centroid movement toward goal)
+        distance_reward = self._calculate_distance_reward(prev_state, new_state)
         
-        if num_nodes > 0:
-            try:
-                graph_features = new_state.get('graph_features')
-                if graph_features is not None:
-                    if isinstance(graph_features, torch.Tensor):
-                        centroid_x = graph_features[3].item()  # Index 3 is centroid_x
-                    else:
-                        centroid_x = graph_features[3]
-            except (IndexError, TypeError):
-                # Fallback: calculate centroid from node positions
-                node_features = new_state.get('node_features', [])
-                if len(node_features) > 0:
-                    x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
-                                 for node in node_features]
-                    centroid_x = sum(x_positions) / len(x_positions)
-        
-        # Use delta distance shaping (potential-based) for rightward migration
-        if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
-            # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
-            # Positive when moving right, negative when moving left
-            delta_x = centroid_x - self._prev_centroid_x
-            distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
-        else:
-            # Fallback: static distance penalty
-            if self.goal_x > 0:
-                distance_signal = -(self.goal_x - centroid_x) / self.goal_x
-            else:
-                distance_signal = 0.0
-        
-        # Optional: add proper PBRS shaping on top (preserves optimal policy)
-        if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
-            phi_prev = self._phi_centroid_distance_potential(prev_state)
-            phi_new = self._phi_centroid_distance_potential(new_state)
-            distance_signal += self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
-        
-        # Update previous centroid for next step
-        self._prev_centroid_x = centroid_x
+        # PRIORITY 3: Termination reward (sparse terminal signal, always 0 during episode)
+        # Will be set to -1 or +1 only at termination in step() method
+        termination_reward = 0.0
         
         # === REWARD COMPOSITION ===
         # Two paths: (1) Special modes (selective components), (2) Default (all three components)
@@ -1105,46 +1166,38 @@ class DurotaxisEnv(gym.Env):
             if has_delete_mode:
                 mode_reward += delete_reward
             
-            # Priority 2: Spawn (if enabled)
-            if has_spawn_mode:
-                mode_reward += spawn_reward
-            
-            # Priority 3: Distance (if enabled)
+            # Priority 2: Distance (if enabled)
             if has_centroid_mode:
-                mode_reward += distance_signal
+                mode_reward += distance_reward
+            
+            # NOTE: spawn_mode preserved for backward compatibility but spawn_reward NOT used
             
             # Set total reward from special mode composition
             total_reward = mode_reward
-            graph_reward = mode_reward
             
             # Zero out components NOT in special modes (for logging clarity)
-            if not has_spawn_mode:
-                spawn_reward = 0.0
             if not has_delete_mode:
                 delete_reward = 0.0
             if not has_centroid_mode:
-                distance_signal = 0.0
+                distance_reward = 0.0
         else:
-            # === DEFAULT MODE: Weighted composition (Delete > Spawn > Distance) ===
+            # === DEFAULT MODE: Weighted composition (Delete > Distance > Termination) ===
             # Apply environment-level weights to make priority explicit in task reward
             total_reward = (
                 self._w_delete * float(delete_reward) +
-                self._w_spawn * float(spawn_reward) +
-                self._w_distance * float(distance_signal)
+                self._w_distance * float(distance_reward) +
+                self._w_termination * float(termination_reward)
             )
-            graph_reward = total_reward
         
         # === BUILD REWARD BREAKDOWN ===
-        # Create reward breakdown with only the components used in refactored system
+        # Create reward breakdown with all components in refactored system
         reward_breakdown = {
             'total_reward': total_reward,
-            'graph_reward': graph_reward,
             'delete_reward': delete_reward,
-            'spawn_reward': spawn_reward,
-            'distance_signal': distance_signal,
+            'distance_reward': distance_reward,
+            'termination_reward': termination_reward,  # Always included (0 during episode, ±1 at termination)
             'num_nodes': num_nodes,
-            'empty_graph_recovery_penalty': 0.0,  # Set later if recovery occurred
-            'termination_reward': 0.0  # Set later if episode terminates
+            'empty_graph_recovery_penalty': 0.0  # Set later if recovery occurred
         }
         
         # Store for backward compatibility (some methods might still use this)
@@ -1501,16 +1554,107 @@ class DurotaxisEnv(gym.Env):
     # ============================================================================
     # REWARD CALCULATION FUNCTIONS
     # ============================================================================
+    
+    def _calculate_distance_reward(self, prev_state, new_state):
+        """
+        Calculate distance reward based on centroid movement toward goal.
+        
+        Uses substrate-aware tanh normalization with PBRS when enabled.
+        Supports both delta-based (potential-based) and static distance calculation.
+        
+        Args:
+            prev_state: Previous state dict containing topology
+            new_state: Current state dict containing topology
+            
+        Returns:
+            float: Distance reward, typically in range (-1, 1) with substrate-aware mode
+        """
+        num_nodes = new_state['num_nodes']
+        centroid_x = 0.0
+        distance_reward = 0.0
+        
+        # Extract centroid x position from new state
+        if num_nodes > 0:
+            try:
+                graph_features = new_state.get('graph_features')
+                if graph_features is not None:
+                    if isinstance(graph_features, torch.Tensor):
+                        centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                    else:
+                        centroid_x = graph_features[3]
+            except (IndexError, TypeError):
+                # Fallback: calculate centroid from node positions
+                node_features = new_state.get('node_features', [])
+                if len(node_features) > 0:
+                    x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                 for node in node_features]
+                    centroid_x = sum(x_positions) / len(x_positions)
+        
+        # Use delta distance shaping (potential-based) for rightward migration
+        if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
+            # Delta distance: Δx = (cx_t - cx_{t-1})
+            delta_x = centroid_x - self._prev_centroid_x
+            
+            if self._dist_substrate_aware:
+                # Substrate-aware scaling: compute local gradient at midpoint
+                x_loc = (self._prev_centroid_x + centroid_x) / 2.0
+                g = self._compute_substrate_gradient(x_loc)
+                
+                # Convert raw distance to substrate-aware signal: s = g(x) * Δx
+                s = g * delta_x
+                
+                # Optional: add proper PBRS shaping BEFORE normalization (preserves optimal policy)
+                if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
+                    phi_prev = self._phi_centroid_distance_potential(prev_state)
+                    phi_new = self._phi_centroid_distance_potential(new_state)
+                    pbrs_term = self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
+                    s += pbrs_term
+                
+                # Compute scale constant c based on expected good step size
+                # c = tanh_scale * g * target_dx, where tanh_scale ≈ 1.4722 = atanh(0.9)
+                # This ensures tanh(g * target_dx / c) ≈ 0.9
+                c = self._dist_tanh_scale * g * self._dist_target_dx
+                
+                if self._dist_use_tanh:
+                    # Apply tanh squashing: r = tanh(s / c) ∈ (-1, 1)
+                    distance_reward = np.tanh(s / c) if c > 0 else 0.0
+                else:
+                    # Softsign alternative: r = s / (1 + |s|) ∈ (-1, 1)
+                    distance_reward = s / (1.0 + abs(s))
+            else:
+                # Original scaling (no substrate awareness)
+                distance_reward = self.dm_dist_scale * (delta_x / self.goal_x)
+                
+                # Optional: add proper PBRS shaping on top (preserves optimal policy)
+                # Note: When substrate_aware disabled, PBRS is added after (no normalization)
+                if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
+                    phi_prev = self._phi_centroid_distance_potential(prev_state)
+                    phi_new = self._phi_centroid_distance_potential(new_state)
+                    distance_reward += self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
+        else:
+            # Fallback: static distance penalty
+            if self.goal_x > 0:
+                distance_reward = -(self.goal_x - centroid_x) / self.goal_x
+            else:
+                distance_reward = 0.0
+        
+        # Update previous centroid for next step
+        self._prev_centroid_x = centroid_x
+        
+        return distance_reward
 
     def _calculate_delete_reward(self, prev_state, new_state, actions):
         """
         Calculate reward/penalty based on deletion compliance with to_delete flags.
+        Scaled to [-1, 1] range by dividing by num_nodes.
         
-        Logic (REVISED for simple_delete_only_mode):
-        - If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
-        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence - RULE 1)
-        - If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper - RULE 2)
-        - If a node from previous topology was NOT marked (to_delete=0) AND still exists: +delete_reward (proper persistence)
+        Logic (4 Rules): 
+        - RULE 1: If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
+        - RULE 2: If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence penalty)
+        - RULE 3: If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper deletion)
+        - RULE 4: If a node from previous topology was NOT marked (to_delete=0) AND still exists: +delete_reward (proper persistence)
+        
+        Scaling: Total raw reward is divided by prev_num_nodes to ensure output in [-1, 1]
         
         Tagging Strategy:
         - At step t, if node's intensity < avg(all intensities), tag as to_delete=1 at step t+delta_time
@@ -1523,10 +1667,8 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken this step
             
         Returns:
-            float: Delete reward (positive for proper behavior, negative for violations)
+            float: Delete reward in range [-1, 1] (positive for proper behavior, negative for violations)
         """
-        delete_reward = 0.0
-        
         # Need previous state with persistent_id and to_delete data  
         if 'persistent_id' not in prev_state or prev_state['persistent_id'] is None:
             return 0.0
@@ -1534,7 +1676,8 @@ class DurotaxisEnv(gym.Env):
         if 'to_delete' not in prev_state or prev_state['to_delete'] is None:
             return 0.0
             
-        if prev_state['num_nodes'] == 0:
+        prev_num_nodes = prev_state['num_nodes']
+        if prev_num_nodes == 0:
             return 0.0
         
         # Use the cloned data from prev_state (captured at the time of state extraction)
@@ -1547,6 +1690,9 @@ class DurotaxisEnv(gym.Env):
         else:
             current_persistent_ids = set()
         
+        # Accumulate raw reward (will be scaled by num_nodes at the end)
+        raw_delete_reward = 0.0
+        
         # Check each node from previous state
         for i, to_delete_flag in enumerate(prev_to_delete_flags):
             prev_persistent_id = prev_persistent_ids[i].item()
@@ -1554,33 +1700,38 @@ class DurotaxisEnv(gym.Env):
             
             if to_delete_flag.item() > 0.5:  # Node was marked for deletion
                 if node_was_deleted:
-                    # Node was marked for deletion and was actually deleted - reward
-                    delete_reward += self.delete_proper_reward
-                    # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
+                    # RULE 1: Node was marked for deletion and was actually deleted - reward
+                    raw_delete_reward += self.delete_proper_reward
                 else:
-                    # Node was marked for deletion but still exists - penalty (RULE 1)
-                    delete_reward -= self.delete_persistence_penalty
-                    # print(f"🔴 Delete penalty! Node PID:{prev_persistent_id} was marked but still exists (-{self.delete_persistence_penalty})")
+                    # RULE 2: Node was marked for deletion but still exists - penalty
+                    raw_delete_reward -= self.delete_persistence_penalty
             else:  # Node was NOT marked for deletion (to_delete=0)
                 if node_was_deleted:
-                    # Node was NOT marked but was deleted anyway - penalty (RULE 2)
-                    delete_reward -= self.delete_improper_penalty
-                    # print(f"🔴 Improper delete penalty! Node PID:{prev_persistent_id} was deleted without marking (-{self.delete_improper_penalty})")
+                    # RULE 3: Node was NOT marked but was deleted anyway - penalty
+                    raw_delete_reward -= self.delete_improper_penalty
                 else:
-                    # Node was NOT marked and still exists - reward (proper persistence)
-                    delete_reward += self.delete_proper_reward
-                    # print(f"🟢 Proper persistence! Node PID:{prev_persistent_id} correctly kept (+{self.delete_proper_reward})")
+                    # RULE 4: Node was NOT marked and still exists - reward (proper persistence)
+                    raw_delete_reward += self.delete_proper_reward
         
         # ============================================================================
         # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
         # ============================================================================
-        # Add PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
+        # Apply PBRS to raw reward BEFORE scaling
+        # PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
         # This biases learning toward compliant deletions without changing optimal policy
         if self._pbrs_delete_enabled and self._pbrs_delete_coeff != 0.0:
             phi_prev = self._phi_delete_potential(prev_state)
             phi_new = self._phi_delete_potential(new_state)
             pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
-            delete_reward += self._pbrs_delete_coeff * pbrs_shaping
+            # Add PBRS to raw reward BEFORE scaling
+            raw_delete_reward += self._pbrs_delete_coeff * pbrs_shaping
+        
+        # Scale by num_nodes to get value in approximately [-1, 1] range
+        # Base reward range: [-1, 1]
+        # PBRS can extend this to approximately [-1.125, 1.125] with default config
+        # (shaping_coeff=0.1, w_pending=1.0, w_safe=0.25, gamma=0.99)
+        # This small exceedance (±0.125) is intentional to allow PBRS guidance
+        delete_reward = raw_delete_reward / prev_num_nodes
         
         return delete_reward
 
@@ -2138,6 +2289,7 @@ class DurotaxisEnv(gym.Env):
         self.consecutive_left_moves = 0
         
         # Reset previous centroid for delta distance computation (distance mode optimization)
+        # Will be initialized after topology reset below
         self._prev_centroid_x = None
         
         # Reset topology history
@@ -2164,10 +2316,8 @@ class DurotaxisEnv(gym.Env):
         # Only includes components used in refactored system
         self._reward_components_template = {
             'total_reward': 0.0,
-            'graph_reward': 0.0,
             'delete_reward': 0.0,
-            'spawn_reward': 0.0,
-            'distance_signal': 0.0,
+            'distance_reward': 0.0,
             'num_nodes': 0,
             'empty_graph_recovery_penalty': 0.0,
             'termination_reward': 0.0
@@ -2206,6 +2356,23 @@ class DurotaxisEnv(gym.Env):
             node_age=self._node_age,
             node_stagnation=self._node_stagnation
         )
+        
+        # Initialize previous centroid for distance reward calculation
+        if state['num_nodes'] > 0:
+            try:
+                graph_features = state.get('graph_features')
+                if graph_features is not None:
+                    if isinstance(graph_features, torch.Tensor):
+                        self._prev_centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                    else:
+                        self._prev_centroid_x = graph_features[3]
+            except (IndexError, TypeError):
+                # Fallback: calculate centroid from node positions
+                node_features = state.get('node_features', [])
+                if len(node_features) > 0:
+                    x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                 for node in node_features]
+                    self._prev_centroid_x = sum(x_positions) / len(x_positions)
         
         # Get observation from GraphInputEncoder output
         observation = self._get_encoder_observation(state)
