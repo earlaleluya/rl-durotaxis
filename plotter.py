@@ -390,23 +390,29 @@ def create_loss_plot(episodes, losses, smoothed_losses, title_suffix="", save_pa
 
 
 def extract_reward_components(data):
-    """Extract reward component means and standard deviations for each episode."""
+    """Extract reward component means and standard deviations for each episode.
+    
+    DELETE RATIO ARCHITECTURE: Now tracks 5 components:
+    - graph_reward (alias for centroid movement)
+    - spawn_reward
+    - delete_reward  
+    - distance_signal
+    - total_reward
+    """
     episodes = []
     
-    # Reward components
+    # Reward components (DELETE RATIO ARCHITECTURE)
     graph_reward_means = []
     spawn_reward_means = []
     delete_reward_means = []
-    edge_reward_means = []
-    total_node_reward_means = []
+    distance_signal_means = []
     total_reward_means = []
     
     # Standard deviations
     graph_reward_stds = []
     spawn_reward_stds = []
     delete_reward_stds = []
-    edge_reward_stds = []
-    total_node_reward_stds = []
+    distance_signal_stds = []
     total_reward_stds = []
     
     for episode_data in data:
@@ -414,67 +420,71 @@ def extract_reward_components(data):
         
         # Extract mean values for each reward component (handle None/null values)
         rewards = episode_data['reward_components']
-        graph_reward_means.append(rewards['graph_reward']['mean'] if rewards['graph_reward']['mean'] is not None else 0.0)
-        spawn_reward_means.append(rewards['spawn_reward']['mean'] if rewards['spawn_reward']['mean'] is not None else 0.0)
-        delete_reward_means.append(rewards['delete_reward']['mean'] if rewards['delete_reward']['mean'] is not None else 0.0)
-        edge_reward_means.append(rewards['edge_reward']['mean'] if rewards['edge_reward']['mean'] is not None else 0.0)
-        total_node_reward_means.append(rewards['total_node_reward']['mean'] if rewards['total_node_reward']['mean'] is not None else 0.0)
-        total_reward_means.append(rewards['total_reward']['mean'] if rewards['total_reward']['mean'] is not None else 0.0)
+        graph_reward_means.append(rewards.get('graph_reward', {}).get('mean', 0.0) or 0.0)
+        spawn_reward_means.append(rewards.get('spawn_reward', {}).get('mean', 0.0) or 0.0)
+        delete_reward_means.append(rewards.get('delete_reward', {}).get('mean', 0.0) or 0.0)
+        distance_signal_means.append(rewards.get('distance_signal', {}).get('mean', 0.0) or 0.0)
+        total_reward_means.append(rewards.get('total_reward', {}).get('mean', 0.0) or 0.0)
         
         # Extract std values for each reward component (handle None/null values)
-        graph_reward_stds.append(rewards['graph_reward']['std'] if rewards['graph_reward']['std'] is not None else 0.0)
-        spawn_reward_stds.append(rewards['spawn_reward']['std'] if rewards['spawn_reward']['std'] is not None else 0.0)
-        delete_reward_stds.append(rewards['delete_reward']['std'] if rewards['delete_reward']['std'] is not None else 0.0)
-        edge_reward_stds.append(rewards['edge_reward']['std'] if rewards['edge_reward']['std'] is not None else 0.0)
-        total_node_reward_stds.append(rewards['total_node_reward']['std'] if rewards['total_node_reward']['std'] is not None else 0.0)
-        total_reward_stds.append(rewards['total_reward']['std'] if rewards['total_reward']['std'] is not None else 0.0)
+        graph_reward_stds.append(rewards.get('graph_reward', {}).get('std', 0.0) or 0.0)
+        spawn_reward_stds.append(rewards.get('spawn_reward', {}).get('std', 0.0) or 0.0)
+        delete_reward_stds.append(rewards.get('delete_reward', {}).get('std', 0.0) or 0.0)
+        distance_signal_stds.append(rewards.get('distance_signal', {}).get('std', 0.0) or 0.0)
+        total_reward_stds.append(rewards.get('total_reward', {}).get('std', 0.0) or 0.0)
     
     return (episodes, 
             graph_reward_means, spawn_reward_means, delete_reward_means, 
-            edge_reward_means, total_node_reward_means, total_reward_means,
+            distance_signal_means, total_reward_means,
             graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-            edge_reward_stds, total_node_reward_stds, total_reward_stds)
+            distance_signal_stds, total_reward_stds)
 
 
 def create_reward_components_plot(episodes, graph_reward_means, spawn_reward_means, delete_reward_means,
-                                 edge_reward_means, total_node_reward_means, total_reward_means,
+                                 distance_signal_means, total_reward_means,
                                  graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-                                 edge_reward_stds, total_node_reward_stds, total_reward_stds,
+                                 distance_signal_stds, total_reward_stds,
                                  title_suffix="", save_path=None):
-    """Create and display/save plots for reward components with standard deviation bands."""
+    """Create and display/save plots for reward components with standard deviation bands.
+    
+    DELETE RATIO ARCHITECTURE: Plots 5 reward components in a 3x2 grid:
+    - graph_reward (centroid movement)
+    - spawn_reward
+    - delete_reward
+    - distance_signal
+    - total_reward
+    """
     
     # Convert to numpy arrays for easier math
     episodes = np.array(episodes)
     
-    # Means
+    # Means (DELETE RATIO ARCHITECTURE)
     graph_reward_means = np.array(graph_reward_means)
     spawn_reward_means = np.array(spawn_reward_means)
     delete_reward_means = np.array(delete_reward_means)
-    edge_reward_means = np.array(edge_reward_means)
-    total_node_reward_means = np.array(total_node_reward_means)
+    distance_signal_means = np.array(distance_signal_means)
     total_reward_means = np.array(total_reward_means)
     
     # Standard deviations
     graph_reward_stds = np.array(graph_reward_stds)
     spawn_reward_stds = np.array(spawn_reward_stds)
     delete_reward_stds = np.array(delete_reward_stds)
-    edge_reward_stds = np.array(edge_reward_stds)
-    total_node_reward_stds = np.array(total_node_reward_stds)
+    distance_signal_stds = np.array(distance_signal_stds)
     total_reward_stds = np.array(total_reward_stds)
     
     # Set up the plot style
     plt.style.use('default')
     fig, axes = plt.subplots(3, 2, figsize=(15, 12))
-    fig.suptitle(f'Reward Components Evolution Across Episodes{title_suffix}', fontsize=16, fontweight='bold')
+    fig.suptitle(f'Reward Components Evolution - Delete Ratio Architecture{title_suffix}', fontsize=16, fontweight='bold')
     
-    # Colors for each reward component
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+    # Colors for each reward component (DELETE RATIO ARCHITECTURE: 5 components)
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b']
     
-    # Plot Graph Reward
+    # Plot Graph Reward (centroid movement)
     axes[0, 0].plot(episodes, graph_reward_means, 'o-', color=colors[0], linewidth=2, markersize=4, alpha=0.8, label='Mean')
     axes[0, 0].fill_between(episodes, graph_reward_means - graph_reward_stds, graph_reward_means + graph_reward_stds, 
                            color=colors[0], alpha=0.2, label='±1 std')
-    axes[0, 0].set_title('Graph Reward per Episode', fontsize=12, fontweight='bold')
+    axes[0, 0].set_title('Graph Reward (Centroid Movement) per Episode', fontsize=12, fontweight='bold')
     axes[0, 0].set_xlabel('Episode')
     axes[0, 0].set_ylabel('Graph Reward')
     axes[0, 0].grid(True, alpha=0.3)
@@ -503,47 +513,38 @@ def create_reward_components_plot(episodes, graph_reward_means, spawn_reward_mea
     axes[1, 0].legend(fontsize=9)
     axes[1, 0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
-    # Plot Edge Reward
-    axes[1, 1].plot(episodes, edge_reward_means, 'o-', color=colors[3], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[1, 1].fill_between(episodes, edge_reward_means - edge_reward_stds, edge_reward_means + edge_reward_stds,
+    # Plot Distance Signal
+    axes[1, 1].plot(episodes, distance_signal_means, 'o-', color=colors[3], linewidth=2, markersize=4, alpha=0.8, label='Mean')
+    axes[1, 1].fill_between(episodes, distance_signal_means - distance_signal_stds, distance_signal_means + distance_signal_stds,
                            color=colors[3], alpha=0.2, label='±1 std')
-    axes[1, 1].set_title('Edge Reward per Episode', fontsize=12, fontweight='bold')
+    axes[1, 1].set_title('Distance Signal per Episode', fontsize=12, fontweight='bold')
     axes[1, 1].set_xlabel('Episode')
-    axes[1, 1].set_ylabel('Edge Reward')
+    axes[1, 1].set_ylabel('Distance Signal')
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend(fontsize=9)
     axes[1, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
-    # Plot Total Node Reward
-    axes[2, 0].plot(episodes, total_node_reward_means, 'o-', color=colors[4], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[2, 0].fill_between(episodes, total_node_reward_means - total_node_reward_stds, total_node_reward_means + total_node_reward_stds,
+    # Plot Total Reward
+    axes[2, 0].plot(episodes, total_reward_means, 'o-', color=colors[4], linewidth=2, markersize=4, alpha=0.8, label='Mean')
+    axes[2, 0].fill_between(episodes, total_reward_means - total_reward_stds, total_reward_means + total_reward_stds,
                            color=colors[4], alpha=0.2, label='±1 std')
-    axes[2, 0].set_title('Total Node Reward per Episode', fontsize=12, fontweight='bold')
+    axes[2, 0].set_title('Total Reward per Episode', fontsize=12, fontweight='bold')
     axes[2, 0].set_xlabel('Episode')
-    axes[2, 0].set_ylabel('Total Node Reward')
+    axes[2, 0].set_ylabel('Total Reward')
     axes[2, 0].grid(True, alpha=0.3)
     axes[2, 0].legend(fontsize=9)
     axes[2, 0].axhline(y=0, color='black', linestyle='--', alpha=0.5)
     
-    # Plot Total Reward
-    axes[2, 1].plot(episodes, total_reward_means, 'o-', color=colors[5], linewidth=2, markersize=4, alpha=0.8, label='Mean')
-    axes[2, 1].fill_between(episodes, total_reward_means - total_reward_stds, total_reward_means + total_reward_stds,
-                           color=colors[5], alpha=0.2, label='±1 std')
-    axes[2, 1].set_title('Total Reward per Episode', fontsize=12, fontweight='bold')
-    axes[2, 1].set_xlabel('Episode')
-    axes[2, 1].set_ylabel('Total Reward')
-    axes[2, 1].grid(True, alpha=0.3)
-    axes[2, 1].legend(fontsize=9)
-    axes[2, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    # Hide unused subplot (we have 5 components, not 6)
+    axes[2, 1].axis('off')
     
     # Add statistics text boxes
     reward_data = [
         ('Graph', graph_reward_means, axes[0, 0]),
         ('Spawn', spawn_reward_means, axes[0, 1]),
         ('Delete', delete_reward_means, axes[1, 0]),
-        ('Edge', edge_reward_means, axes[1, 1]),
-        ('Total Node', total_node_reward_means, axes[2, 0]),
-        ('Total', total_reward_means, axes[2, 1])
+        ('Distance', distance_signal_means, axes[1, 1]),
+        ('Total', total_reward_means, axes[2, 0])
     ]
     
     for param_name, values, ax in reward_data:
@@ -645,16 +646,16 @@ def main():
             print(f"Loading reward component data from: {reward_json_file}")
             reward_data = load_reward_stats(reward_json_file)
             (reward_episodes, graph_reward_means, spawn_reward_means, delete_reward_means,
-             edge_reward_means, total_node_reward_means, total_reward_means,
+             distance_signal_means, total_reward_means,
              graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-             edge_reward_stds, total_node_reward_stds, total_reward_stds) = extract_reward_components(reward_data)
+             distance_signal_stds, total_reward_stds) = extract_reward_components(reward_data)
             
             print(f"Loaded reward data for {len(reward_episodes)} episodes")
             reward_save_path = output_dir / f'reward_components{f"_{run_name}" if run_name.startswith("run") else ""}.png'
             fig3 = create_reward_components_plot(reward_episodes, graph_reward_means, spawn_reward_means, delete_reward_means,
-                                               edge_reward_means, total_node_reward_means, total_reward_means,
+                                               distance_signal_means, total_reward_means,
                                                graph_reward_stds, spawn_reward_stds, delete_reward_stds,
-                                               edge_reward_stds, total_node_reward_stds, total_reward_stds,
+                                               distance_signal_stds, total_reward_stds,
                                                title_suffix, reward_save_path)
         else:
             print(f"Warning: Reward components file not found: {reward_json_file}")

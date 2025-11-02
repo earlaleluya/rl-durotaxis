@@ -25,7 +25,7 @@ class DurotaxisEnv(gym.Env):
     
     The environment features a multi-component reward system that balances graph-level constraints (connectivity,
     growth control), node-level behaviors (movement, substrate interaction), edge directionality preferences,
-    and sophisticated termination conditions. It includes semantic pooling for handling variable graph sizes
+    and sophisticated termination conditions. It uses fast topk selection for handling variable graph sizes
     and run-based model organization for systematic experiment management.
     
     Key Features
@@ -33,7 +33,7 @@ class DurotaxisEnv(gym.Env):
     - **Dynamic Graph Topology**: Real-time node spawn/delete operations with persistent node tracking
     - **Substrate Gradients**: Configurable intensity fields (linear, exponential, custom) for durotaxis simulation
     - **Multi-Component Rewards**: Graph, node, edge, spawn, deletion, and termination reward components
-    - **Semantic Pooling**: Intelligent node selection for large graphs using spatial and feature clustering
+    - **Fast TopK Selection**: O(N log K) node selection for fixed-size observations when graphs exceed max_critical_nodes
     - **Termination Conditions**: Success (rightmost boundary), failure (node limits, drift), and timeout scenarios
     - **Run Organization**: Automatic model saving with run directories (run0001, run0002, etc.)
     - **Real-time Visualization**: Optional topology rendering with configurable update rates
@@ -136,7 +136,8 @@ class DurotaxisEnv(gym.Env):
     action_space : gym.Space
         Discrete action space (dummy - actual actions determined by policy network).
     observation_space : gym.Space
-        Box space for flattened graph embeddings with semantic pooling support.
+        Box space for flattened graph embeddings with fast topk selection.
+        Shape: [(max_critical_nodes + 1) * encoder_out_dim] - fixed size.
     
     Methods
     -------
@@ -149,9 +150,9 @@ class DurotaxisEnv(gym.Env):
     
     Notes
     -----
-    **Observation Space**: The environment uses semantic pooling when the number of nodes exceeds max_critical_nodes.
-    This intelligently selects representative nodes using spatial and feature clustering rather than arbitrary
-    truncation, preserving graph structure information for the policy network.
+    **Observation Space**: The environment uses fast topk selection when the number of nodes exceeds max_critical_nodes.
+    This efficiently selects representative nodes using O(N log K) torch.topk operation based on saliency scores,
+    ensuring fixed-size observations for neural network compatibility.
     
     **Reward System**: The multi-component reward system balances competing objectives:
     
@@ -251,11 +252,22 @@ class DurotaxisEnv(gym.Env):
         # Centroid-to-goal distance-only mode flag
         self.centroid_distance_only_mode = config.get('centroid_distance_only_mode', False)
         
+        # Simple spawn-only mode flag
+        self.simple_spawn_only_mode = config.get('simple_spawn_only_mode', False)
+        # Legacy: spawn_reward scalar kept for backward compatibility (no longer used)
+        self.spawn_reward = float(config.get('spawn_reward', 2.0))
+        
         # Include termination rewards flag (for special modes)
         # Default behavior:
         #   - If both modes are False: Always use termination rewards (default True, ignored)
         #   - If either mode is True: User must explicitly set this to True to include termination rewards
         self.include_termination_rewards = config.get('include_termination_rewards', False)
+
+        # Reward composition weights (Priority: Delete > Spawn > Distance)
+        rw = config.get('reward_weights', {})
+        self._w_delete = float(rw.get('delete_weight', 1.0))
+        self._w_spawn = float(rw.get('spawn_weight', 0.75))
+        self._w_distance = float(rw.get('distance_weight', 0.5))
 
         # Distance-mode parameters
         dm = config.get('distance_mode', {})
@@ -267,6 +279,13 @@ class DurotaxisEnv(gym.Env):
         self.dm_delete_scale = float(dm.get('delete_penalty_scale', 1.0))
         # Scheduler knobs already wired in trainer (optional)
         self._prev_centroid_x = None
+        
+        # Observation selection parameters (fast topk approach)
+        sel_cfg = config.get('observation_selection', {})
+        self.obs_sel_method = sel_cfg.get('method', 'topk_x')  # topk_x (default), topk_mixed
+        self.obs_sel_w_x = float(sel_cfg.get('w_x', 1.0))  # weight for x-coordinate (rightward bias)
+        self.obs_sel_w_intensity = float(sel_cfg.get('w_intensity', 0.0))  # weight for intensity
+        self.obs_sel_w_norm = float(sel_cfg.get('w_norm', 0.0))  # weight for embedding norm
 
         # Unpack reward dictionaries from config
         self.graph_rewards = config.get('graph_rewards', {
@@ -389,6 +408,32 @@ class DurotaxisEnv(gym.Env):
         
         self.survival_reward_config = config.get('survival_reward_config', {'enabled': False})
         self.milestone_rewards = config.get('milestone_rewards', {'enabled': False})
+        
+        # ============================================================================
+        # POTENTIAL-BASED REWARD SHAPING (PBRS) PARAMETERS
+        # ============================================================================
+        # Get gamma from algorithm config for PBRS (preserves optimal policy)
+        algo_config = config_loader.config.get('algorithm', {})
+        self._pbrs_gamma = float(algo_config.get('gamma', 0.99))
+        
+        # Delete reward PBRS parameters
+        pbrs_delete = self.delete_reward.get('pbrs', {})
+        self._pbrs_delete_enabled = pbrs_delete.get('enabled', False)
+        self._pbrs_delete_coeff = float(pbrs_delete.get('shaping_coeff', 0.0))
+        self._pbrs_delete_w_pending = float(pbrs_delete.get('phi_weight_pending_marked', 1.0))
+        self._pbrs_delete_w_safe = float(pbrs_delete.get('phi_weight_safe_unmarked', 0.25))
+        
+        # Centroid distance PBRS parameters
+        pbrs_centroid = self.graph_rewards.get('pbrs_centroid', {})
+        self._pbrs_centroid_enabled = pbrs_centroid.get('enabled', False)
+        self._pbrs_centroid_coeff = float(pbrs_centroid.get('shaping_coeff', 0.0))
+        self._pbrs_centroid_scale = float(pbrs_centroid.get('phi_distance_scale', 1.0))
+        
+        # Spawn reward PBRS parameters
+        pbrs_spawn = self.spawn_rewards.get('pbrs', {})
+        self._pbrs_spawn_enabled = pbrs_spawn.get('enabled', False)
+        self._pbrs_spawn_coeff = float(pbrs_spawn.get('shaping_coeff', 0.0))
+        self._pbrs_spawn_w_spawnable = float(pbrs_spawn.get('phi_weight_spawnable', 1.0))
 
         self.current_step = 0
         self.current_episode = 0
@@ -400,19 +445,11 @@ class DurotaxisEnv(gym.Env):
         self.centroid_history = []  # Store centroid x-coordinates
         self.consecutive_left_moves = 0  # Count consecutive leftward moves
         
-        # KMeans caching for performance optimization
-        self._kmeans_cache = {}  # Cache for fitted KMeans models
-        self._last_features_hash = None  # Hash of last features for cache invalidation
-        self._cache_hit_count = 0  # Statistics for cache performance
-        self._cache_miss_count = 0  # Statistics for cache performance
-        
         # Encoder observation optimization
         self._max_obs_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
-        self._pre_allocated_obs = np.zeros(self._max_obs_size, dtype=np.float32)  # Reusable zero array
+        self._pre_allocated_obs = np.zeros(self._max_obs_size, dtype=np.float32)  # Reusable zero array for fixed-size observations
         self._edge_index_cache = None  # Cache for edge_index tensor conversion
         self._last_edge_structure_hash = None  # Hash of edge structure for cache invalidation
-        self._edge_cache_hit_count = 0  # Statistics for edge cache performance
-        self._edge_cache_miss_count = 0  # Statistics for edge cache performance
         self.fail_threshold = 2 * self.delta_time  # Threshold for fail termination
 
         # Topology tracking for substrate intensity comparison
@@ -545,14 +582,13 @@ class DurotaxisEnv(gym.Env):
     def _get_cached_edge_index(self, edge_index):
         """
         Get cached edge_index tensor or create new one.
-        Returns (edge_index_tensor, is_cache_hit)
+        Returns edge_index_tensor.
         """
         structure_hash = self._get_edge_structure_hash(edge_index)
         
         if (self._last_edge_structure_hash == structure_hash and 
             self._edge_index_cache is not None):
-            self._edge_cache_hit_count += 1
-            return self._edge_index_cache, True
+            return self._edge_index_cache
         else:
             # Convert edge_index from DGL tuple format to PyG tensor format
             if isinstance(edge_index, tuple):
@@ -564,13 +600,13 @@ class DurotaxisEnv(gym.Env):
             # Cache the converted tensor
             self._edge_index_cache = edge_index_tensor
             self._last_edge_structure_hash = structure_hash
-            self._edge_cache_miss_count += 1
             
-            return edge_index_tensor, False
+            return edge_index_tensor
 
     def _get_encoder_observation(self, state):
         """
-        Get observation from GraphInputEncoder output with semantic pooling.
+        Get observation from GraphInputEncoder output with fast fixed-size selection.
+        Returns a fixed (max_critical_nodes+1) * encoder_out_dim flattened vector.
         
         Args:
             state: State dictionary from state_extractor.get_state_features()
@@ -579,279 +615,140 @@ class DurotaxisEnv(gym.Env):
             np.ndarray: Fixed-size observation vector from encoder output
             
         Note:
-            Uses semantic pooling when num_nodes > max_critical_nodes to preserve representative
-            nodes based on their features rather than arbitrary truncation.
+            - Uses fast topk selection (O(N log K)) instead of slow semantic pooling
+            - When num_nodes > max_critical_nodes: selects top-K nodes by saliency score
+            - When num_nodes <= max_critical_nodes: pads with zeros to fixed size
+            - Works with both SEM enabled and disabled
+            - Device-agnostic (works on CPU/GPU)
         """
         try:
             # Extract components from state
-            node_features = state['node_features']
-            graph_features = state['graph_features']
+            node_features = state['node_features']  # [N, F] torch tensor
+            graph_features = state['graph_features']  # [G] torch tensor
             edge_features = state['edge_attr']
             edge_index = state['edge_index']
             
             # Get cached edge_index tensor (avoids repeated conversions)
-            edge_index_tensor, edge_cache_hit = self._get_cached_edge_index(edge_index)
+            edge_index_tensor = self._get_cached_edge_index(edge_index)
             
-            # Handle empty graphs
+            # Handle empty graphs - return fixed-size zero observation
             if node_features.shape[0] == 0:
-                # Reuse pre-allocated array (avoid new allocation)
-                self._pre_allocated_obs.fill(0.0)  # Reset to zeros
-                return self._pre_allocated_obs.copy()  # Return copy to avoid mutation
+                self._pre_allocated_obs.fill(0.0)
+                return self._pre_allocated_obs.copy()
             
-            # Get encoder output directly
+            # Get encoder output (SEM is applied internally if enabled)
             encoder_out = self.observation_encoder(
                 graph_features=graph_features,
                 node_features=node_features,
                 edge_features=edge_features,
                 edge_index=edge_index_tensor
-            )  # Shape: [num_nodes+1, out_dim]
+            )  # Shape: [N+1, D] where row 0 is graph token, rows 1:N+1 are node embeddings
             
-            # ✅ SIMPLICIAL EMBEDDING HANDLES VARIABLE NODE COUNTS
-            # No pooling needed - Simplicial Embedding in encoder provides geometric structure
-            # that naturally handles variable graph sizes without information loss
-            actual_nodes = encoder_out.shape[0] - 1  # -1 for graph token
+            # Separate graph token from node embeddings
+            graph_token = encoder_out[0:1]  # [1, D]
+            node_embeddings = encoder_out[1:]  # [N, D]
+            N, D = node_embeddings.shape
+            K = int(self.max_critical_nodes)
             
-            # Flatten encoder output directly (no pooling)
-            encoder_flat = encoder_out.flatten().detach().cpu().numpy()
-            
-            # Dynamically handle variable-sized observations
-            if len(encoder_flat) > len(self._pre_allocated_obs):
-                # Resize pre-allocated array if needed
-                self._pre_allocated_obs = np.zeros(len(encoder_flat), dtype=np.float32)
-                self._max_obs_size = len(encoder_flat)
-            
-            # Use pre-allocated array (avoid new allocation for same-size or smaller obs)
-            self._pre_allocated_obs.fill(0.0)  # Reset to zeros
-            self._pre_allocated_obs[:len(encoder_flat)] = encoder_flat
-            return self._pre_allocated_obs[:len(encoder_flat)].copy()  # Return only the used portion
+            # Fast path: N <= K nodes → pad if needed and return fixed size
+            if N <= K:
+                if N < K:
+                    # Pad with zeros to reach K nodes
+                    pad_rows = K - N
+                    pad = node_embeddings.new_zeros((pad_rows, D))
+                    node_block = torch.cat([node_embeddings, pad], dim=0)  # [K, D]
+                else:
+                    node_block = node_embeddings  # [K, D]
                 
+                # Combine graph token with node block
+                fixed = torch.cat([graph_token, node_block], dim=0)  # [K+1, D]
+                flat = fixed.reshape(-1).detach().cpu().numpy()
+                
+                # Use pre-allocated buffer
+                expected_size = (K + 1) * D
+                if self._pre_allocated_obs.shape[0] != expected_size:
+                    self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
+                    self._max_obs_size = expected_size
+                
+                self._pre_allocated_obs[:len(flat)] = flat
+                return self._pre_allocated_obs.copy()
+            
+            # N > K: select top-K representative nodes using fast topk
+            # Build saliency score: s = w_x * x + w_intensity * I + w_norm * ||h||
+            with torch.no_grad():
+                device = node_embeddings.device
+                scores = torch.zeros((N,), dtype=node_embeddings.dtype, device=device)
+                
+                # Component 1: x-coordinate (rightward bias) - feature 0
+                if node_features.shape[1] >= 1 and self.obs_sel_w_x != 0.0:
+                    x = node_features[:, 0]
+                    # Normalize to [0, 1] for numerical stability
+                    x_min, x_max = x.min(), x.max()
+                    if x_max > x_min:
+                        x_norm = (x - x_min) / (x_max - x_min + 1e-6)
+                        scores.add_(self.obs_sel_w_x * x_norm)
+                
+                # Component 2: intensity - feature 2
+                if node_features.shape[1] >= 3 and self.obs_sel_w_intensity != 0.0:
+                    inten = node_features[:, 2]
+                    # Z-score normalization
+                    inten_mean, inten_std = inten.mean(), inten.std(unbiased=False)
+                    if inten_std > 1e-6:
+                        inten_norm = (inten - inten_mean) / (inten_std + 1e-6)
+                        scores.add_(self.obs_sel_w_intensity * inten_norm)
+                
+                # Component 3: embedding norm (representational importance)
+                if self.obs_sel_w_norm != 0.0:
+                    h_norm = node_embeddings.norm(p=2, dim=1)  # [N]
+                    # Z-score normalization
+                    h_mean, h_std = h_norm.mean(), h_norm.std(unbiased=False)
+                    if h_std > 1e-6:
+                        h_norm_z = (h_norm - h_mean) / (h_std + 1e-6)
+                        scores.add_(self.obs_sel_w_norm * h_norm_z)
+                
+                # Fallback: if all weights are zero, use rightmost x-coordinate
+                if torch.all(scores == 0):
+                    if node_features.shape[1] >= 1:
+                        scores = node_features[:, 0]  # x-coordinate
+                    else:
+                        scores = node_embeddings.norm(p=2, dim=1)  # embedding norm
+                
+                # Select top-K nodes by score (O(N log K)) - device-agnostic
+                topk_result = torch.topk(scores, k=K, largest=True, sorted=False)
+                sel_idx = topk_result.indices  # [K]
+                
+                # Optional: sort selected indices by x-coordinate for positional consistency
+                if node_features.shape[1] >= 1:
+                    x_sel = node_features[sel_idx, 0]
+                    order = torch.argsort(x_sel)  # left → right ordering
+                    sel_idx = sel_idx[order]
+                
+                # Extract selected node embeddings
+                selected = node_embeddings[sel_idx]  # [K, D]
+            
+            # Combine graph token with selected nodes
+            fixed = torch.cat([graph_token, selected], dim=0)  # [K+1, D]
+            flat = fixed.reshape(-1).detach().cpu().numpy()
+            
+            # Use pre-allocated buffer (constant size)
+            expected_size = (K + 1) * D
+            if self._pre_allocated_obs.shape[0] != expected_size:
+                self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
+                self._max_obs_size = expected_size
+            
+            self._pre_allocated_obs[:expected_size] = flat[:expected_size]
+            return self._pre_allocated_obs[:expected_size].copy()
+            
         except Exception as e:
             print(f"Error getting encoder observation: {e}")
             import traceback
             traceback.print_exc()
-            # Fallback to zero observation using pre-allocated array
+            # Fallback to zero observation with fixed size
+            expected_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
+            if self._pre_allocated_obs.shape[0] != expected_size:
+                self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
             self._pre_allocated_obs.fill(0.0)
             return self._pre_allocated_obs.copy()
-
-    def _get_features_cache_key(self, features_np, n_clusters):
-        """
-        Generate a cache key for KMeans based on feature characteristics.
-        Uses data shape, sample of values, and clustering parameters.
-        """
-        import hashlib
-        import numpy as np
-        
-        # Create a deterministic hash from feature characteristics
-        shape_str = str(features_np.shape)
-        
-        # Sample key points for hash (to avoid hashing entire array)
-        if features_np.size > 1000:
-            # For large arrays, sample strategically
-            indices = np.linspace(0, features_np.shape[0]-1, 20, dtype=int)
-            sample = features_np.flat[indices]
-        else:
-            # For small arrays, use statistical summary
-            sample = np.array([
-                features_np.mean(), features_np.std(), 
-                features_np.min(), features_np.max(),
-                np.median(features_np.flat)
-            ])
-        
-        # Combine shape, sample, and clustering params
-        key_data = f"{shape_str}_{n_clusters}_{sample.tobytes().hex()}"
-        return hashlib.md5(key_data.encode()).hexdigest()
-    
-    def _get_cached_kmeans(self, features_np, n_clusters, cache_prefix):
-        """
-        Get cached KMeans model or create new one.
-        Returns (kmeans_model, is_cache_hit)
-        """
-        from sklearn.cluster import MiniBatchKMeans
-        
-        cache_key = f"{cache_prefix}_{self._get_features_cache_key(features_np, n_clusters)}"
-        
-        if cache_key in self._kmeans_cache:
-            self._cache_hit_count += 1
-            return self._kmeans_cache[cache_key], True
-        else:
-            # Create new KMeans model
-            kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=256, n_init='auto', random_state=42)
-            kmeans.fit(features_np)
-            
-            # Cache the fitted model
-            self._kmeans_cache[cache_key] = kmeans
-            self._cache_miss_count += 1
-            
-            # Limit cache size to prevent memory issues
-            if len(self._kmeans_cache) > 50:  # Keep only 50 most recent models
-                # Remove oldest entry (simple FIFO)
-                oldest_key = next(iter(self._kmeans_cache))
-                del self._kmeans_cache[oldest_key]
-            
-            return kmeans, False
-
-    def _semantic_node_selection(self, node_embeddings, state, target_count):
-        """
-        Perform semantic node selection using attention-based clustering.
-        
-        This method uses graph neural network embeddings to identify semantically
-        similar nodes and select a diverse subset based on attention weights.
-        The selection aims to choose nodes that are representative of different
-        regions or characteristics in the topology.
-        
-        Parameters
-        ----------
-        node_embeddings : torch.Tensor
-            Node embeddings from the graph neural network, shape (num_nodes, out_dim)
-        state : dict
-            Current state dictionary containing graph information
-        target_count : int
-            Desired number of nodes to select
-            
-        Returns
-        -------
-        torch.Tensor
-            Indices of selected nodes, shape (target_count,)
-            
-        Notes
-        -----
-        The algorithm uses attention mechanisms to compute node importance scores
-        and applies diversity constraints to avoid selecting clustered nodes.
-        """
-        """
-        Intelligently select representative nodes using semantic features.
-        
-        Args:
-            node_embeddings: [num_nodes, out_dim] tensor of node embeddings
-            state: State dictionary with node features
-            target_count: Number of nodes to select
-            
-        Returns:
-            torch.Tensor: Indices of selected nodes
-        """
-        import torch
-        import numpy as np
-        from sklearn.cluster import MiniBatchKMeans
-        
-        num_nodes = node_embeddings.shape[0]
-        
-        try:
-            # Strategy 1: Use raw node features for semantic clustering
-            node_features = state['node_features']  # [num_nodes, 8] - rich feature set
-            
-            if node_features.shape[0] != num_nodes:
-                # Fallback to uniform sampling if feature mismatch
-                print(f"    ⚠️ Feature mismatch, using uniform sampling")
-                device = node_features.device
-                indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long, device=device)
-                return indices
-            
-            # Convert to numpy for clustering
-            features_np = node_features.detach().cpu().numpy()
-            
-            # Strategy 2: Multi-criteria semantic selection
-            selected_indices = []
-            
-            # A. Spatial diversity (based on position features - first 2 dims)
-            if features_np.shape[1] >= 2:
-                positions = features_np[:, :2]  # x, y coordinates
-                spatial_clusters = min(target_count // 3, 8)  # 1/3 for spatial diversity
-                
-                if spatial_clusters > 1:
-                    try:
-                        kmeans_spatial, is_cache_hit = self._get_cached_kmeans(positions, spatial_clusters, "spatial")
-                        spatial_labels = kmeans_spatial.predict(positions)
-                        
-                        if is_cache_hit:
-                            print(f"    🗺️ Spatial clustering: Using cached model for {spatial_clusters} clusters")
-                        
-                        # Select one representative from each spatial cluster
-                        for cluster_id in range(spatial_clusters):
-                            cluster_nodes = np.where(spatial_labels == cluster_id)[0]
-                            if len(cluster_nodes) > 0:
-                                # Choose node closest to cluster centroid
-                                centroid = kmeans_spatial.cluster_centers_[cluster_id]
-                                distances = np.linalg.norm(positions[cluster_nodes] - centroid, axis=1)
-                                best_idx = cluster_nodes[np.argmin(distances)]
-                                selected_indices.append(best_idx)
-                        
-                        print(f"    🗺️ Spatial clustering: {len(selected_indices)} nodes from {spatial_clusters} regions")
-                    except:
-                        pass
-            
-            # B. Feature diversity (based on all features)
-            remaining_slots = target_count - len(selected_indices)
-            if remaining_slots > 0:
-                # Select nodes not already chosen
-                available_indices = list(set(range(num_nodes)) - set(selected_indices))
-                
-                if len(available_indices) > remaining_slots:
-                    try:
-                        # Cluster remaining nodes by feature similarity
-                        available_features = features_np[available_indices]
-                        feature_clusters = min(remaining_slots, len(available_indices))
-                        
-                        if feature_clusters > 1:
-                            kmeans_features, is_cache_hit = self._get_cached_kmeans(available_features, feature_clusters, "features")
-                            feature_labels = kmeans_features.predict(available_features)
-                            
-                            if is_cache_hit:
-                                print(f"    🎯 Feature clustering: Using cached model for {feature_clusters} clusters")
-                            
-                            # Select representative from each feature cluster
-                            for cluster_id in range(feature_clusters):
-                                cluster_mask = (feature_labels == cluster_id)
-                                if np.any(cluster_mask):
-                                    cluster_indices = np.array(available_indices)[cluster_mask]
-                                    # Choose node closest to cluster centroid
-                                    centroid = kmeans_features.cluster_centers_[cluster_id]
-                                    distances = np.linalg.norm(available_features[cluster_mask] - centroid, axis=1)
-                                    best_local_idx = np.argmin(distances)
-                                    best_global_idx = cluster_indices[best_local_idx]
-                                    selected_indices.append(best_global_idx)
-                            
-                            print(f"    🎯 Feature clustering: +{len(selected_indices) - len(selected_indices[:spatial_clusters if 'spatial_clusters' in locals() else 0])} diverse nodes")
-                        else:
-                            # Just take the available nodes
-                            selected_indices.extend(available_indices[:remaining_slots])
-                    except Exception as e:
-                        print(f"    ⚠️ Feature clustering failed: {e}")
-                        # Fallback: uniform sampling from remaining
-                        selected_indices.extend(available_indices[:remaining_slots])
-                else:
-                    # Take all remaining nodes
-                    selected_indices.extend(available_indices)
-            
-            # C. Fill remaining slots with uniform sampling if needed
-            if len(selected_indices) < target_count:
-                available_indices = list(set(range(num_nodes)) - set(selected_indices))
-                remaining_needed = target_count - len(selected_indices)
-                
-                if available_indices:
-                    # Uniform sampling from remaining
-                    step = max(1, len(available_indices) // remaining_needed)
-                    additional = available_indices[::step][:remaining_needed]
-                    selected_indices.extend(additional)
-                    print(f"    📐 Uniform fill: +{len(additional)} nodes to reach target")
-            
-            # Ensure we don't exceed target count
-            selected_indices = selected_indices[:target_count]
-            
-            # Sort indices for consistent ordering
-            selected_indices = sorted(selected_indices)
-            
-            # Infer device from node_features
-            device = node_features.device if hasattr(node_features, 'device') else torch.device('cpu')
-            return torch.tensor(selected_indices, dtype=torch.long, device=device)
-            
-        except Exception as e:
-            print(f"    ❌ Semantic selection failed: {e}")
-            # Fallback to uniform sampling
-            device = node_features.device if hasattr(node_features, 'device') else torch.device('cpu')
-            indices = torch.linspace(0, num_nodes-1, target_count, dtype=torch.long, device=device)
-            print(f"    🔄 Fallback to uniform sampling: {target_count} nodes")
-            return indices
-
 
     def step(self, action):
         """
@@ -934,13 +831,35 @@ class DurotaxisEnv(gym.Env):
                 self.state_extractor.set_topology(self.topology)
 
         # Execute actions using the policy network (now guaranteed to have nodes)
+        # Store action parameters for logging
+        action_params = {'delete_ratio': 0.0, 'gamma': 0.0, 'alpha': 0.0, 'noise': 0.0, 'theta': 0.0}
+        
         if self.policy_agent is not None and prev_num_nodes > 0:
             try:
                 executed_actions = self.policy_agent.act_with_policy(
                     deterministic=False
                 )
+                # Try to extract action parameters if available
+                if hasattr(self.policy_agent, 'last_continuous_actions') and self.policy_agent.last_continuous_actions is not None:
+                    last_actions = self.policy_agent.last_continuous_actions
+                    if len(last_actions) >= 5:
+                        # Extract single global action parameters (shape: [5])
+                        action_params['delete_ratio'] = float(last_actions[0].item())
+                        action_params['gamma'] = float(last_actions[1].item())
+                        action_params['alpha'] = float(last_actions[2].item())
+                        action_params['noise'] = float(last_actions[3].item())
+                        action_params['theta'] = float(last_actions[4].item())
+                    else:
+                        print(f"⚠️  DEBUG: last_continuous_actions has wrong shape: {last_actions.shape if hasattr(last_actions, 'shape') else len(last_actions)}")
+                else:
+                    if not hasattr(self.policy_agent, 'last_continuous_actions'):
+                        print(f"⚠️  DEBUG: policy_agent has no attribute 'last_continuous_actions'")
+                    elif self.policy_agent.last_continuous_actions is None:
+                        print(f"⚠️  DEBUG: last_continuous_actions is None (prev_num_nodes={prev_num_nodes})")
             except Exception as e:
                 print(f"⚠️  Policy execution failed: {e}")
+                import traceback
+                traceback.print_exc()
                 executed_actions = {}
         else:
             # Fallback to random actions if policy fails or no nodes
@@ -999,39 +918,30 @@ class DurotaxisEnv(gym.Env):
             reward_components['termination_reward'] = termination_reward
             
             # Determine if termination rewards should be included
-            is_normal_mode = not self.simple_delete_only_mode and not self.centroid_distance_only_mode
-            is_combined_mode = self.simple_delete_only_mode and self.centroid_distance_only_mode
-            is_special_mode_with_termination = (self.simple_delete_only_mode or self.centroid_distance_only_mode) and self.include_termination_rewards
+            # Check which special modes are enabled
+            has_delete_mode = self.simple_delete_only_mode
+            has_centroid_mode = self.centroid_distance_only_mode
+            has_spawn_mode = self.simple_spawn_only_mode
+            num_special_modes = sum([has_delete_mode, has_centroid_mode, has_spawn_mode])
+            
+            is_normal_mode = num_special_modes == 0
+            is_special_mode_with_termination = num_special_modes > 0 and self.include_termination_rewards
             
             # Include termination rewards if:
-            # 1. Normal mode (both special modes disabled), OR
+            # 1. Normal mode (all special modes disabled), OR
             # 2. Special mode with include_termination_rewards=True
             if is_normal_mode or is_special_mode_with_termination:
-                if is_combined_mode:
-                    # Combined mode: Distance + Delete + Scaled Termination
-                    # Apply scaled and clipped termination (prioritize distance signal)
+                # Apply termination reward scaling/clipping if centroid mode is enabled
+                if has_centroid_mode:
+                    # Centroid mode(s): Apply scaled and clipped termination (prioritize distance signal)
                     scaled_termination = termination_reward * self.dm_term_scale
                     if self.dm_term_clip:
                         scaled_termination = max(-self.dm_term_clip_val, 
                                                  min(self.dm_term_clip_val, scaled_termination))
                     reward_components['total_reward'] += scaled_termination
-                    reward_components['termination_reward_scaled'] = scaled_termination
-                elif self.simple_delete_only_mode:
-                    # Simple delete mode only: Replace total with graph_reward + termination
-                    reward_components['total_reward'] = (
-                        reward_components.get('graph_reward', 0.0) + termination_reward
-                    )
-                elif self.centroid_distance_only_mode:
-                    # Centroid distance mode only: Apply scaled and clipped termination
-                    scaled_termination = termination_reward * self.dm_term_scale
-                    if self.dm_term_clip:
-                        scaled_termination = max(-self.dm_term_clip_val, 
-                                                 min(self.dm_term_clip_val, scaled_termination))
-                    reward_components['total_reward'] += scaled_termination
-                    # Store the scaled version for logging
                     reward_components['termination_reward_scaled'] = scaled_termination
                 else:
-                    # Normal mode: Add termination reward to existing total
+                    # Normal mode or delete/spawn modes: Add full termination reward
                     reward_components['total_reward'] += termination_reward
             # else: Special mode without include_termination_rewards flag - ignore termination rewards
         
@@ -1086,12 +996,20 @@ class DurotaxisEnv(gym.Env):
                 boundary_warning = f" ⚠️DANGER:{nodes_in_danger}"
         
         recovery_flag = " ♻️" if empty_graph_recovered else ""
+        
+        # Extract reward components
+        delete_r = reward_components.get('delete_reward', 0.0)
+        spawn_r = reward_components.get('spawn_reward', 0.0)
+        distance_r = reward_components.get('distance_signal', 0.0)
+        
         print(
             f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
             f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
-            f"R={scalar_reward:+6.3f} (S:{spawn_r:+4.1f} N:{node_r:+4.1f} E:{edge_r:+4.1f}) | "
+            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.3f} S:{spawn_r:+4.3f} Dist:{distance_r:+4.3f}) | "
             f"C={centroid_x:5.1f}{centroid_direction}{boundary_warning}{recovery_flag} | "
-            f"A={len(executed_actions):2d} | T={terminated} {truncated}"
+            f"Actions: dr={action_params['delete_ratio']:.3f} γ={action_params['gamma']:.2f} "
+            f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f} | "
+            f"Termi={terminated} Trunc={truncated}"
         )
         
         # Auto-render after each step to ensure visualization is always updated
@@ -1103,371 +1021,131 @@ class DurotaxisEnv(gym.Env):
 
     def _calculate_reward(self, prev_state, new_state, actions):
         """
-        Calculate reward based on topology evolution and substrate exploration.
-        Returns scalar reward (graph-level + aggregated node-level).
+        Calculate reward based on simplified composition: Delete > Spawn > Distance.
+        
+        Refactored to use ONLY:
+        - Delete reward (Rule 1: proper deletion compliance)
+        - Spawn reward (Rule 2: intensity-based spawning, NO boundary checks)
+        - Distance reward (Rule 3: centroid movement toward goal)
+        - Termination rewards (applied at episode end)
+        
+        Special modes (delete-only, centroid-only, spawn-only, combinations) still work.
+        Priority: Delete > Spawn > Distance (assumption: good delete/spawn → better distance)
         """
         # Initialize reward components
-        graph_reward = 0.0
-        node_rewards = []
-        
-        # === GRAPH-LEVEL REWARDS ===
-        
-        # Penalty for too many (N > Nc) or too few nodes (N < 2)
         num_nodes = new_state['num_nodes']
-        if num_nodes < 2:
-            graph_reward -= self.connectivity_penalty  # Strong penalty for losing all connectivity
-        elif num_nodes > self.max_critical_nodes:
-            # Scaled penalty: grows quadratically with excess nodes to strongly discourage runaway growth
-            excess_nodes = num_nodes - self.max_critical_nodes
-            scaled_penalty = self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
-            graph_reward -= scaled_penalty
-        else:
-            graph_reward += self.survival_reward # Basic survival reward
-
-        # Small reward for taking actions (encourages exploration)
-        graph_reward += len(actions) * self.action_reward
         
-        # === CENTROID MOVEMENT REWARD: Collective rightward progress ===
-        centroid_reward = self._calculate_centroid_movement_reward(prev_state, new_state)
-        graph_reward += centroid_reward
+        # === CALCULATE CORE REWARD COMPONENTS ===
         
-        # === SPAWN REWARD: Durotaxis-based spawning ===
-        spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
-        graph_reward += spawn_reward
-        
-        # === DELETE REWARD: Proper deletion compliance ===
+        # PRIORITY 1: Delete reward (proper deletion compliance)
         delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
-        graph_reward += delete_reward
         
-        # === DELETION EFFICIENCY REWARD: Tidiness bonus for smart pruning ===
-        efficiency_reward = self._calculate_deletion_efficiency_reward(prev_state, new_state)
-        graph_reward += efficiency_reward
+        # PRIORITY 2: Spawn reward (intensity-based, simplified - no boundary checks in refactored version)
+        spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
         
-        # === EDGE REWARD: Directional bias toward rightward movement ===
-        edge_reward = self._calculate_edge_reward(prev_state, new_state, actions)
-        graph_reward += edge_reward
-        
-        
-        # === NODE-LEVEL REWARDS (VECTORIZED) ===
+        # PRIORITY 3: Distance reward (centroid movement toward goal)
+        # Calculate centroid x position for distance signal
+        centroid_x = 0.0
+        distance_signal = 0.0
         
         if num_nodes > 0:
-            import numpy as np
-            node_features = new_state['node_features']
-            
-            # Convert to numpy for efficient vectorized operations
-            node_features_np = node_features.detach().cpu().numpy()  # [num_nodes, feature_dim]
-            
-            # Initialize vectorized reward array
-            node_rewards_vec = np.zeros(num_nodes, dtype=np.float32)
-            
-            # 1. VECTORIZED Position-based rewards (durotaxis progression)
-            node_positions = node_features_np[:, :2]  # [num_nodes, 2] - x, y coordinates
-            
-            # Reward/penalize based on movement direction - VECTORIZED
-            if hasattr(self, 'prev_node_positions') and len(self.prev_node_positions) > 0:
-                # Convert previous positions to numpy array
-                prev_positions = np.array(self.prev_node_positions[:num_nodes])  # Handle size mismatches
-                if prev_positions.shape[0] == num_nodes:
-                    # Vectorized movement calculation
-                    x_movement = node_positions[:, 0] - prev_positions[:, 0]  # [num_nodes]
-                    
-                    # Reward rightward movement, penalize leftward movement
-                    movement_rewards = np.where(
-                        x_movement > 0,
-                        x_movement * self.movement_reward,  # Rightward: strong reward
-                        x_movement * self.leftward_penalty  # Leftward: penalty (x_movement is negative, so this is negative)
-                    )
-                    node_rewards_vec += movement_rewards
-            
-            # 2. VECTORIZED Substrate intensity rewards
-            if node_features_np.shape[1] > 2:
-                substrate_intensities = node_features_np[:, 2]  # [num_nodes] - intensity values
-                intensity_rewards = substrate_intensities * self.substrate_reward  # [num_nodes]
-                node_rewards_vec += intensity_rewards
-            
-            # 3. VECTORIZED Boundary position rewards  
-            if node_features_np.shape[1] > 7:
-                boundary_flags = node_features_np[:, 7]  # [num_nodes] - boundary indicators
-                boundary_rewards = np.where(boundary_flags > 0.5, self.boundary_bonus, 0.0)  # [num_nodes]
-                node_rewards_vec += boundary_rewards
-            
-            # 4. VECTORIZED Positional penalties (avoid substrate edges) - ENHANCED BOUNDARY AVOIDANCE
-            substrate_width = self.substrate.width
-            substrate_height = self.substrate.height
-            
-            # Left edge penalty - VECTORIZED
-            left_edge_mask = node_positions[:, 0] < substrate_width * 0.1  # [num_nodes]
-            left_edge_penalties = np.where(left_edge_mask, -self.left_edge_penalty, 0.0)  # [num_nodes]
-            node_rewards_vec += left_edge_penalties
-            
-            # ENHANCED: Progressive top/bottom edge penalties - VECTORIZED
-            # Calculate distance from top and bottom boundaries
-            y_positions = node_positions[:, 1]  # [num_nodes]
-            dist_from_top = y_positions / substrate_height  # 0.0 = top, 1.0 = bottom
-            dist_from_bottom = (substrate_height - y_positions) / substrate_height  # 0.0 = bottom, 1.0 = top
-            
-            # Get minimum distance to either boundary (0.0 = at boundary, 0.5 = center)
-            min_dist_to_boundary = np.minimum(dist_from_top, dist_from_bottom)  # [num_nodes]
-            
-            # Define zone thresholds
-            edge_threshold = self.edge_zone_threshold      # 15% - edge zone
-            danger_threshold = self.danger_zone_threshold  # 8% - danger zone
-            critical_threshold = self.critical_zone_threshold  # 3% - critical zone
-            safe_center_range = self.safe_center_range     # 30% - safe center
-            
-            # Progressive penalties based on proximity to boundary
-            boundary_penalties = np.zeros(num_nodes, dtype=np.float32)
-            
-            # Critical zone: SEVERE penalty (within 3% of boundary)
-            critical_mask = min_dist_to_boundary < critical_threshold
-            boundary_penalties = np.where(critical_mask, -self.critical_zone_penalty, boundary_penalties)
-            
-            # Danger zone: Strong penalty (within 8% of boundary)
-            danger_mask = (min_dist_to_boundary >= critical_threshold) & (min_dist_to_boundary < danger_threshold)
-            boundary_penalties = np.where(danger_mask, -self.danger_zone_penalty, boundary_penalties)
-            
-            # Edge zone: Moderate penalty (within 15% of boundary)
-            edge_mask = (min_dist_to_boundary >= danger_threshold) & (min_dist_to_boundary < edge_threshold)
-            boundary_penalties = np.where(edge_mask, -self.edge_position_penalty, boundary_penalties)
-            
-            # Safe center zone: Small bonus (center 30% of height)
-            center_dist = np.abs(y_positions - substrate_height/2) / (substrate_height/2)  # 0.0 = center, 1.0 = edge
-            safe_center_mask = center_dist < safe_center_range
-            safe_center_rewards = np.where(safe_center_mask, self.safe_center_bonus, 0.0)
-            
-            node_rewards_vec += boundary_penalties
-            node_rewards_vec += safe_center_rewards
-            
-            # 5. Per-node intensity comparison (requires loop for complexity)
-            if self.dequeued_topology is not None and node_features_np.shape[1] > 2:
-                # Compute average intensity once for all nodes - VECTORIZED
-                current_intensities = node_features_np[:, 2]  # [num_nodes]
-                avg_intensity = np.mean(current_intensities)
-                
-                # Process each node for intensity comparison (some complexity requires per-node handling)
-                for i in range(num_nodes):
-                    node_x = node_positions[i, 0]
-                    node_y = node_positions[i, 1]
-                    
-                    # Get node's persistent ID for reliable tracking
-                    node_persistent_id = self._get_node_persistent_id(i)
-                    
-                    # Check if this node was present in the dequeued topology
-                    if node_persistent_id is not None:
-                        node_was_in_dequeued = self._check_persistent_id_in_topology(node_persistent_id, self.dequeued_topology)
+            try:
+                graph_features = new_state.get('graph_features')
+                if graph_features is not None:
+                    if isinstance(graph_features, torch.Tensor):
+                        centroid_x = graph_features[3].item()  # Index 3 is centroid_x
                     else:
-                        # Fallback to spatial matching if persistent IDs not available
-                        node_was_in_dequeued = self._node_exists_in_topology(node_x, node_y, self.dequeued_topology)
-                    
-                    if node_was_in_dequeued:
-                        current_node_intensity = current_intensities[i]
-                        
-                        # Set penalties/bonuses based on intensity comparison
-                        if current_node_intensity < avg_intensity:
-                            node_rewards_vec[i] -= self.intensity_penalty  # Penalty for being below average
-                        else:
-                            node_rewards_vec[i] += self.intensity_bonus  # Basic survival reward
-            
-            # Convert back to list for compatibility with existing code
-            node_rewards = node_rewards_vec.tolist()
-            
-            # Store current positions for next step - VECTORIZED
-            self.prev_node_positions = node_positions.tolist()  # Convert back to list format
-          
-        # === COMBINE REWARDS ===
+                        centroid_x = graph_features[3]
+            except (IndexError, TypeError):
+                # Fallback: calculate centroid from node positions
+                node_features = new_state.get('node_features', [])
+                if len(node_features) > 0:
+                    x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                 for node in node_features]
+                    centroid_x = sum(x_positions) / len(x_positions)
         
-        # Aggregate node rewards (you can use different strategies)
-        if node_rewards:
-            # Strategy 1: Simple sum
-            total_node_reward = sum(node_rewards)
-            
-            # Strategy 2: Average (uncomment to use)
-            # total_node_reward = sum(node_rewards) / len(node_rewards)
-            
-            # Strategy 3: Weighted combination (uncomment to use)
-            # total_node_reward = sum(node_rewards) * (num_nodes / self.max_critical_nodes)
+        # Use delta distance shaping (potential-based) for rightward migration
+        if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
+            # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
+            # Positive when moving right, negative when moving left
+            delta_x = centroid_x - self._prev_centroid_x
+            distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
         else:
-            total_node_reward = 0.0
-        
-        # Apply curriculum penalty multiplier to negative rewards
-        penalty_multiplier = getattr(self, '_curriculum_penalty_multiplier', 1.0)
-        if penalty_multiplier != 1.0:
-            # Apply penalty multiplier to negative components
-            if graph_reward < 0:
-                graph_reward *= penalty_multiplier
-            if total_node_reward < 0:
-                total_node_reward *= penalty_multiplier
-        
-        # Add survival reward if configured
-        survival_reward = self.get_survival_reward(self.current_step)
-        
-        # Add milestone rewards for reaching distance thresholds
-        milestone_reward = self._calculate_milestone_reward(new_state)
-        
-        # Final combined reward
-        total_reward = graph_reward + total_node_reward + survival_reward + milestone_reward
-        
-        # === COMBINED MODE: Distance Shaping + Delete Penalties ===
-        # When BOTH modes are enabled, combine distance shaping with delete penalties
-        if self.simple_delete_only_mode and self.centroid_distance_only_mode:
-            # === 1. Calculate Distance Signal (Dense, Directional) ===
-            centroid_x = 0.0
-            if num_nodes > 0:
-                try:
-                    graph_features = new_state.get('graph_features')
-                    if graph_features is not None:
-                        if isinstance(graph_features, torch.Tensor):
-                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
-                        else:
-                            centroid_x = graph_features[3]
-                except (IndexError, TypeError):
-                    # Fallback: calculate centroid from node positions
-                    node_features = new_state.get('node_features', [])
-                    if len(node_features) > 0:
-                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
-                                     for node in node_features]
-                        centroid_x = sum(x_positions) / len(x_positions)
-            
-            # Use delta distance shaping (potential-based) for rightward migration
-            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
-                # Delta distance: reward ∝ (cx_t - cx_{t-1}) / goal_x
-                # Positive when moving right, negative when moving left
-                delta_x = centroid_x - self._prev_centroid_x
-                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
+            # Fallback: static distance penalty
+            if self.goal_x > 0:
+                distance_signal = -(self.goal_x - centroid_x) / self.goal_x
             else:
-                # Fallback: static distance penalty
-                if self.goal_x > 0:
-                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
-                else:
-                    distance_signal = 0.0
-            
-            # Update previous centroid for next step
-            self._prev_centroid_x = centroid_x
-            
-            # === 2. Calculate Delete Penalties (Efficient Node Management) ===
-            # Extract only the delete penalties from delete_reward
-            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
-            
-            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
-            growth_penalty_only = 0.0
-            if num_nodes > self.max_critical_nodes:
-                excess_nodes = num_nodes - self.max_critical_nodes
-                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
-            
-            # Combine delete penalties
-            delete_penalties_total = growth_penalty_only + delete_penalty_only
-            
-            # === 3. Combine Distance + Delete ===
-            total_reward = distance_signal + delete_penalties_total
-            graph_reward = distance_signal + delete_penalties_total
-            
-            # Zero out all other components (keep reward focused)
-            spawn_reward = 0.0
-            delete_reward = delete_penalties_total  # Keep for logging
-            efficiency_reward = 0.0
-            edge_reward = 0.0
-            centroid_reward = 0.0
-            milestone_reward = 0.0
-            total_node_reward = 0.0
-            survival_reward = 0.0
+                distance_signal = 0.0
         
-        # === SIMPLE DELETE-ONLY MODE ===
-        # When enabled, zero out all rewards except delete penalties (Rule 1 & 2) and growth penalty (Rule 0)
-        elif self.simple_delete_only_mode:
-            # Extract only the delete penalties from delete_reward
-            # In simple mode, we want ONLY penalties, no positive rewards
-            delete_penalty_only = delete_reward if delete_reward < 0 else 0.0
-            
-            # Rule 0: Growth penalty (when num_nodes > max_critical_nodes)
-            growth_penalty_only = 0.0
-            if num_nodes > self.max_critical_nodes:
-                excess_nodes = num_nodes - self.max_critical_nodes
-                growth_penalty_only = -self.growth_penalty * (1 + excess_nodes / self.max_critical_nodes)
-            
-            # Combine penalties: Rule 0 (growth) + Rule 1 (persistence) + Rule 2 (improper deletion)
-            total_reward = growth_penalty_only + delete_penalty_only
-            graph_reward = growth_penalty_only + delete_penalty_only
-            
-            # Zero out all other components
-            spawn_reward = 0.0
-            efficiency_reward = 0.0
-            edge_reward = 0.0
-            centroid_reward = 0.0
-            milestone_reward = 0.0
-            total_node_reward = 0.0
-            survival_reward = 0.0
+        # Optional: add proper PBRS shaping on top (preserves optimal policy)
+        if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
+            phi_prev = self._phi_centroid_distance_potential(prev_state)
+            phi_new = self._phi_centroid_distance_potential(new_state)
+            distance_signal += self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
         
+        # Update previous centroid for next step
+        self._prev_centroid_x = centroid_x
         
-        # === CENTROID-TO-GOAL DISTANCE-ONLY MODE ===
-        # When enabled, provide ONLY distance-based penalty from centroid to goal
-        elif self.centroid_distance_only_mode:
-            # Calculate centroid x position
-            centroid_x = 0.0
-            if num_nodes > 0:
-                try:
-                    graph_features = new_state.get('graph_features')
-                    if graph_features is not None:
-                        if isinstance(graph_features, torch.Tensor):
-                            centroid_x = graph_features[3].item()  # Index 3 is centroid_x
-                        else:
-                            centroid_x = graph_features[3]
-                except (IndexError, TypeError) as e:
-                    # Fallback: calculate centroid from node positions
-                    node_features = new_state.get('node_features', [])
-                    if len(node_features) > 0:
-                        x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
-                                     for node in node_features]
-                        centroid_x = sum(x_positions) / len(x_positions)
-            
-            # === DISTANCE MODE OPTIMIZATION ===
-            # Use delta distance shaping (potential-based) for faster learning
-            if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
-                # Delta distance shaping: reward = scale × (cx_t - cx_{t-1}) / goal_x
-                # Potential-based: Φ(s) = cx / goal_x, preserves optimal policy
-                # Positive when moving right, negative when moving left
-                delta_x = centroid_x - self._prev_centroid_x
-                distance_signal = self.dm_dist_scale * (delta_x / self.goal_x)
-            else:
-                # Fallback: Static distance penalty (original behavior)
-                # Calculate distance penalty: -(goal_x - centroid_x) / goal_x
-                # As centroid approaches goal, penalty approaches 0
-                # If centroid is at or past goal, penalty is 0 or positive (reward)
-                if self.goal_x > 0:
-                    distance_signal = -(self.goal_x - centroid_x) / self.goal_x
-                else:
-                    distance_signal = 0.0
-            
-            # Update previous centroid for next step
-            self._prev_centroid_x = centroid_x
-            
-            # Set total reward to distance signal only
-            total_reward = distance_signal
-            graph_reward = distance_signal
-            
-            # Zero out all other components
-            spawn_reward = 0.0
-            delete_reward = 0.0
-            efficiency_reward = 0.0
-            edge_reward = 0.0
-            centroid_reward = 0.0
-            milestone_reward = 0.0
-            total_node_reward = 0.0
-            survival_reward = 0.0
+        # === REWARD COMPOSITION ===
+        # Two paths: (1) Special modes (selective components), (2) Default (all three components)
         
-        # OPTIMIZATION 2: Use preallocated template for faster dict creation
-        reward_breakdown = dict(self._reward_components_template)
-        reward_breakdown['total_reward'] = total_reward
-        reward_breakdown['graph_reward'] = graph_reward
-        reward_breakdown['spawn_reward'] = spawn_reward
-        reward_breakdown['delete_reward'] = delete_reward
-        reward_breakdown['deletion_efficiency_reward'] = efficiency_reward if 'efficiency_reward' in locals() else 0.0
-        reward_breakdown['edge_reward'] = edge_reward
-        reward_breakdown['centroid_reward'] = centroid_reward if 'centroid_reward' in locals() else 0.0
-        reward_breakdown['milestone_reward'] = milestone_reward
-        reward_breakdown['node_rewards'] = node_rewards
-        reward_breakdown['total_node_reward'] = total_node_reward
-        reward_breakdown['survival_reward'] = survival_reward
-        reward_breakdown['num_nodes'] = num_nodes
+        # Check which special modes are enabled
+        has_delete_mode = self.simple_delete_only_mode
+        has_centroid_mode = self.centroid_distance_only_mode
+        has_spawn_mode = self.simple_spawn_only_mode
+        
+        # Count how many special modes are enabled
+        num_special_modes = sum([has_delete_mode, has_centroid_mode, has_spawn_mode])
+        
+        if num_special_modes > 0:
+            # === SPECIAL MODES: Use ONLY enabled components (no weighting in special modes) ===
+            mode_reward = 0.0
+            
+            # Priority 1: Delete (if enabled)
+            if has_delete_mode:
+                mode_reward += delete_reward
+            
+            # Priority 2: Spawn (if enabled)
+            if has_spawn_mode:
+                mode_reward += spawn_reward
+            
+            # Priority 3: Distance (if enabled)
+            if has_centroid_mode:
+                mode_reward += distance_signal
+            
+            # Set total reward from special mode composition
+            total_reward = mode_reward
+            graph_reward = mode_reward
+            
+            # Zero out components NOT in special modes (for logging clarity)
+            if not has_spawn_mode:
+                spawn_reward = 0.0
+            if not has_delete_mode:
+                delete_reward = 0.0
+            if not has_centroid_mode:
+                distance_signal = 0.0
+        else:
+            # === DEFAULT MODE: Weighted composition (Delete > Spawn > Distance) ===
+            # Apply environment-level weights to make priority explicit in task reward
+            total_reward = (
+                self._w_delete * float(delete_reward) +
+                self._w_spawn * float(spawn_reward) +
+                self._w_distance * float(distance_signal)
+            )
+            graph_reward = total_reward
+        
+        # === BUILD REWARD BREAKDOWN ===
+        # Create reward breakdown with only the components used in refactored system
+        reward_breakdown = {
+            'total_reward': total_reward,
+            'graph_reward': graph_reward,
+            'delete_reward': delete_reward,
+            'spawn_reward': spawn_reward,
+            'distance_signal': distance_signal,
+            'num_nodes': num_nodes,
+            'empty_graph_recovery_penalty': 0.0,  # Set later if recovery occurred
+            'termination_reward': 0.0  # Set later if episode terminates
+        }
         
         # Store for backward compatibility (some methods might still use this)
         self.last_reward_breakdown = reward_breakdown
@@ -1573,95 +1251,15 @@ class DurotaxisEnv(gym.Env):
 
         self.topology.graph.ndata['pos'] = adjusted_positions
 
-    def _calculate_centroid_movement_reward(self, prev_state, new_state):
-        """
-        Calculate reward based on collective centroid movement to the right.
-        
-        This reward encourages the entire cell colony to migrate rightward as a group,
-        providing a strong signal for the primary goal of durotaxis.
-        
-        Args:
-            prev_state: Previous state dict containing graph_features with centroid
-            new_state: Current state dict containing graph_features with centroid
-            
-        Returns:
-            float: Positive reward for rightward movement, negative for leftward
-        """
-        if new_state['num_nodes'] == 0 or prev_state['num_nodes'] == 0:
-            return 0.0
-        
-        # Get centroid x-coordinates from graph features
-        prev_centroid_x = prev_state['graph_features'][3].item()
-        curr_centroid_x = new_state['graph_features'][3].item()
-        
-        # Calculate movement
-        centroid_movement = curr_centroid_x - prev_centroid_x
-        
-        # Apply reward multiplier
-        reward = centroid_movement * self.centroid_movement_reward
-        
-        return reward
-    
-    def _calculate_milestone_reward(self, new_state):
-        """
-        Calculate reward for reaching distance milestones.
-        
-        Provides progressive rewards as the agent reaches certain percentages
-        of the substrate width, creating intermediate goals that guide learning.
-        
-        Args:
-            new_state: Current state dict
-            
-        Returns:
-            float: Milestone reward if a new milestone is reached, 0.0 otherwise
-        """
-        if not hasattr(self, 'milestone_rewards') or not self.milestone_rewards.get('enabled', False):
-            return 0.0
-        
-        # Skip milestone rewards and printing when in centroid distance only mode
-        if self.centroid_distance_only_mode:
-            return 0.0
-        
-        if new_state['num_nodes'] == 0:
-            return 0.0
-        
-        # Get the rightmost node position
-        node_features = new_state['node_features']
-        max_x = max(node_features[:, 0]).item()
-        
-        substrate_width = self.substrate.width
-        progress_percent = (max_x / substrate_width) * 100
-        
-        # Check if we've reached a new milestone (track in episode)
-        if not hasattr(self, '_milestones_reached'):
-            self._milestones_reached = set()
-        
-        reward = 0.0
-        
-        # Check each milestone threshold
-        milestones = [
-            (25, 'distance_25_percent'),
-            (50, 'distance_50_percent'),
-            (75, 'distance_75_percent'),
-            (90, 'distance_90_percent')
-        ]
-        
-        for threshold, key in milestones:
-            if progress_percent >= threshold and threshold not in self._milestones_reached:
-                self._milestones_reached.add(threshold)
-                milestone_reward = self.milestone_rewards.get(key, 0.0)
-                reward += milestone_reward
-                print(f"🎯 MILESTONE REACHED! {threshold}% of substrate width! Reward: +{milestone_reward}")
-        
-        return reward
-    
     def _calculate_spawn_reward(self, prev_state, new_state, actions):
         """
         Calculate reward for durotaxis-based spawning.
         
-        Reward rule: If a node spawns a new node and the substrate intensity 
-        of the new node is >= delta_intensity higher than the spawning node,
-        then reward += spawn_success_reward, otherwise penalty -= spawn_failure_penalty
+        Unified behavior (same magnitude for both modes):
+        - Reward += spawn_success_reward if ΔI >= delta_intensity
+        - Penalty -= spawn_failure_penalty if ΔI < delta_intensity
+        - Uses same values from spawn_rewards config regardless of mode
+        - Includes PBRS shaping term when enabled
         
         Args:
             prev_state: Previous topology state
@@ -1680,6 +1278,10 @@ class DurotaxisEnv(gym.Env):
         if new_num_nodes == 0:
             return spawn_reward
         
+        # DEBUG: Count new nodes and check flag values
+        num_new_nodes = 0
+        all_new_node_flags = []
+        
         # Use new_node flag to identify newly spawned nodes
         # The new_node flag is the last feature in the node feature vector
         for node_idx in range(new_num_nodes):
@@ -1687,36 +1289,21 @@ class DurotaxisEnv(gym.Env):
                 node_feature_vector = new_node_features[node_idx]
                 
                 # Check if this is a newly spawned node (new_node flag = 1.0)
-                if len(node_feature_vector) > 0:
-                    new_node_flag = node_feature_vector[-1].item()  # Last feature is new_node flag
+                # Node features: [x, y, intensity, in_deg, out_deg, centrality, centroid_dist, boundary, new_node, age, stagnation]
+                # new_node is at index 8 (0-indexed), NOT the last feature
+                if len(node_feature_vector) > 8:
+                    new_node_flag = node_feature_vector[8].item()  # Index 8 is new_node flag
+                    all_new_node_flags.append(new_node_flag)
                     
                     if new_node_flag == 1.0:  # This is a newly spawned node
+                        num_new_nodes += 1
                         # Get substrate intensity (3rd feature, index 2)
                         if len(node_feature_vector) > 2:
                             new_node_intensity = node_feature_vector[2].item()
                             new_node_pos = node_feature_vector[:2]  # x, y coordinates
-                            new_node_y = new_node_pos[1].item()
                             
-                            # Check if spawned near boundary (boundary-aware spawning)
-                            if self.spawn_boundary_check:
-                                substrate_height = self.substrate.height
-                                
-                                # Calculate distance from top/bottom boundaries
-                                dist_from_top = new_node_y / substrate_height
-                                dist_from_bottom = (substrate_height - new_node_y) / substrate_height
-                                min_dist_to_boundary = min(dist_from_top, dist_from_bottom)
-                                
-                                # Apply penalties for spawning near boundaries
-                                if min_dist_to_boundary < self.danger_zone_threshold:  # Within 8% - danger zone
-                                    spawn_reward -= self.spawn_in_danger_zone_penalty
-                                    # print(f"⚠️ Spawn in DANGER ZONE! Y={new_node_y:.1f}, "
-                                    #       f"dist={min_dist_to_boundary:.2%} < {self.danger_zone_threshold:.2%}, "
-                                    #       f"penalty: -{self.spawn_in_danger_zone_penalty}")
-                                elif min_dist_to_boundary < self.edge_zone_threshold:  # Within 15% - edge zone
-                                    spawn_reward -= self.spawn_near_boundary_penalty
-                                    # print(f"⚠️ Spawn near boundary! Y={new_node_y:.1f}, "
-                                    #       f"dist={min_dist_to_boundary:.2%} < {self.edge_zone_threshold:.2%}, "
-                                    #       f"penalty: -{self.spawn_near_boundary_penalty}")
+                            # REFACTORED: Boundary checks removed in simplified system
+                            # Focus purely on intensity-based spawning
                             
                             # Find parent node from previous state by checking actions
                             # For now, we'll use spatial proximity as backup
@@ -1740,6 +1327,7 @@ class DurotaxisEnv(gym.Env):
                             if best_parent_intensity is not None:
                                 intensity_difference = new_node_intensity - best_parent_intensity
                                 
+                                # Use unified reward values (same magnitude for both modes)
                                 if intensity_difference >= self.delta_intensity:
                                     spawn_reward += self.spawn_success_reward
                                     # print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
@@ -1751,16 +1339,183 @@ class DurotaxisEnv(gym.Env):
                                     #       f"Parent intensity: {best_parent_intensity:.3f}, "
                                     #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
         
+        # DEBUG: Print spawn detection and reward
+        if not hasattr(self, '_debug_spawn_count'):
+            self._debug_spawn_count = 0
+            self._debug_no_spawn_count = 0
+        
+        # Add PBRS shaping term for simple_spawn_only_mode
+        if self.simple_spawn_only_mode and self._pbrs_spawn_enabled and self._pbrs_spawn_coeff != 0.0:
+            phi_prev = self._phi_spawn_potential(prev_state)
+            phi_new = self._phi_spawn_potential(new_state)
+            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
+            spawn_reward += self._pbrs_spawn_coeff * pbrs_shaping
+        
         return spawn_reward
+    
+    # ============================================================================
+    # POTENTIAL-BASED REWARD SHAPING (PBRS) - HELPER FUNCTIONS
+    # ============================================================================
+    
+    def _phi_delete_potential(self, state):
+        """
+        Compute potential function Phi(s) for delete reward shaping.
+        
+        Uses only current state (Markov property):
+        - pending_marked(s): count of nodes with to_delete=1 that still exist
+        - safe_unmarked(s): count of nodes with to_delete=0 that still exist
+        
+        Phi(s) = -w_pending * pending_marked(s) + w_safe * safe_unmarked(s)
+        
+        Deleting a marked node reduces pending_marked → Phi increases → positive shaping
+        Deleting an unmarked node reduces safe_unmarked → Phi decreases → negative shaping
+        
+        Args:
+            state: State dict containing 'to_delete' flags and node existence info
+            
+        Returns:
+            float: Potential value Phi(s)
+        """
+        try:
+            if state['num_nodes'] == 0:
+                return 0.0
+            
+            # Get to_delete flags from state
+            to_delete = state.get('to_delete', None)
+            if to_delete is None:
+                return 0.0
+            
+            # Convert to numpy for device-agnostic computation
+            if hasattr(to_delete, 'detach'):
+                to_delete_np = to_delete.detach().cpu().numpy()
+            else:
+                to_delete_np = np.asarray(to_delete)
+            
+            to_delete_np = to_delete_np.astype(np.float32)
+            
+            # All nodes in state exist (by definition)
+            pending_marked = float((to_delete_np > 0.5).sum())
+            safe_unmarked = float((to_delete_np <= 0.5).sum())
+            
+            phi = -self._pbrs_delete_w_pending * pending_marked + self._pbrs_delete_w_safe * safe_unmarked
+            return float(phi)
+            
+        except Exception as e:
+            # Fail gracefully
+            return 0.0
+    
+    def _phi_centroid_distance_potential(self, state):
+        """
+        Compute potential function Phi(s) for centroid distance shaping.
+        
+        Uses only current state (Markov property):
+        - centroid_x(s): Current x-coordinate of graph centroid
+        - goal_x: Target x-coordinate (rightmost substrate boundary)
+        
+        Phi(s) = -scale * (goal_x - centroid_x(s))
+        
+        Moving right reduces distance → Phi increases → positive shaping
+        Moving left increases distance → Phi decreases → negative shaping
+        
+        Args:
+            state: State dict containing centroid_x and goal_x
+            
+        Returns:
+            float: Potential value Phi(s)
+        """
+        try:
+            if state['num_nodes'] == 0:
+                return 0.0
+            
+            # Prefer explicit field, else derive from graph_features
+            if 'centroid_x' in state and state['centroid_x'] is not None:
+                centroid_x = float(state['centroid_x'])
+            else:
+                gf = state.get('graph_features', None)
+                if isinstance(gf, torch.Tensor) and gf.numel() >= 4:
+                    centroid_x = float(gf[3].item())
+                elif isinstance(gf, (list, tuple)) and len(gf) >= 4:
+                    centroid_x = float(gf[3])
+                else:
+                    return 0.0
+            
+            goal_x = float(getattr(self, 'goal_x', self.substrate.width - 1))
+            
+            # Distance to goal (negative potential, so moving closer increases Phi)
+            distance_to_goal = goal_x - centroid_x
+            phi = -self._pbrs_centroid_scale * distance_to_goal
+            
+            return float(phi)
+            
+        except Exception:
+            # Fail gracefully
+            return 0.0
+    
+    def _phi_spawn_potential(self, state):
+        """
+        Compute potential function Phi(s) for spawn reward shaping.
+        
+        Uses only current state (Markov property):
+        - spawnable_nodes(s): count of nodes on high-intensity substrate
+        - high-intensity: substrate_intensity >= spawn intensity threshold
+        
+        Phi(s) = w_spawnable * spawnable_nodes(s)
+        
+        Spawning on high-intensity substrate increases spawnable count → Phi increases → positive shaping
+        Spawning on low-intensity substrate doesn't increase count → no Phi change → no shaping bonus
+        
+        Args:
+            state: State dict containing node intensities
+            
+        Returns:
+            float: Potential value Phi(s)
+        """
+        try:
+            if state['num_nodes'] == 0:
+                return 0.0
+            
+            # Get intensities from state
+            intensities = state.get('intensity', None)
+            if intensities is None:
+                return 0.0
+            
+            # Convert to numpy for device-agnostic computation
+            if hasattr(intensities, 'detach'):
+                intensities_np = intensities.detach().cpu().numpy()
+            else:
+                intensities_np = np.asarray(intensities)
+            
+            intensities_np = intensities_np.astype(np.float32)
+            
+            # Count nodes with high substrate intensity (spawnable candidates)
+            # Use self.delta_intensity as threshold (same as spawn success criterion)
+            spawnable_count = float((intensities_np >= self.delta_intensity).sum())
+            
+            phi = self._pbrs_spawn_w_spawnable * spawnable_count
+            return float(phi)
+            
+        except Exception as e:
+            # Fail gracefully
+            return 0.0
+    
+    # ============================================================================
+    # REWARD CALCULATION FUNCTIONS
+    # ============================================================================
 
     def _calculate_delete_reward(self, prev_state, new_state, actions):
         """
         Calculate reward/penalty based on deletion compliance with to_delete flags.
         
-        Logic:
+        Logic (REVISED for simple_delete_only_mode):
         - If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
-        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence)
-        - If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper)
+        - If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence - RULE 1)
+        - If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper - RULE 2)
+        - If a node from previous topology was NOT marked (to_delete=0) AND still exists: +delete_reward (proper persistence)
+        
+        Tagging Strategy:
+        - At step t, if node's intensity < avg(all intensities), tag as to_delete=1 at step t+delta_time
+        - delta_time is configurable (default: 3)
+        - Only triggered when num_nodes > max_critical_nodes (signals need for deletion)
         
         Args:
             prev_state: Previous state dict containing topology
@@ -1768,7 +1523,7 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken this step
             
         Returns:
-            float: Delete reward (positive for proper deletions, negative for persistence/improper deletions)
+            float: Delete reward (positive for proper behavior, negative for violations)
         """
         delete_reward = 0.0
         
@@ -1800,9 +1555,7 @@ class DurotaxisEnv(gym.Env):
             if to_delete_flag.item() > 0.5:  # Node was marked for deletion
                 if node_was_deleted:
                     # Node was marked for deletion and was actually deleted - reward
-                    # In simple_delete_only_mode, we give 0 instead of positive reward
-                    if not self.simple_delete_only_mode:
-                        delete_reward += self.delete_proper_reward
+                    delete_reward += self.delete_proper_reward
                     # print(f"🟢 Delete reward! Node PID:{prev_persistent_id} was properly deleted (+{self.delete_proper_reward})")
                 else:
                     # Node was marked for deletion but still exists - penalty (RULE 1)
@@ -1813,136 +1566,23 @@ class DurotaxisEnv(gym.Env):
                     # Node was NOT marked but was deleted anyway - penalty (RULE 2)
                     delete_reward -= self.delete_improper_penalty
                     # print(f"🔴 Improper delete penalty! Node PID:{prev_persistent_id} was deleted without marking (-{self.delete_improper_penalty})")
-                # else: node not marked and still exists - neutral (expected behavior)
+                else:
+                    # Node was NOT marked and still exists - reward (proper persistence)
+                    delete_reward += self.delete_proper_reward
+                    # print(f"🟢 Proper persistence! Node PID:{prev_persistent_id} correctly kept (+{self.delete_proper_reward})")
+        
+        # ============================================================================
+        # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
+        # ============================================================================
+        # Add PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
+        # This biases learning toward compliant deletions without changing optimal policy
+        if self._pbrs_delete_enabled and self._pbrs_delete_coeff != 0.0:
+            phi_prev = self._phi_delete_potential(prev_state)
+            phi_new = self._phi_delete_potential(new_state)
+            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
+            delete_reward += self._pbrs_delete_coeff * pbrs_shaping
         
         return delete_reward
-    
-    def _calculate_deletion_efficiency_reward(self, prev_state, new_state):
-        """
-        Reward the agent for deleting old, stagnant, or strategically unimportant nodes.
-        
-        This "tidiness" reward encourages the agent to prune its network efficiently,
-        particularly targeting nodes that are:
-        - Old (existed for many steps without contributing)
-        - Stagnant (not moving/exploring)
-        - On low-quality substrate (marked by the heuristic system)
-        
-        Args:
-            prev_state: Previous state dict (using snapshots)
-            new_state: Current state dict (using snapshots)
-            
-        Returns:
-            float: Efficiency reward for smart deletions
-        """
-        # Use snapshot data instead of topology references
-        if prev_state['num_nodes'] == 0 or 'persistent_id' not in prev_state:
-            return 0.0
-
-        efficiency_reward = 0.0
-        
-        # Get persistent IDs from snapshots
-        prev_pids = set(prev_state['persistent_id'].cpu().tolist())
-        current_pids = set(new_state['persistent_id'].cpu().tolist()) if new_state['num_nodes'] > 0 else set()
-        
-        deleted_pids = prev_pids - current_pids
-
-        if not deleted_pids:
-            return 0.0
-
-        # Define reward multipliers (tuned for balanced learning)
-        AGE_REWARD_MULTIPLIER = 0.05      # Reward for deleting old nodes
-        STAGNATION_REWARD_MULTIPLIER = 0.1  # Reward for deleting stagnant nodes
-        
-        for pid in deleted_pids:
-            reward = 0.0
-            
-            # Reward for deleting old nodes (>50 steps old)
-            if pid in self._node_age and self._node_age[pid] > 50:
-                age_bonus = (self._node_age[pid] - 50) * AGE_REWARD_MULTIPLIER
-                reward += age_bonus
-
-            # Reward for deleting stagnant nodes (>20 steps without movement)
-            if pid in self._node_stagnation and self._node_stagnation[pid]['count'] > 20:
-                stagnation_bonus = (self._node_stagnation[pid]['count'] - 20) * STAGNATION_REWARD_MULTIPLIER
-                reward += stagnation_bonus
-            
-            if reward > 0:
-                # Optional: Debug logging (uncomment for debugging)
-                # print(f"🧹 Tidiness reward! Deleted node {pid} "
-                #       f"(Age: {self._node_age.get(pid, 0)}, "
-                #       f"Stagnant: {self._node_stagnation.get(pid, {}).get('count', 0)}). "
-                #       f"Reward: +{reward:.2f}")
-                efficiency_reward += reward
-                
-        return efficiency_reward
-
-    def _calculate_edge_reward(self, prev_state, new_state, actions):
-        """
-        Calculate reward/penalty based on edge directions to encourage rightward movement.
-        
-        Logic:
-        - For each edge, calculate direction vector from source to destination node
-        - If edge points rightward (positive x-direction): +edge_reward
-        - If edge points leftward (negative x-direction): -edge_reward
-        - Vertical edges (same x-coordinate) get no reward/penalty
-        
-        Args:
-            prev_state: Previous state dict (not used but kept for consistency)
-            new_state: Current state dict containing topology
-            actions: Actions taken this step (not used but kept for consistency)
-            
-        Returns:
-            float: Edge reward (positive for rightward bias, negative for leftward bias)
-        """
-        edge_reward = 0.0
-        
-        # Need current topology to analyze edges
-        if 'topology' not in new_state or new_state['topology'] is None:
-            return 0.0
-            
-        current_topology = new_state['topology']
-        
-        # Check if topology has any nodes and edges
-        if current_topology.graph.num_nodes() == 0 or current_topology.graph.num_edges() == 0:
-            return 0.0
-        
-        # Get node positions and edge information
-        node_positions = current_topology.graph.ndata['pos']  # Shape: [num_nodes, 2]
-        edges = current_topology.graph.edges()  # Returns (src_nodes, dst_nodes)
-        src_nodes, dst_nodes = edges
-        
-        rightward_edges = 0
-        leftward_edges = 0
-        
-        # Analyze each edge direction
-        for i in range(len(src_nodes)):
-            src_idx = src_nodes[i].item()
-            dst_idx = dst_nodes[i].item()
-            
-            # Get positions of source and destination nodes
-            src_pos = node_positions[src_idx]  # [x, y]
-            dst_pos = node_positions[dst_idx]  # [x, y]
-            
-            # Calculate direction vector
-            dx = dst_pos[0].item() - src_pos[0].item()  # x-direction component
-            
-            # Categorize edge direction
-            if dx > 0.01:  # Rightward (with small threshold to avoid numerical issues)
-                rightward_edges += 1
-                edge_reward += self.edge_rightward_bonus
-            elif dx < -0.01:  # Leftward
-                leftward_edges += 1
-                edge_reward -= self.edge_leftward_penalty
-            # If |dx| <= 0.01, consider it vertical/neutral (no reward/penalty)
-        
-        # Log edge direction analysis for debugging
-        if rightward_edges > 0 or leftward_edges > 0:
-            total_edges = current_topology.graph.num_edges()
-            # print(f"🔀 Edge analysis: {rightward_edges} rightward (+), {leftward_edges} leftward (-), "
-            #       f"{total_edges - rightward_edges - leftward_edges} vertical/neutral (0) "
-            #       f"| Reward: {edge_reward:.3f}")
-        
-        return edge_reward
 
     def _node_exists_in_topology(self, node_x, node_y, topology, tolerance=None):
         """
@@ -2521,21 +2161,16 @@ class DurotaxisEnv(gym.Env):
         self.empty_graph_recovery_last_step = None
         
         # OPTIMIZATION 2: Preallocate reward dict template to reduce per-step allocations
+        # Only includes components used in refactored system
         self._reward_components_template = {
             'total_reward': 0.0,
             'graph_reward': 0.0,
-            'spawn_reward': 0.0,
             'delete_reward': 0.0,
-            'deletion_efficiency_reward': 0.0,
-            'edge_reward': 0.0,
-            'centroid_reward': 0.0,
-            'milestone_reward': 0.0,
-            'node_rewards': [],
-            'total_node_reward': 0.0,
-            'survival_reward': 0.0,
+            'spawn_reward': 0.0,
+            'distance_signal': 0.0,
+            'num_nodes': 0,
             'empty_graph_recovery_penalty': 0.0,
-            'termination_reward': 0.0,
-            'num_nodes': 0
+            'termination_reward': 0.0
         }
         
         # Reset topology
@@ -2707,25 +2342,6 @@ class DurotaxisEnv(gym.Env):
             'persistent_ids_marked': marked_pids,
             'persistent_ids_safe': safe_pids
         }
-    
-    def get_kmeans_cache_stats(self):
-        """Get KMeans cache performance statistics."""
-        total_requests = self._cache_hit_count + self._cache_miss_count
-        hit_rate = (self._cache_hit_count / total_requests * 100) if total_requests > 0 else 0.0
-        
-        return {
-            'cache_hits': self._cache_hit_count,
-            'cache_misses': self._cache_miss_count,
-            'total_requests': total_requests,
-            'hit_rate_percent': hit_rate,
-            'cached_models_count': len(self._kmeans_cache)
-        }
-    
-    def clear_kmeans_cache(self):
-        """Clear the KMeans cache and reset statistics."""
-        self._kmeans_cache.clear()
-        self._cache_hit_count = 0
-        self._cache_miss_count = 0
 
     def get_encoder_cache_stats(self):
         """Get encoder observation cache performance statistics."""
@@ -2751,8 +2367,7 @@ class DurotaxisEnv(gym.Env):
 
     def close(self):
         """Clean up resources."""
-        # Clear all caches
-        self._kmeans_cache.clear()
+        # Clear edge index cache
         self._edge_index_cache = None
         
         if hasattr(self.topology, 'close'):

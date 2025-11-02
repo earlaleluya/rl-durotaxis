@@ -1,0 +1,272 @@
+// RL-Durotaxis System Architecture Flowchart (Refactored 5-Component System)
+// Visualizes the 5-component multi-head critic with weighted reward composition
+// To generate image: dot -Tpng rl_flowchart_color.dot -o rl_flowchart.png
+
+digraph RLDurotaxis {
+    rankdir=TB;
+    bgcolor="white";
+    node [shape=box, style="rounded,filled", fontname="Arial", fontsize=10];
+    edge [fontname="Arial", fontsize=9];
+    
+    // ===== CONFIG LAYER =====
+    subgraph cluster_config {
+        label="Configuration (config.yaml)";
+        color="#7a7a7a";
+        style="rounded,filled";
+        fillcolor="#e8ebf2";
+        
+        config [label=<
+            <b>Reward Weights</b> (Environment):<br/>
+            • delete: 1.0 (highest priority)<br/>
+            • spawn: 0.75 (medium priority)<br/>
+            • distance: 0.5 (lower priority)<br/>
+            <br/>
+            <b>Critic Weights</b> (Training):<br/>
+            • total: 1.0, graph: 0.4<br/>
+            • delete/spawn/distance: 0.3
+        >, fillcolor="white"];
+    }
+    
+    // ===== ENVIRONMENT LAYER =====
+    subgraph cluster_environment {
+        label="Environment (durotaxis_env.py)";
+        color="#5a5a5a";
+        style="rounded,filled";
+        fillcolor="#ffe6e6";
+        
+        state [label=<
+            <b>Graph State s<sub>t</sub></b><br/>
+            • Node features [N, 11]<br/>
+            • Edge features [E, 3]<br/>
+            • Graph features [19]
+        >, fillcolor="white"];
+        
+        action_apply [label=<
+            <b>Apply Actions</b><br/>
+            1. Delete leftmost (ratio)<br/>
+            2. Spawn nodes (γ,α,θ,n)<br/>
+            3. Update physics
+        >, fillcolor="#ffcccc"];
+        
+        reward_comp [label=<
+            <b>Compute 3 Core Rewards</b><br/>
+            <br/>
+            <font color="darkred"><b>Delete</b></font>: proper/improper/persistence<br/>
+            <font color="darkgreen"><b>Spawn</b></font>: success/failure/boundary<br/>
+            <font color="darkblue"><b>Distance</b></font>: centroid/milestones/terminal
+        >, fillcolor="#ffb3b3"];
+        
+        reward_weight [label=<
+            <b>Apply Env Weights</b><br/>
+            <br/>
+            total = 1.0·delete + 0.75·spawn + 0.5·distance<br/>
+            graph = total (alias)<br/>
+            <br/>
+            <b>Output: 5 components</b><br/>
+            {total, graph, delete, spawn, distance}
+        >, fillcolor="#ff9999"];
+        
+        next_state [label=<
+            <b>Transition</b><br/>
+            s<sub>t+1</sub>, r<sub>t</sub> [5], done, info
+        >, fillcolor="white"];
+    }
+    
+    // ===== NETWORK LAYER =====
+    subgraph cluster_network {
+        label="Neural Network (actor_critic.py + encoder.py)";
+        color="#5a5a5a";
+        style="rounded,filled";
+        fillcolor="#e6f3ff";
+        
+        encoder [label=<
+            <b>Graph Encoder</b><br/>
+            <br/>
+            • Feature projection<br/>
+            • 4-layer TransformerConv<br/>
+            • Edge-aware attention<br/>
+            <br/>
+            → embeddings [N+1, 128]
+        >, fillcolor="white"];
+        
+        actor [label=<
+            <b>Actor Network (Policy π)</b><br/>
+            <br/>
+            • ResNet18 backbone<br/>
+            • MLP head<br/>
+            <br/>
+            <b>Output:</b><br/>
+            • μ [N, 5], log_σ [N, 5]<br/>
+            <br/>
+            <b>Actions:</b><br/>
+            [delete_ratio, γ, α, noise, θ]
+        >, fillcolor="#cce5ff"];
+        
+        critic [label=<
+            <b>Critic Network (5 Heads)</b><br/>
+            <br/>
+            • ResNet18 backbone<br/>
+            • 5 independent MLP heads<br/>
+            <br/>
+            <b>Output V(s):</b><br/>
+            • V<sub>total</sub>, V<sub>graph</sub> (alias)<br/>
+            • V<sub>delete</sub>, V<sub>spawn</sub>, V<sub>distance</sub>
+        >, fillcolor="#99ccff"];
+    }
+    
+    // ===== PPO UPDATE LAYER =====
+    subgraph cluster_ppo {
+        label="PPO Training (train.py)";
+        color="#5a5a5a";
+        style="rounded,filled";
+        fillcolor="#e6ffe6";
+        
+        trajectory [label=<
+            <b>Trajectory Buffer</b><br/>
+            <br/>
+            Collect transitions:<br/>
+            (s, a, r [5], V [5], log_π, done)
+        >, fillcolor="white"];
+        
+        gae [label=<
+            <b>Per-Component GAE</b><br/>
+            <br/>
+            <u>For EACH component c separately:</u><br/>
+            1. Extract r<sub>t</sub><sup>c</sup> from reward dict<br/>
+            2. Extract V<sup>c</sup>(s) from critic head c<br/>
+            3. δ<sub>t</sub><sup>c</sup> = r<sub>t</sub><sup>c</sup> + γV<sup>c</sup>' - V<sup>c</sup><br/>
+            4. A<sub>t</sub><sup>c</sup> = Σ (γλ)<sup>l</sup> · δ<sub>t+l</sub><sup>c</sup><br/>
+            5. G<sub>t</sub><sup>c</sup> = A<sub>t</sub><sup>c</sup> + V<sup>c</sup><br/>
+            6. Normalize A<sub>t</sub><sup>c</sup> per component<br/>
+            <br/>
+            → 5 independent {returns, advantages}<br/>
+            <font color="darkgreen"><b>Benefit:</b> Component-specific learning!</font>
+        >, fillcolor="#ccffcc"];
+        
+        policy_loss [label=<
+            <b>Policy Loss</b><br/>
+            <br/>
+            <b>Weighted Advantage:</b><br/>
+            A<sub>weighted</sub> = Σ w<sub>i</sub> · A<sub>i</sub><br/>
+            (all 5 components)<br/>
+            <br/>
+            L<sub>policy</sub> = -mean(<br/>
+              min(ratio·A<sub>weighted</sub>,<br/>
+                  clip(ratio)·A<sub>weighted</sub>)<br/>
+            )
+        >, fillcolor="#99ff99"];
+        
+        value_loss [label=<
+            <b>Value Loss (Component-Specific)</b><br/>
+            <br/>
+            <u>For each component c:</u><br/>
+            L<sub>c</sub> = MSE(V<sub>c</sub>, G<sub>c</sub><sup>component</sup>)<br/>
+            <br/>
+            <font color="darkred">V<sub>spawn</sub> → G<sub>spawn</sub> (spawn-only)</font><br/>
+            <font color="darkblue">V<sub>delete</sub> → G<sub>delete</sub> (delete-only)</font><br/>
+            <br/>
+            L<sub>value</sub> = Σ w<sub>c</sub> · L<sub>c</sub><br/>
+            <br/>
+            <b>Weights:</b><br/>
+            total: 1.0, graph: 0.4, others: 0.3
+        >, fillcolor="#66ff66"];
+        
+        total_loss [label=<
+            <b>Total Loss</b><br/>
+            <br/>
+            L = L<sub>policy</sub> + L<sub>value</sub> - β·H(π)
+        >, fillcolor="#33ff33"];
+        
+        update [label=<
+            <b>Backpropagation</b><br/>
+            <br/>
+            Update actor &amp; critic<br/>
+            parameters (θ)
+        >, fillcolor="#00ff00"];
+    }
+    
+    // ===== METRICS =====
+    metrics [label=<
+        <b>Logging &amp; Metrics</b><br/>
+        <br/>
+        • Episode rewards (5 comp.)<br/>
+        • Loss components<br/>
+        • Network stats<br/>
+        • Checkpoint saves
+    >, shape=note, fillcolor="#ffffcc"];
+    
+    // ===== FLOW CONNECTIONS =====
+    
+    // Config → Components
+    config -> reward_weight [label="reward_weights", color=blue];
+    config -> value_loss [label="component_weights", color=blue];
+    
+    // Environment flow
+    state -> encoder [label="observation", color=black, penwidth=2];
+    encoder -> actor [label="embeddings", color=black];
+    encoder -> critic [label="embeddings", color=black];
+    
+    actor -> action_apply [label=<a<sub>t</sub> [N, 5]>, color=darkgreen, penwidth=2];
+    action_apply -> reward_comp [label="state changes", color=black];
+    reward_comp -> reward_weight [label="3 core rewards", color=orange];
+    reward_weight -> next_state [label="5 components", color=red, penwidth=2];
+    
+    critic -> trajectory [label=<V(s) [5]>, color=purple];
+    next_state -> trajectory [label=<r, s', done>, color=black];
+    actor -> trajectory [label=<a, log_π>, color=darkgreen];
+    
+    // PPO flow
+    trajectory -> gae [label="batch ready", color=black, penwidth=2];
+    gae -> policy_loss [label="advantages [5]", color=purple];
+    gae -> value_loss [label="returns [5]", color=purple];
+    
+    policy_loss -> total_loss [color=darkgreen];
+    value_loss -> total_loss [color=darkred];
+    total_loss -> update [label="gradient", color=black, penwidth=2];
+    
+    update -> actor [label="update θ", color=blue, style=dashed];
+    update -> critic [label="update θ", color=blue, style=dashed];
+    
+    // Metrics
+    trajectory -> metrics [style=dotted, color=gray];
+    total_loss -> metrics [style=dotted, color=gray];
+    
+    // Loop back
+    next_state -> state [label=<s ← s'>, color=gray, style=dashed];
+    
+    // ===== LEGEND =====
+    subgraph cluster_legend {
+        label="Key Points";
+        color="#5a5a5a";
+        style="rounded,filled";
+        fillcolor="#fffaf0";
+        
+        leg1 [label=<
+            <b>Priority Hierarchy:</b><br/>
+            Delete (1.0) &gt; Spawn (0.75) &gt; Distance (0.5)
+        >, shape=note, fillcolor="lightyellow"];
+        
+        leg2 [label=<
+            <b>graph_reward = total_reward</b><br/>
+            (explicit alias prevents<br/>
+            contradictory signals)
+        >, shape=note, fillcolor="lightcyan"];
+        
+        leg3 [label=<
+            <b>Policy Composition:</b><br/>
+            Uses weighted sum of<br/>
+            ALL 5 component advantages
+        >, shape=note, fillcolor="lightgreen"];
+        
+        leg4 [label=<
+            <b>Per-Component GAE (NEW):</b><br/>
+            Each critic head learns<br/>
+            component-specific values<br/>
+            → Agent can identify &amp;<br/>
+            improve weak components!
+        >, shape=note, fillcolor="lightpink"];
+    }
+    
+    // Position legend at bottom
+    {rank=same; metrics; leg1; leg2; leg3; leg4;}
+}

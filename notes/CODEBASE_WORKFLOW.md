@@ -9,8 +9,9 @@ This codebase implements a **Reinforcement Learning (RL) system** for simulating
 - **Graph Transformer Encoder:** PyTorch Geometric TransformerConv with edge-aware attention
 - **Edge Features (`edge_attr`):** 3D edge properties [distance, direction_x, direction_y] used in attention mechanism
 - **Continuous Action Space:** Delete-ratio architecture (5D: delete_ratio, gamma, alpha, noise, theta)
-- **Simplicial Embedding:** Optional geometric constraint layer for ablation studies
-- **Experimental Reward Modes:** Dense centroid-distance reward with adaptive terminal scaling
+- **Simplified Reward System:** Weighted composition of 3 core components (Delete > Spawn > Distance)
+- **Multi-Head Critic:** 5-head value function (total_reward, graph_reward, delete_reward, spawn_reward, distance_signal)
+- **Special Ablation Modes:** Configurable modes to isolate specific reward components for targeted studies
 
 ---
 
@@ -67,9 +68,8 @@ This codebase implements a **Reinforcement Learning (RL) system** for simulating
 config.yaml
     │
     ├─▶ trainer: Training parameters (episodes, learning rate, batch size)
-    ├─▶ environment: Environment setup (substrate size, node limits, rewards)
-    ├─▶ actor_critic: Network architecture (hidden dims, action spaces)
-    ├─▶ curriculum_learning: Progressive difficulty stages
+    ├─▶ environment: Env setup (substrate size, node limits, reward weights)
+    ├─▶ actor_critic: Network architecture (hidden dims, value components)
     ├─▶ algorithm: PPO parameters (gamma, GAE, clipping)
     └─▶ system: Device configuration (CUDA/CPU)
             │
@@ -89,7 +89,324 @@ config.yaml
 
 ---
 
-### 2. **Training Loop Architecture**
+### 2. **Reinforcement Learning Loop Flowchart**
+
+This diagram shows the detailed RL interaction cycle between the environment, actor-critic network, and PPO training:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    REINFORCEMENT LEARNING LOOP                           │
+│            (One Step: t → t+1 in Episode Trajectory)                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────┐
+                    │   ENVIRONMENT STATE     │
+                    │   s_t (at time t)       │
+                    │                         │
+                    │ • graph_features [19]   │
+                    │ • node_features [N, 11] │
+                    │ • edge_features [E, 3]  │
+                    │ • edge_index [2, E]     │
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+        ┌────────────────────────────────────────────────────────┐
+        │            GRAPH INPUT ENCODER                         │
+        │         (encoder.py: GraphInputEncoder)                │
+        │                                                         │
+        │  1. Feature Projection (MLP)                           │
+        │     node_features [N, 11] → [N, 128]                   │
+        │     edge_features [E, 3] → [E, 128]                    │
+        │     graph_features [19] → [1, 128] (virtual node)      │
+        │                                                         │
+        │  2. Graph Transformer (4 layers, TransformerConv)      │
+        │     Multi-head attention with edge_attr                │
+        │     Residual connections + LayerNorm + GELU            │
+        │                                                         │
+        │  3. Simplicial Embedding (Optional)                    │
+        │     Group-wise softmax constraint                      │
+        │                                                         │
+        │  OUTPUT: embeddings [N+1, 128]                         │
+        │    - graph_token [1, 128]                              │
+        │    - node_tokens [N, 128]                              │
+        └────────┬───────────────────────────┬───────────────────┘
+                 │                           │
+                 ▼                           ▼
+    ┌────────────────────────┐  ┌───────────────────────────┐
+    │        ACTOR           │  │         CRITIC            │
+    │  (Policy Network)      │  │    (Value Network)        │
+    │                        │  │                           │
+    │  Input: node_tokens +  │  │  Input: graph_token       │
+    │         graph_token    │  │                           │
+    │         [N+1, 128]     │  │         [1, 128]          │
+    │                        │  │                           │
+    │  1. ResNet18 Backbone  │  │  1. ResNet18 Backbone     │
+    │     (ImageNet init)    │  │     (ImageNet init)       │
+    │                        │  │                           │
+    │  2. MLP Head           │  │  2. MLP Head              │
+    │                        │  │                           │
+    │  OUTPUT:               │  │  OUTPUT:                  │
+    │  • μ [N, 5]           │  │  • V(s_t) = {             │
+    │  • log_σ [N, 5]       │  │      'total_reward'       │
+    │                        │  │      'graph_reward'       │
+    │  Continuous params:    │  │      'spawn_reward'       │
+    │  [delete_ratio, γ,     │  │      'delete_reward'      │
+    │   α, noise, θ]        │  │      'distance_signal'    │
+    │                        │  │    }                      │
+    │                        │  │    (graph=total alias)    │
+    └───────────┬────────────┘  │  Multi-component values   │
+                │                │  [1, 5]                   │
+                │                └───────────┬───────────────┘
+                │                            │
+                ▼                            │
+    ┌────────────────────────┐              │
+    │   POLICY π(a_t|s_t)   │              │
+    │                        │              │
+    │  1. Build Normal Dist. │              │
+    │     N(μ, exp(log_σ))  │              │
+    │                        │              │
+    │  2. Sample Actions     │              │
+    │     a_t ~ π(·|s_t)    │              │
+    │     a_t = [delete_ratio│              │
+    │            γ, α,       │              │
+    │            noise, θ]   │              │
+    │     [N, 5]             │              │
+    │                        │              │
+    │  3. Compute Log Prob   │              │
+    │     log π(a_t|s_t)    │              │
+    │                        │              │
+    │  4. Compute Entropy    │              │
+    │     H(π) = 0.5*log(2πe│              │
+    │            * σ²)       │              │
+    │     (encourages        │              │
+    │      exploration)      │              │
+    └───────────┬────────────┘              │
+                │                            │
+                │  a_t, log π(a_t|s_t), H   │  V(s_t)
+                │                            │
+                └─────────────┬──────────────┘
+                              │
+                              ▼
+                    ┌──────────────────────┐
+                    │    ENVIRONMENT       │
+                    │  env.step(a_t)       │
+                    │                      │
+                    │  1. Apply delete_ratio│
+                    │     (remove leftmost) │
+                    │                      │
+                    │  2. Apply spawn      │
+                    │     (γ,α,noise,θ)    │
+                    │                      │
+                    │  3. Update physics   │
+                    │                      │
+                    │  4. Compute rewards  │
+                    │                      │
+                    │  5. Check done       │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+            ┌──────────────────────────────────────┐
+            │         ENVIRONMENT OUTPUTS          │
+            │                                      │
+            │  • s_{t+1}: Next state               │
+            │  • r_t: Reward (5 components)        │
+            │    {total_reward, graph_reward,      │
+            │     spawn_reward, delete_reward,     │
+            │     distance_signal}                 │
+            │    Note: graph = total (alias)       │
+            │  • done: Episode termination flag    │
+            │  • info: Additional metadata         │
+            └──────────────┬───────────────────────┘
+                           │
+                           ▼
+            ┌────────────────────────────────────────┐
+            │      STORE TRANSITION IN BUFFER        │
+            │                                        │
+            │  trajectory.add_step(                  │
+            │    state=s_t,                          │
+            │    action=a_t,                         │
+            │    reward=r_t,                         │
+            │    value=V(s_t),                       │
+            │    log_prob=log π(a_t|s_t),           │
+            │    done=done                           │
+            │  )                                     │
+            └────────────┬───────────────────────────┘
+                         │
+                         ▼
+        ┌─────────────────────────────────────────────┐
+        │  AFTER COLLECTING BATCH OF EPISODES         │
+        │  (Every rollout_batch_size episodes)        │
+        └─────────────────────────────────────────────┘
+                         │
+                         ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │  COMPUTE PER-COMPONENT ADVANTAGES & RETURNS              │
+        │  (Generalized Advantage Estimation - GAE)                │
+        │                                                           │
+        │  **PER-COMPONENT GAE** (NEW IMPLEMENTATION):             │
+        │                                                           │
+        │  For EACH component c in {total, graph, spawn,           │
+        │                           delete, distance}:             │
+        │                                                           │
+        │  1. Extract component-specific rewards r_t^c             │
+        │     (from reward dict for each timestep)                 │
+        │                                                           │
+        │  2. Extract component-specific values V^c(s_t)           │
+        │     (from critic's 5 independent value heads)            │
+        │                                                           │
+        │  3. Compute TD errors δ_t^c:                             │
+        │     δ_t^c = r_t^c + γ*V^c(s_{t+1}) - V^c(s_t)           │
+        │                                                           │
+        │  4. Compute GAE advantages A_t^c:                        │
+        │     A_t^c = Σ_{l=0}^∞ (γλ)^l * δ_{t+l}^c                │
+        │     (exponentially weighted sum of component TD errors)  │
+        │                                                           │
+        │  5. Compute returns G_t^c:                               │
+        │     G_t^c = A_t^c + V^c(s_t)                             │
+        │     (component-specific advantage + baseline)            │
+        │                                                           │
+        │  6. Normalize advantages per component:                  │
+        │     A_t^c = (A_t^c - mean(A^c)) / (std(A^c) + ε)        │
+        │     (separate normalization for each component)          │
+        │                                                           │
+        │  **RESULT**: 5 independent {returns, advantages} dicts   │
+        │    returns[component] = List[Tensor]                     │
+        │    advantages[component] = List[Tensor]                  │
+        │                                                           │
+        │  **BENEFIT**: Critic learns component-specific values    │
+        │    • spawn_value head → spawn-only returns               │
+        │    • delete_value head → delete-only returns             │
+        │    → Agent can identify weak components & improve!       │
+        └─────────────────────────┬───────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              PPO POLICY UPDATE (4 epochs)                 │
+        │         For each minibatch in trajectory buffer:          │
+        └──────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │                 RE-EVALUATE ACTIONS                       │
+        │                                                            │
+        │  Feed s_t through network again:                          │
+        │    new_log_prob, new_values, entropy = network.evaluate_  │
+        │                                         actions(s_t, a_t)  │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              COMPUTE PPO POLICY LOSS                      │
+        │                                                            │
+        │  1. Compute probability ratio:                            │
+        │     ratio = exp(new_log_prob - old_log_prob)              │
+        │           = π_new(a_t|s_t) / π_old(a_t|s_t)              │
+        │                                                            │
+        │  2. Compute clipped surrogate objective:                  │
+        │     L_clip = min(                                         │
+        │       ratio * A_t,                    # Unclipped         │
+        │       clip(ratio, 1-ε, 1+ε) * A_t    # Clipped (ε=0.1)  │
+        │     )                                                     │
+        │                                                            │
+        │  3. Policy loss (negative to maximize):                   │
+        │     L_policy = -mean(L_clip)                              │
+        │                                                            │
+        │  (Clipping prevents too large policy updates)             │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │         COMPUTE VALUE LOSS (Multi-Component)              │
+        │                                                            │
+        │  For each reward component c:                             │
+        │                                                            │
+        │  1. Unclipped value loss:                                 │
+        │     L_v_unclipped^c = (G_t^c - V_new^c(s_t))²            │
+        │                                                            │
+        │  2. Clipped value loss:                                   │
+        │     V_clipped^c = V_old^c(s_t) +                          │
+        │                   clip(V_new^c - V_old^c, -ε_v, +ε_v)    │
+        │     L_v_clipped^c = (G_t^c - V_clipped^c)²               │
+        │                                                            │
+        │  3. Take maximum (conservative update):                   │
+        │     L_value^c = max(L_v_unclipped^c, L_v_clipped^c)      │
+        │                                                            │
+        │  4. Weighted sum across components:                       │
+        │     L_value = Σ_c weight_c * L_value^c                    │
+        │                                                            │
+        │  (Clipping stabilizes value function training)            │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │              COMPUTE ENTROPY BONUS                        │
+        │                                                            │
+        │  L_entropy = -entropy_coeff * H(π)                        │
+        │                                                            │
+        │  (Negative entropy = encourages exploration)              │
+        │  (Higher entropy = more random actions)                   │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │               COMPUTE TOTAL LOSS                          │
+        │                                                            │
+        │  L_total = L_policy +                                     │
+        │            value_loss_coeff * L_value +                   │
+        │            entropy_coeff * L_entropy                      │
+        │                                                            │
+        │  Typical coefficients:                                    │
+        │    value_loss_coeff = 0.5                                 │
+        │    entropy_coeff = 0.01                                   │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │            BACKPROPAGATION & OPTIMIZATION                 │
+        │                                                            │
+        │  1. optimizer.zero_grad()                                 │
+        │                                                            │
+        │  2. L_total.backward()                                    │
+        │     (compute gradients ∇θ L_total)                        │
+        │                                                            │
+        │  3. Check for NaN/Inf in gradients                        │
+        │     (safety check, skip update if detected)               │
+        │                                                            │
+        │  4. Gradient clipping:                                    │
+        │     clip_grad_norm_(parameters, max_norm=0.5)             │
+        │     (prevents exploding gradients)                        │
+        │                                                            │
+        │  5. optimizer.step()                                      │
+        │     θ_new = θ_old - learning_rate * ∇θ L_total           │
+        │     (update network parameters)                           │
+        └─────────────────────────┬────────────────────────────────┘
+                                  │
+                                  ▼
+                    ┌──────────────────────────┐
+                    │   UPDATED POLICY & VALUE │
+                    │      NETWORKS (θ_new)    │
+                    │                          │
+                    │   Ready for next episode │
+                    └──────────────────────────┘
+```
+
+**Key Notation:**
+- `s_t`: State at time t
+- `a_t`: Action at time t  
+- `r_t`: Reward at time t
+- `V(s_t)`: Value function (state value estimate)
+- `π(a_t|s_t)`: Policy (probability of action a_t given state s_t)
+- `A_t`: Advantage (how much better is action a_t compared to average)
+- `G_t`: Return (cumulative discounted future reward)
+- `H(π)`: Entropy (measure of policy randomness/exploration)
+- `γ`: Discount factor (0.99)
+- `λ`: GAE lambda (0.95)
+- `ε`: PPO clip epsilon (0.1)
+- `θ`: Network parameters
+
+---
+
+### 3. **Training Loop Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -186,7 +503,7 @@ config.yaml
 
 ---
 
-### 3. **Environment Workflow (DurotaxisEnv)**
+### 4. **Environment Workflow (DurotaxisEnv)**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -235,63 +552,35 @@ STEP FUNCTION WORKFLOW:
   ┌─────────────────────────────────────────────────────────┐
   │ 3. COMPUTE REWARD COMPONENTS                             │
   │                                                           │
-  │    **EXPERIMENTAL REWARD MODES** (mutually exclusive):   │
+  │    **SIMPLIFIED REWARD SYSTEM**:                         │
   │                                                           │
-  │    A) NORMAL MODE (default):                             │
-  │       All standard reward components enabled             │
+  │    Three core components with explicit priority:         │
   │                                                           │
-  │    B) CENTROID DISTANCE ONLY MODE:                       │
-  │       environment.centroid_distance_only_mode: true      │
-  │       ├─▶ Dense delta-distance reward: scale × (cx_t - cx_{t-1}) / goal_x │
-  │       ├─▶ Potential-based shaping (preserves optimal policy) │
-  │       ├─▶ Terminal rewards scaled down (×0.02) to avoid domination │
-  │       └─▶ Adaptive scheduler: reduces terminal scale as progress improves │
+  │    A) DELETE REWARD (weight: 1.0) - Highest priority     │
+  │       ├─▶ Proper deletion bonus (remove leftmost)        │
+  │       ├─▶ Improper deletion penalty                      │
+  │       └─▶ Persistence penalty (keeping flagged nodes)    │
   │                                                           │
-  │    C) SIMPLE DELETE-ONLY MODE (deprecated):              │
-  │       environment.simple_delete_only_mode: true          │
-  │       Only penalties + termination rewards               │
+  │    B) SPAWN REWARD (weight: 0.75) - Medium priority      │
+  │       ├─▶ Spawn success reward                           │
+  │       ├─▶ Spawn failure penalty                          │
+  │       └─▶ Near-boundary spawn penalty                    │
   │                                                           │
-  │    ─────────────────────────────────────────────────────│
-  │    NORMAL MODE REWARDS:                                  │
+  │    C) DISTANCE SIGNAL (weight: 0.5) - Lower priority     │
+  │       ├─▶ Centroid movement (rightward progress)         │
+  │       ├─▶ Milestone rewards (25%, 50%, 75%, 90%)         │
+  │       └─▶ Termination rewards (success/failure)          │
   │                                                           │
-  │    Graph Rewards:                                        │
-  │    ├─▶ connectivity_penalty (nodes < 2)                  │
-  │    ├─▶ growth_penalty (nodes > max_critical_nodes)       │
-  │    ├─▶ survival_reward (per step)                        │
-  │    └─▶ centroid_movement_reward (rightward progress)     │
+  │    Total reward composition:                             │
+  │    total_reward = 1.0*delete + 0.75*spawn + 0.5*distance │
+  │    graph_reward = total_reward (explicit alias)          │
   │                                                           │
-  │    Node Rewards:                                         │
-  │    ├─▶ movement_reward (rightward movement per node)     │
-  │    ├─▶ intensity_bonus/penalty (substrate interaction)   │
-  │    ├─▶ leftward_penalty (discourage left movement)       │
-  │    └─▶ position_rewards (boundary awareness + safe zones)│
-  │                                                           │
-  │    Edge Rewards:                                         │
-  │    ├─▶ rightward_bonus (edges pointing right)            │
-  │    └─▶ leftward_penalty (edges pointing left)            │
-  │                                                           │
-  │    Delete Rewards (delete_ratio action):                 │
-  │    ├─▶ proper_deletion_reward (delete leftmost nodes)    │
-  │    ├─▶ persistence_penalty (keeping flagged nodes)       │
-  │    └─▶ improper_deletion_penalty (delete non-flagged)    │
-  │                                                           │
-  │    Spawn Rewards (via gamma/alpha/noise/theta):          │
-  │    ├─▶ spawn_success_reward                              │
-  │    ├─▶ spawn_failure_penalty                             │
-  │    └─▶ spawn_near_boundary_penalty (prevent risky spawns)│
-  │                                                           │
-  │    Milestone Rewards:                                    │
-  │    ├─▶ distance_25_percent: +50.0 (reached 25% of width) │
-  │    ├─▶ distance_50_percent: +150.0 (reached 50%)         │
-  │    ├─▶ distance_75_percent: +300.0 (reached 75%)         │
-  │    └─▶ distance_90_percent: +500.0 (almost at goal)      │
-  │                                                           │
-  │    Termination Rewards:                                  │
-  │    ├─▶ success_reward: +500.0 (reached goal!)            │
-  │    ├─▶ out_of_bounds_penalty: -100.0 (boundary violation)│
-  │    ├─▶ no_nodes_penalty: -100.0 (lost all nodes)         │
-  │    ├─▶ leftward_drift_penalty: -50.0 (persistent left)   │
-  │    └─▶ timeout_penalty: 0.0 (no penalty for exploration) │
+  │    **SPECIAL ABLATION MODES**:                           │
+  │    Configurable modes to isolate components for study:   │
+  │    - Centroid distance only mode                         │
+  │    - Delete-only mode                                    │
+  │    - Spawn-only mode                                     │
+  │    (See reward_mode CLI guide for details)               │
   └─────────────────────────────────────────────────────────┘
         │
         ▼
@@ -325,7 +614,7 @@ STEP FUNCTION WORKFLOW:
 
 ---
 
-### 4. **Neural Network Architecture**
+### 5. **Neural Network Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -392,15 +681,15 @@ INPUT: Graph State
 │       │         │  │       │         │    │  encoder output     │
 │       ▼         │  │       ▼         │    │  before Actor/Critic│
 │  ┌──────────┐  │  │  ┌──────────┐  │    │                     │
-│  │ ResNet18 │  │  │  │ ResNet18 │  │    │  WSA: Deprecated    │
-│  │ Backbone │  │  │  │ Backbone │  │    │  (not in current    │
-│  │(ImageNet)│  │  │  │(ImageNet)│  │    │   config)           │
-│  └────┬─────┘  │  │  └────┬─────┘  │    │                     │
-│       │         │  │       │         │    │  ResNet Freezing:   │
-│       ▼         │  │       ▼         │    │  - freeze_mode      │
-│  ┌──────────┐  │  │  ┌──────────┐  │    │    options: none,   │
-│  │   MLP    │  │  │  │   MLP    │  │    │    all, until_layer3│
-│  │(hidden=128)│  │  │ (hidden=128)│  │    │    last_block      │
+│  │ ResNet18 │  │  │  │ ResNet18 │  │    │  ResNet Freezing:   │
+│  │ Backbone │  │  │  │ Backbone │  │    │  - freeze_mode      │
+│  │(ImageNet)│  │  │  │(ImageNet)│  │    │    options: none,   │
+│  └────┬─────┘  │  │  └────┬─────┘  │    │    all, until_layer3│
+│       │         │  │       │         │    │    last_block       │
+│       ▼         │  │       ▼         │    │                     │
+│  ┌──────────┐  │  │  ┌──────────┐  │    │  Input Adapter:     │
+│  │   MLP    │  │  │  │   MLP    │  │    │  - repeat3: RGB     │
+│  │(hidden=128)│  │  │ (hidden=128)│  │    │  - 1ch_conv: Conv1x1│
 │  └────┬─────┘  │  │  └────┬─────┘  │    │                     │
 │       │         │  │       │         │    │  Input Adapter:     │
 │       ▼         │  │       ▼         │    │  - repeat3: RGB    │
@@ -408,14 +697,14 @@ INPUT: Graph State
 │  │ Outputs: │  │  │  │ Outputs: │  │    └─────────────────────┘
 │  │          │  │  │  │          │  │
 │  │continuous│  │  │  │  values  │  │
-│  │   mu     │  │  │  │  (6 comp)│  │
+│  │   mu     │  │  │  │  (5 comp)│  │
 │  │  [N, 5]  │  │  │  │          │  │
 │  │          │  │  │  │ - total  │  │
 │  │continuous│  │  │  │ - graph  │  │
-│  │  logstd  │  │  │  │ - spawn  │  │
-│  │  [N, 5]  │  │  │  │ - delete │  │
-│  │          │  │  │  │ - edge   │  │
-│  │          │  │  │  │ - node   │  │
+│  │  logstd  │  │  │  │   (alias)│  │
+│  │  [N, 5]  │  │  │  │ - spawn  │  │
+│  │          │  │  │  │ - delete │  │
+│  │          │  │  │  │ -distance│  │
 │  │          │  │  │  │          │  │
 │  └──────────┘  │  │  └──────────┘  │
 └─────────────────┘  └─────────────────┘
@@ -433,13 +722,13 @@ ACTOR OUTPUT PROCESSING:
       └─ Stage 2: Learn all 5 continuous actions (delete_ratio + spawn params)
 
 CRITIC OUTPUT:
-  └─▶ value_predictions: dict with 6 components
+  └─▶ value_predictions: dict with 5 components (graph=total alias)
       - Used for multi-objective advantage estimation
 ```
 
 ---
 
-### 5. **Policy Update (PPO with Value Clipping)**
+### 6. **Policy Update (PPO with Value Clipping)**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -452,8 +741,8 @@ INPUT: Minibatch of transitions
   ├─ actions: [B, ...]
   ├─ old_log_probs: [B]
   ├─ advantages: [B]
-  ├─ returns: [B, 6]  (6 reward components)
-  └─ old_values: [B, 6]
+  ├─ returns: [B, 5]  (5 reward components)
+  └─ old_values: [B, 5]
 
         │
         ▼
@@ -465,7 +754,7 @@ INPUT: Minibatch of transitions
 │     ├─ discrete_log_probs: [B]                                  │
 │     ├─ continuous_log_probs: [B]                                │
 │     ├─ total_log_probs: [B]                                     │
-│     ├─ value_predictions: [B, 6]                                │
+│     ├─ value_predictions: [B, 5]                                │
 │     └─ entropy: scalar                                           │
 └─────────────────────────────────────────────────────────────────┘
         │
@@ -543,7 +832,7 @@ INPUT: Minibatch of transitions
 
 ---
 
-### 6. **Curriculum Learning System**
+### 7. **Curriculum Learning System**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -644,7 +933,7 @@ PROGRESSION LOGIC:
 
 ---
 
-### 7. **Key Data Structures**
+### 8. **Key Data Structures**
 
 ```python
 # State Dictionary (observations)
@@ -672,30 +961,28 @@ action_bounds = {
     'theta': [-0.5236, 0.5236]         # Migration angle (-π/6 to π/6, -30° to +30°)
 }
 
-# Reward Dictionary (multi-component)
+# Reward Dictionary (5 components, graph=total alias)
 rewards = {
-    'total_reward': float,
-    'graph_reward': float,
-    'spawn_reward': float,
-    'delete_reward': float,
-    'edge_reward': float,
-    'total_node_reward': float
+    'total_reward': float,              # Weighted sum (1.0*d + 0.75*s + 0.5*dist)
+    'graph_reward': float,              # Explicit alias of total_reward
+    'spawn_reward': float,              # Spawn component (weight: 0.75)
+    'delete_reward': float,             # Delete component (weight: 1.0)
+    'distance_signal': float            # Distance component (weight: 0.5)
 }
 
-# Value Predictions (multi-component)
+# Value Predictions (5 independent heads)
 value_predictions = {
-    'total_reward': torch.Tensor,       # [1]
-    'graph_reward': torch.Tensor,       # [1]
-    'spawn_reward': torch.Tensor,       # [1]
-    'delete_reward': torch.Tensor,      # [1]
-    'edge_reward': torch.Tensor,        # [1]
-    'total_node_reward': torch.Tensor   # [1]
+    'total_reward': torch.Tensor,       # [1] - Critic weight: 1.0
+    'graph_reward': torch.Tensor,       # [1] - Critic weight: 0.4
+    'spawn_reward': torch.Tensor,       # [1] - Critic weight: 0.3
+    'delete_reward': torch.Tensor,      # [1] - Critic weight: 0.3
+    'distance_signal': torch.Tensor     # [1] - Critic weight: 0.3
 }
 ```
 
 ---
 
-### 8. **File Organization & Responsibilities**
+### 9. **File Organization & Responsibilities**
 
 | File | Responsibility | Key Classes/Functions |
 |------|---------------|----------------------|
@@ -710,12 +997,11 @@ value_predictions = {
 | **config.yaml** | Configuration parameters | N/A (YAML) |
 | **config_loader.py** | Configuration parsing | `ConfigLoader` |
 | **curriculum_learning.py** | Progressive difficulty stages | `CurriculumManager` |
-| **pretrained_fusion.py** | WSA multi-PTM fusion (optional) | `WeightSharingAttention` |
 | **plotter.py** | Visualization and plotting | Plotting utilities |
 
 ---
 
-### 9. **Training Execution Flow**
+### 10. **Training Execution Flow**
 
 ```bash
 # Command Line
@@ -781,12 +1067,147 @@ $ python train_cli.py --total-episodes 2000 --learning-rate 0.0003
 
 ---
 
+## Per-Component GAE Implementation (2025-11-01)
+
+### Overview
+
+The training system now uses **per-component Generalized Advantage Estimation (GAE)** instead of scalar total-reward GAE. This enables the critic's value heads to learn component-specific value estimates, allowing the agent to identify and improve on weak reward components.
+
+### Architecture
+
+```
+TrajectoryBuffer.compute_returns_and_advantages_for_all_episodes()
+│
+├─ For EACH reward component c in {total, graph, spawn, delete, distance}:
+│   │
+│   ├─ Extract component rewards: r_t^c from reward dict
+│   ├─ Extract component values: V^c(s_t) from critic head
+│   │
+│   ├─ Compute TD errors: δ_t^c = r_t^c + γ*V^c(s_{t+1}) - V^c(s_t)
+│   ├─ Compute GAE advantages: A_t^c = Σ_{l=0}^∞ (γλ)^l * δ_{t+l}^c
+│   ├─ Compute returns: G_t^c = A_t^c + V^c(s_t)
+│   └─ Normalize: A_t^c = (A_t^c - mean(A^c)) / (std(A^c) + ε)
+│
+└─ Store as dicts:
+    episode['returns'][component] = List[Tensor]
+    episode['advantages'][component] = List[Tensor]
+```
+
+### Data Flow
+
+**Before (Scalar GAE)**:
+```python
+# Single scalar GAE computation
+rewards_tensor = [r['total_reward'] for r in rewards]  # [T]
+advantages = compute_gae(rewards_tensor, values)  # [T]
+returns = advantages + values  # [T]
+
+# Duplicated to all components
+for component in components:
+    returns_dict[component] = returns  # Same value!
+    advantages_dict[component] = advantages  # Same value!
+```
+
+**After (Per-Component GAE)**:
+```python
+# Separate GAE per component
+for component in ['total', 'graph', 'spawn', 'delete', 'distance']:
+    rewards_c = [r[component] for r in rewards]  # Component-specific
+    values_c = [v[component] for v in values]    # Component-specific
+    
+    advantages_c = compute_gae(rewards_c, values_c)  # Independent GAE
+    returns_c = advantages_c + values_c
+    
+    returns_dict[component] = returns_c  # Different per component!
+    advantages_dict[component] = advantages_c  # Different per component!
+```
+
+### Training Impact
+
+**Critic Training**:
+- `spawn_value` head → trained on `G_t^spawn` (spawn-only returns)
+- `delete_value` head → trained on `G_t^delete` (delete-only returns)
+- Each head learns what its component is actually worth
+
+**Policy Learning**:
+- Advantages are weighted-combined: `A_weighted = Σ w_i * A_i`
+- Policy gradient uses all components, but now with accurate per-component signals
+- Agent can identify: "My delete rewards are low, I should improve deletion"
+
+### Example Scenario
+
+**Before**: Agent with poor deletion
+```
+Episode rewards: spawn=+20, delete=-10, total=+10
+All value heads predict: ~10
+
+Critic: "Everything is worth ~10"
+Policy: "Total is positive, keep doing what I'm doing" ❌
+```
+
+**After**: Same agent
+```
+Episode rewards: spawn=+20, delete=-10, total=+10
+spawn_value predicts: +20 ✓
+delete_value predicts: -10 ✓
+
+Critic: "Spawn is valuable (+20), delete is bad (-10)"
+Policy: "Delete component is negative, adjust delete behavior" ✅
+```
+
+### Code Changes
+
+**Key files modified**:
+1. `train.py::TrajectoryBuffer.compute_returns_and_advantages_for_all_episodes()`
+   - Added `component_names` parameter
+   - Loop over components instead of single scalar computation
+   - Store results as dicts instead of lists
+
+2. `train.py::TrajectoryBuffer.get_batch_data()`
+   - Return `returns` and `advantages` as dicts
+   - Handle per-component concatenation across episodes
+
+3. `train.py::TrajectoryBuffer.create_minibatches()`
+   - Preserve dict structure when creating minibatches
+   - Slice component-wise lists correctly
+
+4. `train.py::update_policy_minibatch()`
+   - Accept dict-structured returns/advantages
+   - Stack per-component tensors
+   - No longer duplicate scalar values
+
+### Testing
+
+**Test file**: `tools/test_per_component_training.py`
+
+Verifies:
+- Returns/advantages are dicts with per-component structure
+- Component-specific values differ (spawn ≠ delete)
+- Batch data and minibatches preserve structure
+
+**Test output**:
+```
+Component-specific returns at step 0:
+  Spawn return:  15.415
+  Delete return: 11.021
+✅ Component-specific returns are different
+```
+
+---
+
 ## Key Design Patterns
 
-### 1. **Multi-Component Value Learning**
-- Separate value heads for 6 reward components
-- Adaptive weighting based on component variance
-- Attention-based dynamic weighting
+### 1. **Multi-Component Value Learning with Per-Component GAE**
+- Separate value heads for 5 reward components:
+  - total_reward, graph_reward (alias), delete_reward, spawn_reward, distance_signal
+- **Per-component GAE computation** (NEW):
+  - Each component gets independent TD errors, advantages, and returns
+  - spawn_value head trained on spawn-only returns
+  - delete_value head trained on delete-only returns
+  - Enables agent to identify and improve weak components
+- Environment priority weights: delete=1.0 > spawn=0.75 > distance=0.5
+- Critic learning weights: total=1.0, graph=0.4, others=0.3
+- Policy uses weighted composition of ALL component advantages
 - Value clipping for stable PPO updates
 
 ### 2. **Delete-Ratio Action Architecture (Current)**
@@ -802,13 +1223,16 @@ $ python train_cli.py --total-episodes 2000 --learning-rate 0.0003
 - **Enriched features:** 19 graph-level, 11 node-level, 3 edge-level dimensions
 - **Optional Simplicial Embedding (SEM):** Group-wise softmax for geometric constraints
 
-### 4. **Experimental Reward Modes**
-- **Normal Mode:** Full reward structure (graph, node, edge, spawn, delete, milestones)
-- **Centroid Distance Only Mode:** Dense delta-distance reward with adaptive terminal scaling
-  - Potential-based shaping preserves optimal policy
-  - Adaptive scheduler reduces terminal reward scale as progress improves
-  - Config: `environment.centroid_distance_only_mode: true`
-- **Simple Delete-Only Mode (Deprecated):** Penalties + termination only
+### 4. **Reward System Architecture**
+- **Core Components:** 3 weighted components (Delete, Spawn, Distance)
+  - Environment priority weights: delete=1.0 > spawn=0.75 > distance=0.5
+  - Critic learning weights: total=1.0, graph=0.4, others=0.3
+  - graph_reward = total_reward (explicit alias prevents contradictory signals)
+- **Special Ablation Modes:** Configurable modes to isolate components:
+  - Centroid distance only mode: `environment.centroid_distance_only_mode: true`
+  - Delete-only mode: Isolate deletion behavior
+  - Spawn-only mode: Isolate spawning behavior
+  - (See REWARD_MODE_CLI_GUIDE.md for detailed usage)
 
 ### 5. **Curriculum Learning**
 - 3 progressive stages with adaptive transitions

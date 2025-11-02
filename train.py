@@ -124,12 +124,14 @@ class TrajectoryBuffer:
             'values': [],
             'old_values': [],  # Store old values for PPO value clipping
             'log_probs': [],
+            'continuous_mu': [],      # Store mu for proper KL divergence
+            'continuous_std': [],     # Store std for proper KL divergence
             'final_values': None,
             'terminated': False,
             'success': False
         }
     
-    def add_step(self, state, action, reward, value, log_prob, old_value=None):
+    def add_step(self, state, action, reward, value, log_prob, old_value=None, continuous_mu=None, continuous_std=None):
         """Add a step to the current episode"""
         self.current_episode['states'].append(state)
         self.current_episode['actions'].append(action)
@@ -137,6 +139,8 @@ class TrajectoryBuffer:
         self.current_episode['values'].append(value)
         self.current_episode['old_values'].append(old_value if old_value is not None else value)
         self.current_episode['log_probs'].append(log_prob)
+        self.current_episode['continuous_mu'].append(continuous_mu)
+        self.current_episode['continuous_std'].append(continuous_std)
     
     def finish_episode(self, final_values, terminated, success):
         """Finish the current episode and add it to the buffer"""
@@ -146,7 +150,7 @@ class TrajectoryBuffer:
         self.episodes.append(self.current_episode)
     
     def get_batch_data(self):
-        """Get all trajectories as batch data"""
+        """Get all trajectories as batch data with per-component returns/advantages"""
         if not self.episodes:
             return None
             
@@ -157,8 +161,12 @@ class TrajectoryBuffer:
         all_values = []
         all_old_values = []
         all_log_probs = []
-        all_returns = []
-        all_advantages = []
+        all_continuous_mu = []
+        all_continuous_std = []
+        
+        # Per-component returns and advantages (dict of lists)
+        all_returns = {}
+        all_advantages = {}
         
         for episode in self.episodes:
             all_states.extend(episode['states'])
@@ -167,8 +175,28 @@ class TrajectoryBuffer:
             all_values.extend(episode['values'])
             all_old_values.extend(episode['old_values'])
             all_log_probs.extend(episode['log_probs'])
-            all_returns.extend(episode['returns'])
-            all_advantages.extend(episode['advantages'])
+            all_continuous_mu.extend(episode['continuous_mu'])
+            all_continuous_std.extend(episode['continuous_std'])
+            
+            # Handle per-component returns and advantages
+            if isinstance(episode['returns'], dict):
+                # Per-component structure
+                for component, component_returns in episode['returns'].items():
+                    if component not in all_returns:
+                        all_returns[component] = []
+                    all_returns[component].extend(component_returns)
+                
+                for component, component_advantages in episode['advantages'].items():
+                    if component not in all_advantages:
+                        all_advantages[component] = []
+                    all_advantages[component].extend(component_advantages)
+            else:
+                # Legacy scalar structure - convert to dict with 'total_reward' key
+                if 'total_reward' not in all_returns:
+                    all_returns['total_reward'] = []
+                    all_advantages['total_reward'] = []
+                all_returns['total_reward'].extend(episode['returns'])
+                all_advantages['total_reward'].extend(episode['advantages'])
         
         return {
             'states': all_states,
@@ -177,12 +205,14 @@ class TrajectoryBuffer:
             'values': all_values,
             'old_values': all_old_values,
             'log_probs': all_log_probs,
-            'returns': all_returns,
-            'advantages': all_advantages
+            'continuous_mu': all_continuous_mu,
+            'continuous_std': all_continuous_std,
+            'returns': all_returns,  # Dict[component_name, List[Tensor]]
+            'advantages': all_advantages  # Dict[component_name, List[Tensor]]
         }
     
     def create_minibatches(self, minibatch_size: int):
-        """Create random minibatches from the buffer data"""
+        """Create random minibatches from the buffer data with per-component structure"""
         batch_data = self.get_batch_data()
         if not batch_data:
             return []
@@ -198,132 +228,127 @@ class TrajectoryBuffer:
             
             minibatch = {}
             for key, data in batch_data.items():
-                minibatch[key] = [data[idx] for idx in batch_indices]
+                if key in ['returns', 'advantages']:
+                    # Handle per-component dict structure
+                    minibatch[key] = {}
+                    for component, component_data in data.items():
+                        minibatch[key][component] = [component_data[idx] for idx in batch_indices]
+                else:
+                    # Regular list data
+                    minibatch[key] = [data[idx] for idx in batch_indices]
             
             minibatches.append(minibatch)
         
         return minibatches
     
-    def compute_returns_and_advantages_for_all_episodes(self, gamma: float, gae_lambda: float):
+    def compute_returns_and_advantages_for_all_episodes(self, gamma: float, gae_lambda: float, component_names: List[str] = None):
         """
-        OPTIMIZATION 4: GPU-vectorized GAE computation for all episodes.
-        Preallocates tensors and keeps computation on device for better performance.
+        PER-COMPONENT GAE: Compute returns and advantages separately for each reward component.
+        
+        This allows the critic's value heads to learn component-specific value estimates,
+        enabling the agent to improve on specific components (e.g., if delete_reward is lacking,
+        the agent can learn to prioritize actions that improve deletion).
+        
+        Args:
+            gamma: Discount factor
+            gae_lambda: GAE lambda parameter
+            component_names: List of component names to compute returns for
         """
+        if component_names is None:
+            component_names = ['total_reward', 'graph_reward', 'spawn_reward', 'delete_reward', 'edge_reward', 'total_node_reward']
+        
         for episode in self.episodes:
             rewards = episode['rewards']
             values = episode['values']
             final_values = episode['final_values']
             terminated = episode['terminated']
 
-            # Extract tensor from dict if needed
-            processed_values = []
-            for v in values:
-                if isinstance(v, dict):
-                    # Try 'total_value' first, fallback to 'total_reward', else error
-                    if 'total_value' in v:
-                        processed_values.append(v['total_value'])
-                    elif 'total_reward' in v:
-                        processed_values.append(v['total_reward'])
-                    else:
-                        raise ValueError(f"Value dict missing 'total_value' and 'total_reward': {v}")
-                else:
-                    processed_values.append(v)
-
             # Early exit for empty episodes
-            if not processed_values:
-                episode['returns'] = []
-                episode['advantages'] = []
+            if not values or not rewards:
+                episode['returns'] = {comp: [] for comp in component_names}
+                episode['advantages'] = {comp: [] for comp in component_names}
                 continue
 
-            # OPTIMIZATION 4a: Convert everything to tensors on device immediately
             T = len(rewards)
             device = self.device
             
-            # Preallocate tensors on device
-            values_tensor = torch.stack([v.to(device) if isinstance(v, torch.Tensor) else torch.tensor(v, device=device) 
-                                        for v in processed_values])
-            rewards_tensor = torch.tensor([r.get('total_reward', 0.0) if isinstance(r, dict) else r 
-                                          for r in rewards], device=device, dtype=torch.float32)
+            # Initialize per-component returns and advantages as dicts
+            episode['returns'] = {comp: [] for comp in component_names}
+            episode['advantages'] = {comp: [] for comp in component_names}
             
-            # Handle final value
-            if isinstance(final_values, dict):
-                if 'total_value' in final_values:
-                    final_value = final_values['total_value']
-                elif 'total_reward' in final_values:
-                    final_value = final_values['total_reward']
-                else:
-                    final_value = torch.tensor(0.0, device=device)
-            else:
-                final_value = final_values if final_values is not None else torch.tensor(0.0, device=device)
-            
-            # Ensure final_value is on device
-            if isinstance(final_value, torch.Tensor):
-                final_value = final_value.to(device)
-            else:
-                final_value = torch.tensor(final_value, device=device, dtype=torch.float32)
-            
-            # Ensure final_value has the same shape as values_tensor entries
-            # If values_tensor is 2D [T, num_components], final_value should match
-            if values_tensor.dim() > 1:
-                # Multi-dimensional values - ensure final_value matches
-                if final_value.dim() == 0:  # Scalar
-                    final_value = final_value.unsqueeze(0).expand(values_tensor.shape[1])
-                elif final_value.dim() == 1 and final_value.shape[0] != values_tensor.shape[1]:
-                    # Wrong size - pad or truncate
-                    if final_value.shape[0] == 1:
-                        final_value = final_value.expand(values_tensor.shape[1])
-                    else:
-                        # This shouldn't happen, but handle gracefully
-                        final_value = final_value[:values_tensor.shape[1]]
-            else:
-                # 1D values - ensure final_value is scalar
-                if final_value.dim() > 0:
-                    final_value = final_value.mean()  # Collapse to scalar
-
-            # OPTIMIZATION 4b: Vectorized GAE computation on GPU
-            # Preallocate output tensors
-            returns = torch.empty(T, device=device, dtype=torch.float32)
-            advantages = torch.empty(T, device=device, dtype=torch.float32)
-            
-            # Compute next values vector
-            # Handle both 1D and 2D values_tensor
-            if values_tensor.dim() == 1:
-                # Simple 1D case
-                next_values = torch.cat([values_tensor[1:], final_value.unsqueeze(0)])
-            else:
-                # 2D case: [T, num_components]
-                # Expand final_value to [1, num_components] to match
-                final_value_expanded = final_value.unsqueeze(0)
-                next_values = torch.cat([values_tensor[1:], final_value_expanded], dim=0)
-                # For GAE, we need scalar values, so take mean/sum across components
-                # Use the first component (total_value) or mean
-                values_tensor = values_tensor.mean(dim=1) if values_tensor.shape[1] > 1 else values_tensor.squeeze(1)
-                next_values = next_values.mean(dim=1) if next_values.shape[1] > 1 else next_values.squeeze(1)
-            
-            if terminated:
-                next_values[-1] = 0.0  # Zero out bootstrap if terminated
-            
-            # Vectorized backward pass for GAE
-            gae = torch.tensor(0.0, device=device, dtype=torch.float32)
-            for t in range(T - 1, -1, -1):
-                # TD error: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
-                delta = rewards_tensor[t] + gamma * next_values[t] - values_tensor[t]
+            # Compute GAE separately for each component
+            for component in component_names:
+                # Extract component-specific rewards
+                component_rewards = torch.tensor(
+                    [r.get(component, 0.0) if isinstance(r, dict) else 0.0 for r in rewards],
+                    device=device, dtype=torch.float32
+                )
                 
-                # GAE: A_t = δ_t + γλ * A_{t+1}
-                gae = delta + gamma * gae_lambda * gae
-                advantages[t] = gae
-                returns[t] = gae + values_tensor[t]
-
-            # OPTIMIZATION 4c: Normalize advantages on GPU
-            if T > 0:
-                adv_mean = advantages.mean()
-                adv_std = advantages.std(unbiased=False)
-                adv_std = torch.clamp(adv_std, min=1e-8)
-                advantages = (advantages - adv_mean) / adv_std
-
-            # Convert to list for backward compatibility (but keep tensors)
-            episode['returns'] = [returns[i] for i in range(T)]
-            episode['advantages'] = [advantages[i] for i in range(T)]
+                # Extract component-specific values
+                component_values = []
+                for v in values:
+                    if isinstance(v, dict):
+                        component_values.append(v.get(component, 0.0))
+                    else:
+                        # Fallback: use total value if dict not available
+                        component_values.append(v if component == 'total_reward' else 0.0)
+                
+                component_values = torch.stack([
+                    torch.tensor(cv, device=device, dtype=torch.float32).squeeze() if not isinstance(cv, torch.Tensor)
+                    else cv.to(device).squeeze() 
+                    for cv in component_values
+                ])
+                
+                # Handle final value for this component
+                if isinstance(final_values, dict):
+                    final_value = final_values.get(component, 0.0)
+                else:
+                    final_value = final_values if final_values is not None and component == 'total_reward' else 0.0
+                
+                if isinstance(final_value, torch.Tensor):
+                    final_value = final_value.to(device).squeeze()
+                else:
+                    final_value = torch.tensor(final_value, device=device, dtype=torch.float32).squeeze()
+                
+                # Ensure final_value is scalar (0-dim tensor)
+                if final_value.dim() > 0:
+                    final_value = final_value.squeeze()
+                
+                # Preallocate output tensors for this component
+                returns = torch.empty(T, device=device, dtype=torch.float32)
+                advantages = torch.empty(T, device=device, dtype=torch.float32)
+                
+                # Build next_values vector - ensure both parts are 1D
+                if final_value.dim() == 0:
+                    next_values = torch.cat([component_values[1:], final_value.unsqueeze(0)])
+                else:
+                    # If final_value somehow still has dimensions, handle it
+                    next_values = torch.cat([component_values[1:], final_value.flatten()[:1]])
+                
+                if terminated:
+                    next_values[-1] = 0.0  # Terminal state has zero value
+                
+                # Vectorized backward pass for GAE
+                gae = torch.tensor(0.0, device=device, dtype=torch.float32)
+                for t in range(T - 1, -1, -1):
+                    # TD error: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
+                    delta = component_rewards[t] + gamma * next_values[t] - component_values[t]
+                    
+                    # GAE: A_t = δ_t + γλ * A_{t+1}
+                    gae = delta + gamma * gae_lambda * gae
+                    advantages[t] = gae
+                    returns[t] = gae + component_values[t]
+                
+                # Normalize advantages for this component
+                if T > 0:
+                    adv_mean = advantages.mean()
+                    adv_std = advantages.std(unbiased=False)
+                    adv_std = torch.clamp(adv_std, min=1e-8)
+                    advantages = (advantages - adv_mean) / adv_std
+                
+                # Store as lists of tensors for backward compatibility
+                episode['returns'][component] = [returns[i] for i in range(T)]
+                episode['advantages'][component] = [advantages[i] for i in range(T)]
     
     def clear(self):
         """Clear all episodes from the buffer"""
@@ -569,6 +594,23 @@ class DurotaxisTrainer:
         self.enable_value_clipping = config.get('enable_value_clipping', True)
         self.value_clip_epsilon = config.get('value_clip_epsilon', 0.2)
         
+        # FIX: Use relative value clipping if enabled (more robust for varying return scales)
+        self.use_relative_value_clip = config.get('use_relative_value_clip', True)
+        if self.use_relative_value_clip and self.value_clip_epsilon < 1.0:
+            # Interpret small epsilon as relative (e.g., 0.2 = 20% of old value)
+            print(f"   Using relative value clipping: ±{self.value_clip_epsilon*100}% of old value")
+        elif not self.use_relative_value_clip and self.value_clip_epsilon < 10.0:
+            # Warn if absolute clipping with small epsilon (likely misconfigured)
+            print(f"   ⚠️  WARNING: Absolute value clipping with small epsilon ({self.value_clip_epsilon}) may be too restrictive!")
+            print(f"   Consider setting value_clip_epsilon > 100 or enabling use_relative_value_clip")
+        
+        # Return normalization configuration (prevents value loss explosion)
+        self.normalize_returns = config.get('normalize_returns', True)
+        self.return_scale = config.get('return_scale', 10.0)  # Scale normalized returns to this magnitude
+        if self.normalize_returns:
+            print(f"   Return normalization enabled (scale={self.return_scale})")
+
+        
         # Adaptive gradient scaling configuration
         gradient_config = config.get('gradient_scaling', {})
         self.enable_gradient_scaling = gradient_config.get('enable_adaptive_scaling', True)
@@ -695,15 +737,16 @@ class DurotaxisTrainer:
             dropout_rate=actor_critic_config.get('dropout_rate', 0.1)
         ).to(self.device)
         
+        # Validate component weights match network value heads
+        self.network.validate_component_weights(self.component_weights)
+        
         # Enhanced Learnable Component Weighting System
         self._initialize_learnable_weights()
         
-        # Optimizer (includes learnable weights)
+        # Optimizer (includes learnable weights and LR scheduler)
         self.learning_rate = config.get('learning_rate', 3e-4)
         self._build_optimizer()
-        
-        # Learning rate scheduler for long runs
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=500)
+        # Note: lr_scheduler is now created in _build_optimizer() with warmup + cosine decay
         
         # Training tracking - initialize before potential checkpoint loading
         self.episode_rewards = defaultdict(list)
@@ -734,6 +777,10 @@ class DurotaxisTrainer:
         
         # Episode history for model selection (rolling window)
         self.episode_history = []  # List of dicts with {success, final_centroid_x, goal_x, return}
+        
+        # Update tracking for warmup and scheduling
+        self.global_update_steps = 0  # Total number of optimizer.step() calls
+        self._param_snapshot = None  # For tracking parameter changes
         
         # Adaptive terminal scale scheduler (for distance mode optimization)
         # Gradually reduces terminal reward influence as rightward progress becomes consistent
@@ -798,8 +845,7 @@ class DurotaxisTrainer:
             'graph_reward': [],
             'spawn_reward': [],
             'delete_reward': [],
-            'edge_reward': [],
-            'total_node_reward': [],
+            'distance_signal': [],
             'total_reward': []
         }
 
@@ -955,6 +1001,28 @@ class DurotaxisTrainer:
         # Create main optimizer with parameter groups
         self.optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), weight_decay=0.0)
         
+        # Create LR warmup + decay scheduler
+        import math
+        trainer_config = self.config_loader.get_trainer_config()
+        self.lr_warmup_updates = trainer_config.get('lr_warmup_updates', 200)
+        self.lr_total_updates = trainer_config.get('lr_total_updates', 10000)
+        self.warmup_updates_for_best = trainer_config.get('warmup_updates_for_best', 5)
+        
+        def lr_lambda(update_step):
+            """Linear warmup to step W, then cosine decay"""
+            W = self.lr_warmup_updates
+            T = self.lr_total_updates
+            
+            if update_step < W:
+                # Linear warmup from 0.001 to 1.0
+                return max(update_step / max(1, W), 1e-3)
+            # Cosine decay from 1.0 to 0.55 after warmup
+            progress = min(1.0, (update_step - W) / max(1, T - W))
+            return 0.55 + 0.45 * (1.0 + math.cos(math.pi * progress)) / 2.0
+        
+        from torch.optim.lr_scheduler import LambdaLR
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda)
+        
         # Print optimizer configuration
         print("\n" + "="*70)
         print("🎓 OPTIMIZER CONFIGURATION")
@@ -966,6 +1034,7 @@ class DurotaxisTrainer:
             print(f"  Group: {group_name}")
             print(f"    LR: {group_lr:.6f}")
             print(f"    Parameters: {group_params:,}")
+        print(f"\n📈 LR Schedule: Warmup {self.lr_warmup_updates} steps → Cosine decay over {self.lr_total_updates} steps")
         print("="*70 + "\n")
     
     def create_action_mask(self, state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
@@ -1028,6 +1097,92 @@ class DurotaxisTrainer:
             else:
                 stats['std'] = 1.0
     
+    def validate_reward_components(self, reward_components: Dict[str, float], step_info: str = "") -> None:
+        """
+        Validate reward components from environment to ensure consistency.
+        
+        Guards against:
+        1. Legacy components (edge_reward, total_node_reward) being returned
+        2. Missing expected components
+        3. graph_reward != total_reward inconsistency
+        4. Unexpected components from environment
+        
+        Args:
+            reward_components: Dict of reward components from env.step()
+            step_info: Optional context string for error messages (e.g., "Episode 5, Step 12")
+        
+        Raises:
+            ValueError: If validation fails
+        """
+        if not hasattr(self, '_env_validation_enabled'):
+            # Check config for validation flag (default: False for production, True for debugging)
+            trainer_config = self.config_loader.config.get('trainer', {})
+            self._env_validation_enabled = trainer_config.get('validate_env_rewards', False)
+        
+        if not self._env_validation_enabled:
+            return  # Validation disabled
+        
+        # Expected components (from config)
+        expected_components = set(self.component_names)
+        
+        # Actual components (from environment)
+        actual_components = set(reward_components.keys())
+        
+        # Allowed extra components (not in component_names but OK to have)
+        allowed_extras = {'milestone_bonus', 'termination_reward', 'termination_reward_scaled', 
+                          'empty_graph_recovery_penalty', 'num_nodes'}
+        
+        # Legacy components that should NOT be present
+        legacy_components = {'edge_reward', 'total_node_reward'}
+        
+        # Check 1: Detect legacy components
+        found_legacy = actual_components & legacy_components
+        if found_legacy:
+            raise ValueError(
+                f"❌ ENV VALIDATION ERROR {step_info}: "
+                f"Legacy components found in environment output: {found_legacy}\n"
+                f"   These components should NOT be returned by the environment.\n"
+                f"   Check durotaxis_env.py reward_breakdown construction."
+            )
+        
+        # Check 2: Verify all expected components are present (excluding allowed extras)
+        missing_components = expected_components - actual_components
+        if missing_components:
+            raise ValueError(
+                f"❌ ENV VALIDATION ERROR {step_info}: "
+                f"Missing expected components: {missing_components}\n"
+                f"   Expected: {expected_components}\n"
+                f"   Actual: {actual_components}\n"
+                f"   Check durotaxis_env.py ensures all components in reward_breakdown."
+            )
+        
+        # Check 3: Detect unexpected components (not expected and not allowed extras)
+        unexpected_components = actual_components - expected_components - allowed_extras
+        if unexpected_components:
+            print(
+                f"⚠️  ENV VALIDATION WARNING {step_info}: "
+                f"Unexpected components in environment output: {unexpected_components}\n"
+                f"   Expected: {expected_components}\n"
+                f"   Allowed extras: {allowed_extras}\n"
+                f"   Actual: {actual_components}"
+            )
+        
+        # Check 4: Verify graph_reward == total_reward (must be exactly equal)
+        if 'total_reward' in reward_components and 'graph_reward' in reward_components:
+            total = float(reward_components['total_reward'])
+            graph = float(reward_components['graph_reward'])
+            
+            # Allow tiny floating point differences
+            if abs(total - graph) > 1e-6:
+                raise ValueError(
+                    f"❌ ENV VALIDATION ERROR {step_info}: "
+                    f"graph_reward != total_reward inconsistency!\n"
+                    f"   total_reward: {total}\n"
+                    f"   graph_reward: {graph}\n"
+                    f"   difference: {abs(total - graph)}\n"
+                    f"   Check durotaxis_env.py ensures graph_reward = total_reward."
+                )
+
     def get_component_scaling_factors(self) -> Dict[str, float]:
         """
         Tier 2 Scaling: Cross-episode adaptive scaling factors
@@ -2285,7 +2440,7 @@ class DurotaxisTrainer:
         
         return is_successful, success_criteria
     
-    def collect_episode(self, episode_num: int = 0) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], bool, bool]:
+    def collect_episode(self, episode_num: int = 0) -> Tuple[List[Dict], List[torch.Tensor], List[Dict], List[Dict], List[Dict], List[torch.Tensor], List[torch.Tensor], Optional[Dict], bool, bool]:
         """Collect one episode of experience with curriculum learning support"""
         # Apply curriculum learning configuration
         curriculum_config = self._get_curriculum_config(episode_num)
@@ -2303,8 +2458,7 @@ class DurotaxisTrainer:
             'graph_reward': [],
             'spawn_reward': [],
             'delete_reward': [],
-            'edge_reward': [],
-            'total_node_reward': [],
+            'distance_signal': [],
             'total_reward': []
         }
         
@@ -2323,6 +2477,8 @@ class DurotaxisTrainer:
         rewards = []
         values = []
         log_probs_list = []
+        continuous_mu_list = []
+        continuous_std_list = []
         
         obs, info = self.env.reset()
         # Update state extractor with current topology
@@ -2411,6 +2567,10 @@ class DurotaxisTrainer:
                     'total': log_probs
                 })
                 
+                # Store distribution parameters for proper KL divergence computation
+                continuous_mu_list.append(output['continuous_mu'])
+                continuous_std_list.append(output['continuous_std'])
+                
                 # Get node positions sorted by x-coordinate for delete ratio strategy
                 node_features = state_dict['node_features']
                 node_positions = [(i, node_features[i][0].item() if isinstance(node_features[i][0], torch.Tensor) else node_features[i][0]) 
@@ -2460,6 +2620,12 @@ class DurotaxisTrainer:
             # Environment step
             next_obs, reward_components, terminated, truncated, info = self.env.step(0)
             done = terminated or truncated
+            
+            # Validate reward components (optional, controlled by config flag)
+            self.validate_reward_components(
+                reward_components, 
+                step_info=f"(Episode {episode_num}, Step {episode_length})"
+            )
 
             # Track environment-side empty graph recoveries for logging consistency
             if info.get('empty_graph_recovered'):
@@ -2538,7 +2704,7 @@ class DurotaxisTrainer:
             # Negative termination rewards indicate failures (penalties)
             success = termination_reward > 0
         
-        return states, actions_taken, rewards, values, log_probs_list, final_values, terminated, success
+        return states, actions_taken, rewards, values, log_probs_list, continuous_mu_list, continuous_std_list, final_values, terminated, success
     
     def compute_returns_and_advantages(self, rewards: List[Dict], values: List[Dict], 
                                      final_values: Optional[Dict] = None, terminated: bool = False,
@@ -2607,6 +2773,14 @@ class DurotaxisTrainer:
             # Safe normalization of component advantages (critical for stability)
             component_advantages = safe_standardize(component_advantages, eps=1e-8)
             
+            # FIX: Normalize returns to prevent value loss explosion
+            # Returns can grow very large (1000+) causing value loss to explode
+            # Normalize to reasonable scale while preserving relative differences
+            if self.normalize_returns:
+                component_returns = safe_standardize(component_returns, eps=1e-8)
+                # Re-scale to typical return magnitude to help value network learning
+                component_returns = component_returns * self.return_scale
+            
             returns[component] = component_returns
             advantages[component] = component_advantages
         
@@ -2614,7 +2788,9 @@ class DurotaxisTrainer:
     
     def compute_hybrid_policy_loss(self, old_log_probs_dict: Dict[str, torch.Tensor], 
                                   eval_output: Dict[str, torch.Tensor], 
-                                  advantage: float, episode: int = 0) -> Dict[str, torch.Tensor]:
+                                  advantage: float, episode: int = 0, 
+                                  old_mu: Optional[torch.Tensor] = None, 
+                                  old_std: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Compute policy loss for continuous actions (delete ratio architecture) with PPO clipping"""
         policy_losses = {}
         
@@ -2644,8 +2820,22 @@ class DurotaxisTrainer:
             old_continuous_log_prob = old_log_probs_dict['continuous']
             new_continuous_log_prob = eval_output['continuous_log_probs']
             
-            # Approximate KL divergence: KL ≈ E[log π_old - log π_new] (device-agnostic)
-            approx_kl_continuous = (old_continuous_log_prob - new_continuous_log_prob).clamp_min(0.0)
+            # Exact KL divergence using PyTorch's built-in kl_divergence for Normal distributions
+            # KL(π_old || π_new) = sum over dims of: 0.5 * (log(σ_new²/σ_old²) + (σ_old² + (μ_old - μ_new)²)/σ_new² - 1)
+            if old_mu is not None and old_std is not None and 'continuous_mu' in eval_output and 'continuous_std' in eval_output:
+                new_mu = eval_output['continuous_mu']
+                new_std = eval_output['continuous_std']
+                
+                # Create Normal distributions
+                old_dist = torch.distributions.Normal(old_mu, old_std)
+                new_dist = torch.distributions.Normal(new_mu, new_std)
+                
+                # Compute exact KL divergence (sum over action dimensions)
+                approx_kl_continuous = torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1)
+            else:
+                # Fallback: use log probability difference (less accurate but still works)
+                # Note: This is only an approximation and can be negative, but we keep it for backwards compatibility
+                approx_kl_continuous = (old_continuous_log_prob - new_continuous_log_prob)
             
             # Clamp log prob difference to prevent exp overflow
             log_prob_diff = torch.clamp(new_continuous_log_prob - old_continuous_log_prob, -20.0, 20.0)
@@ -2726,7 +2916,8 @@ class DurotaxisTrainer:
     
     def update_policy(self, states: List[Dict], actions: List[Dict], 
                      returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
-                     old_log_probs: List[Dict], episode: int = 0) -> Dict[str, float]:
+                     old_log_probs: List[Dict], continuous_mu: List[torch.Tensor], 
+                     continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
         """Update policy using PPO with efficient batched re-evaluation and enhanced entropy"""
         if not states or not actions:
             return {}
@@ -2811,8 +3002,12 @@ class DurotaxisTrainer:
             advantage = total_advantages[i]
             
             # Compute hybrid policy loss with continuous-only handling
+            # Pass old distribution parameters for proper KL divergence
+            old_mu = continuous_mu[i] if i < len(continuous_mu) else None
+            old_std = continuous_std[i] if i < len(continuous_std) else None
+            
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
-                old_log_probs_dict, eval_output, advantage, episode
+                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std
             )
             
             hybrid_policy_losses.append(hybrid_loss_dict)
@@ -2883,8 +3078,11 @@ class DurotaxisTrainer:
             losses['entropy_bonus'] = 0.0
         
         # === TOTAL LOSS AND OPTIMIZATION ===
-        total_loss = avg_total_policy_loss + 0.5 * total_value_loss + avg_entropy_loss + entropy_bonus
+        # FIX: Reduce value loss weight to prevent value loss from dominating training
+        value_loss_weight = 0.25  # Down from 0.5 to reduce impact of large value losses
+        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss + entropy_bonus
         losses['total_loss'] = total_loss.item()
+        losses['value_loss_weight'] = value_loss_weight
         
         # Update learnable component weights based on policy performance
         self.update_learnable_weights(advantages, avg_total_policy_loss)
@@ -2916,47 +3114,68 @@ class DurotaxisTrainer:
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
         self.optimizer.step()
         
+        # Step LR scheduler after optimizer update
+        if hasattr(self, 'lr_scheduler'):
+            self.lr_scheduler.step()
+        
+        # Increment global update counter
+        self.global_update_steps += 1
+        
         return losses
 
     def update_policy_minibatch(self, states: List[Dict], actions: List[Dict], 
-                               returns: List[torch.Tensor], advantages: List[torch.Tensor],
-                               old_log_probs: List[Dict], old_values: List[Dict], episode: int = 0) -> Dict[str, float]:
-        """Update policy using a minibatch of data from the trajectory buffer"""
+                               returns: Dict[str, List[torch.Tensor]], advantages: Dict[str, List[torch.Tensor]],
+                               old_log_probs: List[Dict], old_values: List[Dict], continuous_mu: List[torch.Tensor], 
+                               continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
+        """Update policy using a minibatch of data from the trajectory buffer with per-component structure"""
         if not states or not actions:
             return {}
         
-        # Convert list data back to the format expected by original update_policy
-        # Group returns and advantages by component
-        returns_dict = {component: [] for component in self.component_names}
-        advantages_dict = {component: [] for component in self.component_names}
+        # Convert per-component lists to tensors
+        # returns and advantages are now Dict[component, List[Tensor]], need Dict[component, Tensor]
+        returns_dict = {}
+        advantages_dict = {}
         old_values_dict = {component: [] for component in self.component_names}
         
-        # For minibatch training, we need to reconstruct the component-wise format
-        # Since returns and advantages are already computed as scalars in the buffer,
-        # we'll use them directly as total values
-        for i, (ret_val, adv_val, old_val) in enumerate(zip(returns, advantages, old_values)):
-            # Use the total values for all components (they're already weighted)
-            for component in self.component_names:
-                returns_dict[component].append(ret_val)
-                advantages_dict[component].append(adv_val)
-                # Handle old values - if it's a dict, extract component, otherwise use as total
-                if isinstance(old_val, dict):
-                    old_values_dict[component].append(old_val.get(component, old_val.get('total_reward', ret_val)))
-                else:
-                    old_values_dict[component].append(old_val)
-        
-        # Convert to tensors
+        # Stack component returns and advantages
         for component in self.component_names:
-            returns_dict[component] = torch.stack(returns_dict[component])
-            advantages_dict[component] = torch.stack(advantages_dict[component])
-            old_values_dict[component] = torch.stack(old_values_dict[component])
+            if component in returns and returns[component]:
+                returns_dict[component] = torch.stack(returns[component])
+            else:
+                # Fallback: create zeros if component missing
+                returns_dict[component] = torch.zeros(len(states), device=self.device)
+            
+            if component in advantages and advantages[component]:
+                advantages_dict[component] = torch.stack(advantages[component])
+            else:
+                advantages_dict[component] = torch.zeros(len(states), device=self.device)
         
-        # Call the original update_policy method with old values
-        return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, episode)
+        # Extract old values per component
+        for i, old_val in enumerate(old_values):
+            for component in self.component_names:
+                if isinstance(old_val, dict):
+                    old_values_dict[component].append(old_val.get(component, 0.0))
+                else:
+                    # Fallback: use total value for all components if not dict
+                    old_values_dict[component].append(old_val if component == 'total_reward' else 0.0)
+        
+        # Convert old values to tensors
+        for component in self.component_names:
+            if old_values_dict[component]:
+                old_values_dict[component] = torch.stack([
+                    torch.tensor(v, device=self.device) if not isinstance(v, torch.Tensor) else v.to(self.device)
+                    for v in old_values_dict[component]
+                ])
+            else:
+                old_values_dict[component] = torch.zeros(len(states), device=self.device)
+        
+        # Call the original update_policy method with per-component data
+        return self.update_policy_with_value_clipping(states, actions, returns_dict, advantages_dict, old_log_probs, old_values_dict, continuous_mu, continuous_std, episode)
 
     def update_policy_with_value_clipping(self, states: List[Dict], actions: List[Dict], 
                                         returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
-                                        old_log_probs: List[Dict], old_values: Dict[str, torch.Tensor], episode: int = 0) -> Dict[str, float]:
+                                        old_log_probs: List[Dict], old_values: Dict[str, torch.Tensor], 
+                                        continuous_mu: List[torch.Tensor], continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
         """Update policy using PPO with value clipping for stable critic updates"""
         if not states or not actions:
             return {}
@@ -3041,8 +3260,12 @@ class DurotaxisTrainer:
             advantage = total_advantages[i]
             
             # Compute hybrid policy loss with continuous-only handling
+            # Pass old distribution parameters for proper KL divergence
+            old_mu = continuous_mu[i] if i < len(continuous_mu) else None
+            old_std = continuous_std[i] if i < len(continuous_std) else None
+            
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
-                old_log_probs_dict, eval_output, advantage, episode
+                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std
             )
             
             hybrid_policy_losses.append(hybrid_loss_dict)
@@ -3056,11 +3279,25 @@ class DurotaxisTrainer:
                     
                     if self.enable_value_clipping:
                         # PPO-style value clipping to prevent large critic updates
-                        value_pred_clipped = old_value + torch.clamp(
-                            predicted_value - old_value, 
-                            -self.value_clip_epsilon, 
-                            self.value_clip_epsilon
-                        )
+                        # Use relative or absolute clipping based on configuration
+                        if self.use_relative_value_clip:
+                            # Relative clipping: clip as percentage of old value (more robust)
+                            # Prevents tiny absolute clips when returns are large
+                            old_value_abs = torch.abs(old_value) + 1e-8  # Avoid division by zero
+                            value_delta_relative = (predicted_value - old_value) / old_value_abs
+                            value_delta_clipped = torch.clamp(
+                                value_delta_relative,
+                                -self.value_clip_epsilon,
+                                self.value_clip_epsilon
+                            )
+                            value_pred_clipped = old_value + value_delta_clipped * old_value_abs
+                        else:
+                            # Absolute clipping: original PPO method
+                            value_pred_clipped = old_value + torch.clamp(
+                                predicted_value - old_value,
+                                -self.value_clip_epsilon,
+                                self.value_clip_epsilon
+                            )
                         
                         # Compute both clipped and unclipped value losses
                         v_loss1 = (predicted_value - target_return) ** 2
@@ -3168,8 +3405,11 @@ class DurotaxisTrainer:
             losses['entropy_bonus'] = 0.0
         
         # === TOTAL LOSS AND OPTIMIZATION ===
-        total_loss = avg_total_policy_loss + 0.5 * total_value_loss + avg_entropy_loss + entropy_bonus
+        # FIX: Reduce value loss weight to prevent value loss from dominating training  
+        value_loss_weight = 0.25  # Down from 0.5 to reduce impact of large value losses
+        total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss + entropy_bonus
         losses['total_loss'] = total_loss.item()
+        losses['value_loss_weight'] = value_loss_weight
         
         # Update learnable component weights based on policy performance
         self.update_learnable_weights(advantages, avg_total_policy_loss)
@@ -3200,6 +3440,13 @@ class DurotaxisTrainer:
         
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
         self.optimizer.step()
+        
+        # Step LR scheduler after optimizer update
+        if hasattr(self, 'lr_scheduler'):
+            self.lr_scheduler.step()
+        
+        # Increment global update counter
+        self.global_update_steps += 1
         
         return losses
 
@@ -3268,25 +3515,83 @@ class DurotaxisTrainer:
         
         return float(score)
     
-    def _should_save_best_model(self, kpis: dict, composite_score: float) -> bool:
+    def _should_save_best_model(self, kpis: dict, composite_score: float, episode_count: int) -> bool:
         """
         Determine if current model should be saved as best.
         
         Args:
             kpis: current KPI dict
             composite_score: current composite score
+            episode_count: current episode number
             
         Returns:
             True if this is a new best (with hysteresis threshold)
         """
+        # Check warmup: need minimum number of optimizer updates
+        if self.global_update_steps < self.warmup_updates_for_best:
+            return False
+        
+        # Check minimum episode threshold from config
+        trainer_config = self.config_loader.get_trainer_config()
+        model_sel_config = trainer_config.get('model_selection', {})
+        min_episode = model_sel_config.get('min_episode_for_best_save', 0)
+        if episode_count < min_episode:
+            return False
+        
         if self.best_model_score is None:
-            # First evaluation
+            # First evaluation after warmup
             return True
         
         # Check if improvement exceeds threshold (hysteresis)
         improvement = (composite_score - self.best_model_score) / max(abs(self.best_model_score), 1e-6)
         
         return improvement >= self.model_sel_min_improvement
+    
+    def _log_update_diagnostics(self, losses: dict):
+        """
+        Log gradient and parameter change diagnostics to verify learning is happening.
+        
+        Args:
+            losses: dict of loss values from last update
+        """
+        if not self.verbose:
+            return
+        
+        # Only log every 10 updates to avoid spam
+        if self.global_update_steps % 10 != 0:
+            return
+        
+        # Gradient norm across all parameters
+        total_grad = 0.0
+        count = 0
+        for p in self.network.parameters():
+            if p.grad is not None:
+                g = p.grad.data
+                total_grad += float(g.norm().item())
+                count += 1
+        grad_norm = total_grad / max(1, count)
+        
+        # Parameter delta norm (requires snapshot before step)
+        if self._param_snapshot is None:
+            # Initialize snapshot
+            self._param_snapshot = [p.detach().clone() for p in self.network.parameters() if p.requires_grad]
+            delta_norm = 0.0
+        else:
+            delta = []
+            i = 0
+            for p in self.network.parameters():
+                if p.requires_grad:
+                    if i < len(self._param_snapshot):
+                        delta.append((p.detach() - self._param_snapshot[i]).norm().item())
+                        self._param_snapshot[i].copy_(p.detach())
+                    i += 1
+            delta_norm = float(np.mean(delta) if delta else 0.0)
+        
+        # Get current LR
+        current_lr = self.optimizer.param_groups[0]['lr']
+        
+        print(f"   🔍 Update Diagnostics (step {self.global_update_steps}): "
+              f"grad_norm={grad_norm:.4f}, param_delta={delta_norm:.6f}, LR={current_lr:.2e}")
 
     def _compute_rightward_progress_rate(self, episode_count: int) -> float:
         """
@@ -3351,14 +3656,15 @@ class DurotaxisTrainer:
         """Helper function to collect an episode and add it to the buffer."""
         self.trajectory_buffer.start_episode()
         
-        states, actions, rewards, values, log_probs, final_values, terminated, success = self.collect_episode(episode_count)
+        states, actions, rewards, values, log_probs, continuous_mu_list, continuous_std_list, final_values, terminated, success = self.collect_episode(episode_count)
         
         if not rewards:
             return [], [], [], [], [], None, False, False
         
         for i in range(len(states)):
             self.trajectory_buffer.add_step(
-                states[i], actions[i], rewards[i], values[i], log_probs[i], values[i]
+                states[i], actions[i], rewards[i], values[i], log_probs[i], values[i],
+                continuous_mu_list[i], continuous_std_list[i]
             )
         
         self.trajectory_buffer.finish_episode(final_values, terminated, success)
@@ -3375,7 +3681,7 @@ class DurotaxisTrainer:
         robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
         self.smoothed_rewards.append(robust_ma)
         
-        self.scheduler.step()
+        self.lr_scheduler.step()
         self.save_spawn_statistics(episode_count)
         self.save_reward_statistics(episode_count)
         
@@ -3490,7 +3796,7 @@ class DurotaxisTrainer:
                 gamma = algorithm_config.get('gamma', 0.99)
                 gae_lambda = algorithm_config.get('gae_lambda', 0.95)
                 
-                self.trajectory_buffer.compute_returns_and_advantages_for_all_episodes(gamma, gae_lambda)
+                self.trajectory_buffer.compute_returns_and_advantages_for_all_episodes(gamma, gae_lambda, self.component_names)
                 
                 # ==========================================
                 # PHASE 3: BATCH POLICY UPDATES
@@ -3513,7 +3819,9 @@ class DurotaxisTrainer:
                             minibatch['returns'], 
                             minibatch['advantages'], 
                             minibatch['log_probs'],
-                            minibatch['old_values'], 
+                            minibatch['old_values'],
+                            minibatch['continuous_mu'],
+                            minibatch['continuous_std'],
                             episode_count
                         )
                         
@@ -3545,6 +3853,10 @@ class DurotaxisTrainer:
                 final_losses = {}
                 for loss_name, loss_values in total_losses.items():
                     final_losses[loss_name] = np.mean(loss_values)
+                
+                # === LOG UPDATE DIAGNOSTICS ===
+                # Log gradient and parameter changes to confirm learning is happening
+                self._log_update_diagnostics(final_losses)
                 
                 # === LOG PPO HEALTH METRICS ===
                 if self.verbose and final_losses:
@@ -3715,8 +4027,9 @@ class DurotaxisTrainer:
                     if self.empty_graph_recovery_count > 0:
                         recovery_info = f" | Recoveries: {self.empty_graph_recovery_count}"
                     
+                    current_lr = self.lr_scheduler.get_last_lr()[0] if hasattr(self, 'lr_scheduler') else self.optimizer.param_groups[0]['lr']
                     print(f"Batch {batch_count:3d} | R: {batch_stats['avg_reward']:6.3f} (MA: {recent_reward:6.3f}, Best: {best_so_far:6.3f}) | "
-                          f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
+                          f"Loss: {total_loss:7.4f} | Entropy: {entropy_bonus:7.4f} | LR: {current_lr:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
                           f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
                 
                 # ==========================================
@@ -3727,8 +4040,8 @@ class DurotaxisTrainer:
                 kpis = self._compute_model_selection_kpis()
                 composite_score = self._compute_composite_score(kpis)
                 
-                # Check if this is a new best model
-                if self._should_save_best_model(kpis, composite_score):
+                # Check if this is a new best model (with warmup and episode checks)
+                if self._should_save_best_model(kpis, composite_score, episode_count):
                     prev_score = self.best_model_score
                     self.best_model_score = composite_score
                     self.best_model_metrics = kpis.copy()
@@ -3739,7 +4052,7 @@ class DurotaxisTrainer:
                     
                     # Print detailed improvement message
                     if prev_score is None:
-                        print(f"💾 Best model saved (initial): {self.best_model_filename}")
+                        print(f"💾 Best model saved (initial after warmup): {self.best_model_filename}")
                     else:
                         improvement_pct = ((composite_score - prev_score) / max(abs(prev_score), 1e-6)) * 100
                         print(f"💾 NEW BEST model saved: {self.best_model_filename} (score: {composite_score:.2f}, +{improvement_pct:.1f}%)")
@@ -4130,7 +4443,8 @@ class DurotaxisTrainer:
             json.dump(episode_history, f, indent=2)
         
         # Store reward summary for consolidated logging (silent for one-line logging)
-        key_components = ['total_reward', 'graph_reward', 'spawn_reward', 'edge_reward']
+        # DELETE RATIO ARCHITECTURE: Only track current reward components
+        key_components = ['total_reward', 'graph_reward', 'spawn_reward', 'delete_reward', 'distance_signal']
         active_components = []
         
         for comp in key_components:
@@ -4162,7 +4476,7 @@ class DurotaxisTrainer:
         checkpoint = {
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_state_dict': self.lr_scheduler.state_dict(),
             'episode_rewards': dict(self.episode_rewards),
             'losses': dict(self.losses),
             'best_reward': self.best_total_reward,
@@ -4237,7 +4551,7 @@ class DurotaxisTrainer:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     print(f"   ✅ Loaded optimizer state")
                 if 'scheduler_state_dict' in checkpoint:
-                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                     print(f"   ✅ Loaded scheduler state")
             else:
                 print(f"   ⚠️ Optimizer state reset (as configured)")
@@ -4322,7 +4636,7 @@ class DurotaxisTrainer:
         
         # Load scheduler state if available (for backward compatibility)
         if 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         else:
             print("⚠️ No scheduler state found in checkpoint (older checkpoint format)")
         
