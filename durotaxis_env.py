@@ -1036,7 +1036,7 @@ class DurotaxisEnv(gym.Env):
         
         # Extract reward components
         delete_r = reward_components.get('delete_reward', 0.0)
-        distance_r = reward_components.get('distance_signal', 0.0)
+        distance_r = reward_components.get('distance_reward', 0.0)
         termination_r = reward_components.get('termination_reward', 0.0)
         
         print(
@@ -2289,6 +2289,7 @@ class DurotaxisEnv(gym.Env):
         self.consecutive_left_moves = 0
         
         # Reset previous centroid for delta distance computation (distance mode optimization)
+        # Will be initialized after topology reset below
         self._prev_centroid_x = None
         
         # Reset topology history
@@ -2355,6 +2356,23 @@ class DurotaxisEnv(gym.Env):
             node_age=self._node_age,
             node_stagnation=self._node_stagnation
         )
+        
+        # Initialize previous centroid for distance reward calculation
+        if state['num_nodes'] > 0:
+            try:
+                graph_features = state.get('graph_features')
+                if graph_features is not None:
+                    if isinstance(graph_features, torch.Tensor):
+                        self._prev_centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                    else:
+                        self._prev_centroid_x = graph_features[3]
+            except (IndexError, TypeError):
+                # Fallback: calculate centroid from node positions
+                node_features = state.get('node_features', [])
+                if len(node_features) > 0:
+                    x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
+                                 for node in node_features]
+                    self._prev_centroid_x = sum(x_positions) / len(x_positions)
         
         # Get observation from GraphInputEncoder output
         observation = self._get_encoder_observation(state)

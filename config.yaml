@@ -63,7 +63,7 @@ environment:
     
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
-      enabled: true
+      enabled: false
       shaping_coeff: 0.1              
       phi_weight_pending_marked: 1.0
       phi_weight_safe_unmarked: 0.25
@@ -75,7 +75,7 @@ environment:
     
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
-      enabled: true
+      enabled: false
       shaping_coeff: 0.05             # Lower than delete (0.05 vs 0.1)
       phi_weight_spawnable: 1.0
   
