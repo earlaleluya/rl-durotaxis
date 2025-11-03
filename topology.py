@@ -39,7 +39,8 @@ import networkx as nx
 from substrate import Substrate
 import random
 from scipy.spatial import ConvexHull
-import numpy as np  
+import numpy as np
+from typing import Optional  
 
 
 
@@ -116,25 +117,66 @@ class Topology:
         actions are typically determined by the policy network.
         """
         all_nodes = self.get_all_nodes()
+        print(f"DEBUG: act() start. all_nodes (snapshot) = {all_nodes}")
         sample_actions = {node_id: random.choice(['spawn', 'delete']) for node_id in all_nodes}
         
         # Separate actions into spawn and delete
         spawn_actions = {node_id: action for node_id, action in sample_actions.items() if action == 'spawn'}
         delete_actions = {node_id: action for node_id, action in sample_actions.items() if action == 'delete'}
+        
+        # Convert to stable list to avoid dict iteration issues
+        spawn_node_ids = list(spawn_actions.keys())
+        print(f"DEBUG: spawn_ids (will process) = {spawn_node_ids}")
+        
         # Process spawns first (no index shifting issues)
-        for node_id in spawn_actions:
+        nodes_before = self.graph.num_nodes()
+        for parent in spawn_node_ids:
+            # Skip if parent was deleted or doesn't exist
+            if parent >= self.graph.num_nodes():
+                print(f"DEBUG: Skipping spawn for parent={parent} (out of bounds)")
+                continue
+            
             '''gamma, alpha, noise, theta are learnable parameters.'''
-            self.spawn(node_id, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0)
+            new_id = self.spawn(parent, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0)
+            
+            # Check if more than 1 node was added
+            nodes_now = self.graph.num_nodes()
+            nodes_added = nodes_now - nodes_before
+            if nodes_added > 1:
+                print(f"WARNING: spawn(parent={parent}) produced {nodes_added} nodes (expected 1)!")
+            nodes_before = nodes_now
         # Process deletions in REVERSE ORDER (highest index first)
         # This prevents index shifting from affecting subsequent deletions
         delete_node_ids = sorted(delete_actions.keys(), reverse=True)
+        print(f"DEBUG: delete_ids (will process in reverse) = {delete_node_ids}")
+        
+        nodes_before_deletes = self.graph.num_nodes()
+        edges_before_deletes = self.graph.num_edges()
         for node_id in delete_node_ids:
+            nodes_now = self.graph.num_nodes()
+            edges_now = self.graph.num_edges()
+            print(f"DEBUG: Attempting delete node_id={node_id}; N={nodes_now} E={edges_now}")
             self.delete(node_id)
+            nodes_after = self.graph.num_nodes()
+            edges_after = self.graph.num_edges()
+            nodes_deleted = nodes_now - nodes_after
+            edges_added = edges_after - edges_now  # Can be negative if edges removed
+            print(f"DEBUG: delete(node_id={node_id}) removed {nodes_deleted} nodes, net edges={edges_added:+d}; N={nodes_after} E={edges_after}")
+        
+        nodes_after_deletes = self.graph.num_nodes()
+        edges_after_deletes = self.graph.num_edges()
+        total_deleted = nodes_before_deletes - nodes_after_deletes
+        total_edge_change = edges_after_deletes - edges_before_deletes
+        print(f"DEBUG: Total deletes: expected={len(delete_node_ids)}, actual removed={total_deleted}, net edges={total_edge_change:+d}")
         
         # CRITICAL: Repair connectivity after all spawns and deletes
         # This ensures the graph remains weakly connected even after
         # aggressive spawn/delete operations that may fragment topology
+        nodes_before_repair = self.graph.num_nodes()
         self._repair_connectivity_if_needed()
+        nodes_after_repair = self.graph.num_nodes()
+        if nodes_after_repair != nodes_before_repair:
+            print(f"DEBUG: _repair_connectivity changed node count: {nodes_before_repair} → {nodes_after_repair}")
         
         return sample_actions 
 
@@ -254,6 +296,10 @@ class Topology:
         Adds the new node to the graph and connects curr_node_id to the new node.
         """
         try:
+            # DEBUG: Log entry point
+            nodes_before_spawn = self.graph.num_nodes()
+            print(f"DEBUG spawn called for parent={curr_node_id}; nodes_before={nodes_before_spawn}")
+            
             # Explicit bounds check for clarity (also caught by try-except)
             if curr_node_id >= self.graph.num_nodes():
                 if self.verbose:
@@ -331,7 +377,13 @@ class Topology:
             self._update_spawn_parameters(num_nodes_before, gamma, alpha, noise, theta)
             
             # Get the NEW node ID (after adding the node)
-            new_node_id = self.graph.num_nodes() - 1  
+            new_node_id = self.graph.num_nodes() - 1
+            
+            # DEBUG: Verify we only added 1 node
+            nodes_after_add = self.graph.num_nodes()
+            nodes_added = nodes_after_add - nodes_before_spawn
+            if nodes_added != 1:
+                raise RuntimeError(f"spawn() expected to add exactly 1 node, but added {nodes_added} nodes!")
             
             # Integrate the new node into the graph with connectivity-safe strategy
             # This prevents fragmentation and ensures global connectivity
@@ -353,11 +405,15 @@ class Topology:
             
             # === Step 1: Always connect parent → new node (core rule) ===
             self.graph.add_edges(curr_node_id, new_node_id)
+            edges_after_step1 = self.graph.num_edges()
             
             # === Step 2: Reconnect parent's successors to new node (chain continuity) ===
             if parent_successors:
                 for successor in parent_successors:
                     self.graph.add_edges(new_node_id, successor)
+                edges_after_step2 = self.graph.num_edges()
+                if len(parent_successors) > 2:  # Log if parent had many successors
+                    print(f"  DEBUG spawn: parent={curr_node_id} had {len(parent_successors)} successors, added {edges_after_step2 - edges_after_step1} edges to redirect them")
             
             # === Step 3: Ensure global connectivity (prevents isolated branches) ===
             # If the new node has few connections, connect it to its nearest neighbor
@@ -374,9 +430,16 @@ class Topology:
                 
                 nearest = torch.argmin(dists).item()
                 if nearest != curr_node_id:  # Don't duplicate parent edge
-                    # Add bidirectional edge to maintain connectivity
-                    self.graph.add_edges(new_node_id, nearest)
-                    self.graph.add_edges(nearest, new_node_id)
+                    # Add bidirectional edge to maintain connectivity (check for duplicates)
+                    if not self.graph.has_edges_between(new_node_id, nearest):
+                        self.graph.add_edges(new_node_id, nearest)
+                    if not self.graph.has_edges_between(nearest, new_node_id):
+                        self.graph.add_edges(nearest, new_node_id)
+            
+            # DEBUG: Log successful completion
+            nodes_after_complete = self.graph.num_nodes()
+            edges_after_complete = self.graph.num_edges()
+            print(f"DEBUG spawn: parent={curr_node_id} added new_node_id={new_node_id}; N={nodes_after_complete} E={edges_after_complete}")
             
             return new_node_id
             
@@ -530,12 +593,18 @@ class Topology:
         adjusted_successors = [adjust_idx(s) for s in successors]
         
         # Connect each predecessor to each successor to repair local chain
+        # CRITICAL: Check for duplicate edges to prevent edge explosion
+        edges_added = 0
         if adjusted_predecessors and adjusted_successors:
             for p in adjusted_predecessors:
                 for s in adjusted_successors:
-                    self.graph.add_edges(p, s)
+                    # Only add edge if it doesn't already exist
+                    if not self.graph.has_edges_between(p, s):
+                        self.graph.add_edges(p, s)
+                        edges_added += 1
             # Debug: Print chain repair information
-            # print(f"   🔗 Chain repaired: {len(adjusted_predecessors)} predecessor(s) → {len(adjusted_successors)} successor(s)")
+            if self.verbose and edges_added > 0:
+                print(f"   🔗 Chain repaired: {len(adjusted_predecessors)} predecessor(s) → {len(adjusted_successors)} successor(s), added {edges_added} new edges")
         
         # CRITICAL: Repair global connectivity after deletion
         # Local chain repair (above) only connects immediate neighbors,
@@ -549,6 +618,52 @@ class Topology:
             return np.array([np.nan, np.nan], dtype=float)
         centroid = torch.mean(self.graph.ndata['pos'], dim=0)
         return centroid.detach().cpu().numpy()
+    
+    
+    def persistent_id_to_node_id(self, persistent_id: int) -> Optional[int]:
+        """
+        Convert a persistent ID to current node ID.
+        Returns None if the persistent ID doesn't exist in the graph.
+        
+        Args:
+            persistent_id: The persistent ID to look up
+            
+        Returns:
+            Current node ID (index in graph) or None if not found
+        """
+        if 'persistent_id' not in self.graph.ndata:
+            # Fallback: assume persistent_id == node_id (for backward compatibility)
+            if persistent_id < self.graph.num_nodes():
+                return persistent_id
+            return None
+        
+        persistent_ids = self.graph.ndata['persistent_id']
+        matches = (persistent_ids == persistent_id).nonzero(as_tuple=True)[0]
+        
+        if len(matches) == 0:
+            return None
+        return matches[0].item()
+    
+    
+    def node_id_to_persistent_id(self, node_id: int) -> Optional[int]:
+        """
+        Convert a current node ID to persistent ID.
+        Returns None if node_id is out of bounds.
+        
+        Args:
+            node_id: The current node ID (index in graph)
+            
+        Returns:
+            Persistent ID or None if node_id is invalid
+        """
+        if node_id < 0 or node_id >= self.graph.num_nodes():
+            return None
+        
+        if 'persistent_id' not in self.graph.ndata:
+            # Fallback: assume persistent_id == node_id
+            return node_id
+        
+        return self.graph.ndata['persistent_id'][node_id].item()
     
     
     def get_node_positions(self):
@@ -678,21 +793,21 @@ class Topology:
         
         # Create new graph - handle zero nodes case
         if init_num_nodes <= 0:
-            # Create empty graph with properly initialized ndata tensors
+            # Create empty graph with properly initialized ndata tensors on correct device
             # This prevents errors when other methods assume ndata exists
-            self.graph = dgl.graph(([], []))
-            self.graph.ndata['pos'] = torch.zeros((0, 2), dtype=torch.float32)
-            self.graph.ndata['persistent_id'] = torch.zeros((0,), dtype=torch.long)
-            self.graph.ndata['new_node'] = torch.zeros((0,), dtype=torch.float32)
-            self.graph.ndata['to_delete'] = torch.zeros((0,), dtype=torch.float32)
-            self.graph.ndata['gamma'] = torch.zeros((0,), dtype=torch.float32)
-            self.graph.ndata['alpha'] = torch.zeros((0,), dtype=torch.float32)
-            self.graph.ndata['noise'] = torch.zeros((0,), dtype=torch.float32)
-            self.graph.ndata['theta'] = torch.zeros((0,), dtype=torch.float32)
+            self.graph = dgl.graph(([], []), device=self.device)
+            self.graph.ndata['pos'] = torch.zeros((0, 2), dtype=torch.float32, device=self.device)
+            self.graph.ndata['persistent_id'] = torch.zeros((0,), dtype=torch.long, device=self.device)
+            self.graph.ndata['new_node'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['to_delete'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['gamma'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['alpha'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['noise'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['theta'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
             return self.graph
         
-        # Create new graph with initial nodes
-        self.graph = dgl.graph(([], []))
+        # Create new graph with initial nodes on the correct device
+        self.graph = dgl.graph(([], []), device=self.device)
         
         # Add initial nodes
         self.graph.add_nodes(init_num_nodes)
