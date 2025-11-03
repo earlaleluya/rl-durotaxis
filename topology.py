@@ -36,11 +36,11 @@ import dgl
 import torch
 import matplotlib.pyplot as plt
 import networkx as nx
-import torch
 from substrate import Substrate
 import random
 from scipy.spatial import ConvexHull
-import numpy as np  
+import numpy as np
+from typing import Optional  
 
 
 
@@ -75,11 +75,27 @@ class Topology:
     >>> actions = topology.act()
     """
     
-    def __init__(self, dgl_graph=None, substrate=None, flush_delay=0.01):
+    def __init__(self, dgl_graph=None, substrate=None, flush_delay=0.01, verbose=False, device=None):
+        from device import get_device
+        
         self.substrate = substrate
         self._next_persistent_id = 0  # Global counter for unique persistent IDs
         self.flush_delay = flush_delay  # Default flush delay for visualization
-        self.graph = dgl_graph if dgl_graph is not None else self.reset()
+        self.verbose = verbose  # Control verbosity of status messages
+        self.device = device if device is not None else get_device()
+        # Enforce chain invariant (E = N - 1) by default
+        # When True, spawn/delete preserve a single directed chain and we avoid
+        # adding extra connectivity or bidirectional edges.
+        self.preserve_chain = True
+        
+        # Initialize graph with proper substrate validation
+        if dgl_graph is not None:
+            self.graph = dgl_graph
+        else:
+            if self.substrate is None:
+                raise ValueError("Topology requires a Substrate when no dgl_graph is provided.")
+            self.graph = self.reset()
+        
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
 
@@ -105,28 +121,243 @@ class Topology:
         actions are typically determined by the policy network.
         """
         all_nodes = self.get_all_nodes()
+        print(f"DEBUG: act() start. all_nodes (snapshot) = {all_nodes}")
         sample_actions = {node_id: random.choice(['spawn', 'delete']) for node_id in all_nodes}
         
         # Separate actions into spawn and delete
         spawn_actions = {node_id: action for node_id, action in sample_actions.items() if action == 'spawn'}
         delete_actions = {node_id: action for node_id, action in sample_actions.items() if action == 'delete'}
+        
+        # Convert to stable list to avoid dict iteration issues
+        spawn_node_ids = list(spawn_actions.keys())
+        print(f"DEBUG: spawn_ids (will process) = {spawn_node_ids}")
+        
         # Process spawns first (no index shifting issues)
-        for node_id in spawn_actions:
+        nodes_before = self.graph.num_nodes()
+        for parent in spawn_node_ids:
+            # Skip if parent was deleted or doesn't exist
+            if parent >= self.graph.num_nodes():
+                print(f"DEBUG: Skipping spawn for parent={parent} (out of bounds)")
+                continue
+            
             '''gamma, alpha, noise, theta are learnable parameters.'''
-            self.spawn(node_id, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0)
+            new_id = self.spawn(parent, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0)
+            
+            # Check if more than 1 node was added
+            nodes_now = self.graph.num_nodes()
+            nodes_added = nodes_now - nodes_before
+            if nodes_added > 1:
+                print(f"WARNING: spawn(parent={parent}) produced {nodes_added} nodes (expected 1)!")
+            nodes_before = nodes_now
         # Process deletions in REVERSE ORDER (highest index first)
         # This prevents index shifting from affecting subsequent deletions
         delete_node_ids = sorted(delete_actions.keys(), reverse=True)
+        print(f"DEBUG: delete_ids (will process in reverse) = {delete_node_ids}")
+        
+        nodes_before_deletes = self.graph.num_nodes()
+        edges_before_deletes = self.graph.num_edges()
         for node_id in delete_node_ids:
+            nodes_now = self.graph.num_nodes()
+            edges_now = self.graph.num_edges()
+            print(f"DEBUG: Attempting delete node_id={node_id}; N={nodes_now} E={edges_now}")
             self.delete(node_id)
+            nodes_after = self.graph.num_nodes()
+            edges_after = self.graph.num_edges()
+            nodes_deleted = nodes_now - nodes_after
+            edges_added = edges_after - edges_now  # Can be negative if edges removed
+            print(f"DEBUG: delete(node_id={node_id}) removed {nodes_deleted} nodes, net edges={edges_added:+d}; N={nodes_after} E={edges_after}")
+        
+        nodes_after_deletes = self.graph.num_nodes()
+        edges_after_deletes = self.graph.num_edges()
+        total_deleted = nodes_before_deletes - nodes_after_deletes
+        total_edge_change = edges_after_deletes - edges_before_deletes
+        print(f"DEBUG: Total deletes: expected={len(delete_node_ids)}, actual removed={total_deleted}, net edges={total_edge_change:+d}")
+        
+        # Chain mode keeps E = N - 1; skip global connectivity repairs that add edges
+        if not self.preserve_chain:
+            nodes_before_repair = self.graph.num_nodes()
+            self._repair_connectivity_if_needed()
+            nodes_after_repair = self.graph.num_nodes()
+            if nodes_after_repair != nodes_before_repair:
+                print(f"DEBUG: _repair_connectivity changed node count: {nodes_before_repair} → {nodes_after_repair}")
+        
         return sample_actions 
 
 
+    def _repair_connectivity_if_needed(self):
+        """
+        Repair disconnected graph components to maintain global connectivity.
+        
+        This method detects disjoint subgraphs and connects them to the largest
+        component by adding bidirectional edges between randomly selected nodes.
+        This ensures the graph remains weakly connected even after spawns and
+        deletions that may fragment the topology.
+        
+        Called automatically after:
+        - Batch spawn/delete operations in act()
+        - Individual delete operations
+        - Any operation that might disconnect the graph
+        
+        This is a critical safety mechanism to prevent fragmentation during training.
+        """
+        if self.graph.num_nodes() <= 1:
+            return  # Nothing to connect
+        
+        # Performance optimization: Quick check if graph is definitely disconnected
+        # A connected graph needs at least (N-1) edges
+        # If edges < N-1, definitely disconnected -> proceed with repair
+        # If edges >= N-1, might be connected -> still check but optimization helps sparse graphs
+        num_nodes = self.graph.num_nodes()
+        num_edges = self.graph.num_edges()
+        
+        # If we have enough edges and graph is small, likely connected
+        # But still check for directed graph edge cases
+        
+        try:
+            import networkx as nx
+            
+            # Convert to undirected NetworkX graph to find connected components
+            nx_g = self.graph.to_networkx().to_undirected()
+            components = list(nx.connected_components(nx_g))
+            
+            if len(components) > 1:
+                # Find largest component
+                largest = max(components, key=len)
+                others = [c for c in components if c != largest]
+                
+                # Connect each disconnected component to the largest one
+                for comp in others:
+                    # Pick random nodes from each component
+                    src = random.choice(list(comp))
+                    dst = random.choice(list(largest))
+                    
+                    # Add bidirectional edges to ensure connectivity (check for duplicates)
+                    if not self.graph.has_edges_between(src, dst):
+                        self.graph.add_edges(src, dst)
+                    if not self.graph.has_edges_between(dst, src):
+                        self.graph.add_edges(dst, src)
+                    
+                # Log repairs when verbose mode is enabled
+                if self.verbose:
+                    print(f"   🔧 Repaired {len(others)} disconnected component(s)")
+        except ImportError:
+            # NetworkX not available - skip connectivity repair
+            if self.verbose:
+                print("⚠️  NetworkX not available — skipping connectivity repair")
+            pass
+        except Exception as e:
+            # Silently handle errors to avoid disrupting training (unless verbose)
+            if self.verbose:
+                print(f"⚠️  Connectivity repair failed: {e}")
+            pass
+    
+    # Backwards compatibility alias
+    def ensure_connected(self):
+        """Alias for _repair_connectivity_if_needed() for backwards compatibility."""
+        self._repair_connectivity_if_needed()
+
+
+    def _debug_connectivity_line(self):
+        """Print a one-line 'connected/disconnected' debug status when verbose is on."""
+        if not getattr(self, 'verbose', False):
+            return
+        try:
+            n = self.graph.num_nodes()
+            e = self.graph.num_edges()
+            if n <= 1:
+                status = "connected"
+            else:
+                import networkx as nx
+                nx_g = self.graph.to_networkx().to_undirected()
+                status = "connected" if nx.is_connected(nx_g) else "disconnected"
+            print(f"DEBUG: graph {status} (N={n} E={e})")
+        except Exception:
+            # Keep it one-line and silent on details to avoid noise
+            try:
+                n = self.graph.num_nodes()
+                e = self.graph.num_edges()
+            except Exception:
+                n, e = "?", "?"
+            print(f"DEBUG: graph connectivity check unavailable (N={n} E={e})")
+
+
+    def _edges_to_string(self, use_persistent_ids: bool = True, separator: str = '-') -> str:
+        """Return a concise string of current edges like '0-1, 1-2' using persistent IDs by default."""
+        try:
+            if self.graph.num_edges() == 0:
+                return "(no-edges)"
+            src, dst = self.graph.edges(order='srcdst')
+            src = src.tolist()
+            dst = dst.tolist()
+            if use_persistent_ids and 'persistent_id' in self.graph.ndata:
+                pids = self.graph.ndata['persistent_id']
+                def pid(i):
+                    try:
+                        return int(pids[i].item())
+                    except Exception:
+                        return int(i)
+                pairs = [f"{pid(u)}{separator}{pid(v)}" for u, v in zip(src, dst)]
+            else:
+                pairs = [f"{u}{separator}{v}" for u, v in zip(src, dst)]
+            # Sort for stability
+            pairs.sort()
+            return ", ".join(pairs)
+        except Exception:
+            return "(edges-unavailable)"
+
+
+    def _check_chain_invariant(self):
+        """
+        Validate chain invariant when preserve_chain is enabled:
+        - Edge count E == max(N-1, 0)
+        - Each node has in-degree <= 1 and out-degree <= 1 (simple chain)
+        Returns (ok: bool, message: str)
+        """
+        if not getattr(self, 'preserve_chain', False):
+            return True, "chain mode disabled"
+        try:
+            n = self.graph.num_nodes()
+            e = self.graph.num_edges()
+            if e != max(n - 1, 0):
+                return False, f"edge count invariant failed (N={n}, E={e})"
+            in_deg = self.graph.in_degrees()
+            out_deg = self.graph.out_degrees()
+            if (in_deg > 1).any() or (out_deg > 1).any():
+                return False, "degree bound violated (in>1 or out>1)"
+            return True, "ok"
+        except Exception as ex:
+            return False, f"check failed: {ex}"
 
 
     def get_all_nodes(self):
         """Return a list of all node IDs in the graph."""
         return self.graph.nodes().tolist()
+
+    # Convenience wrappers to operate with persistent IDs (stable across deletions)
+    def spawn_by_persistent_id(self, persistent_id: int, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0):
+        """
+        Spawn using a stable persistent_id. Safely maps to current node_id at call-time.
+        Returns the new node_id or None if the parent doesn't exist.
+        """
+        node_id = self.persistent_id_to_node_id(persistent_id)
+        if node_id is None:
+            if self.verbose:
+                print(f"⚠️  spawn skipped: persistent_id={persistent_id} not found")
+            return None
+        return self.spawn(node_id, gamma=gamma, alpha=alpha, noise=noise, theta=theta)
+
+    def delete_by_persistent_id(self, persistent_id: int):
+        """
+        Delete using a stable persistent_id. Safely maps to current node_id at call-time.
+        Returns True if deleted, False if the node doesn't exist.
+        """
+        node_id = self.persistent_id_to_node_id(persistent_id)
+        if node_id is None:
+            if self.verbose:
+                print(f"⚠️  delete skipped: persistent_id={persistent_id} not found")
+            return False
+        self.delete(node_id)
+        return True
 
 
     def get_substrate_intensities(self):
@@ -138,7 +369,7 @@ class Topology:
         torch.Tensor : Substrate intensities [num_nodes, 1]
         """
         if self.substrate is None:
-            return torch.empty(0, 1, dtype=torch.float32)
+            return torch.empty(0, 1, dtype=torch.float32, device=self.device)
         
         positions = self.graph.ndata['pos']
         device = positions.device
@@ -166,6 +397,33 @@ class Topology:
         Adds the new node to the graph and connects curr_node_id to the new node.
         """
         try:
+            # DEBUG: Log entry point (detailed start line)
+            nodes_before_spawn = self.graph.num_nodes()
+            edges_before_spawn = self.graph.num_edges()
+            parent_succs_before = self.graph.successors(curr_node_id).tolist() if curr_node_id < nodes_before_spawn else []
+            parent_pid_dbg = None
+            if 'persistent_id' in self.graph.ndata and curr_node_id < nodes_before_spawn:
+                try:
+                    parent_pid_dbg = int(self.graph.ndata['persistent_id'][curr_node_id].item())
+                except Exception:
+                    parent_pid_dbg = None
+            # if self.verbose:
+            #     print(f"DEBUG spawn start: parent_node={curr_node_id} pid={parent_pid_dbg} N={nodes_before_spawn} E={edges_before_spawn} succs_before={parent_succs_before}")
+            # Backwards-compatible simple line with persistent_id and edge summary
+            edges_str_before = self._edges_to_string(use_persistent_ids=True)
+            parent_pid_txt = str(parent_pid_dbg) if parent_pid_dbg is not None else "?"
+            # print(f"DEBUG spawn called: parent_pid={parent_pid_txt} (node={curr_node_id}); N={nodes_before_spawn} E={edges_before_spawn} | edges: {edges_str_before}")
+            
+            # Explicit bounds check for clarity (also caught by try-except)
+            if curr_node_id >= self.graph.num_nodes():
+                if self.verbose:
+                    print(f"⚠️  Spawn aborted — node {curr_node_id} does not exist.")
+                return None
+            
+            # Validate that graph has required ndata before proceeding
+            if 'pos' not in self.graph.ndata:
+                raise RuntimeError("graph.ndata must contain 'pos' tensor before calling spawn().")
+            
             r = self._hill_equation(curr_node_id, gamma, alpha, noise)
             # Get current node position (detach and move to CPU for numpy operation)
             curr_pos = self.graph.ndata['pos'][curr_node_id].detach().cpu().numpy()
@@ -233,16 +491,51 @@ class Topology:
             self._update_spawn_parameters(num_nodes_before, gamma, alpha, noise, theta)
             
             # Get the NEW node ID (after adding the node)
-            new_node_id = self.graph.num_nodes() - 1  
+            new_node_id = self.graph.num_nodes() - 1
             
-            # Add edge from curr_node_id to new_node_id
-            self.graph.add_edges(curr_node_id, new_node_id)
+            # DEBUG: Verify we only added 1 node
+            nodes_after_add = self.graph.num_nodes()
+            nodes_added = nodes_after_add - nodes_before_spawn
+            if nodes_added != 1:
+                raise RuntimeError(f"spawn() expected to add exactly 1 node, but added {nodes_added} nodes!")
+            
+            # Preserve existing parent→successor edges and only add parent→new_node
+            # This matches the expected behavior: starting from 0→1, spawning from 0 yields {0→1, 0→2}.
+            edges_added_dbg = []
+            if not self.graph.has_edges_between(curr_node_id, new_node_id):
+                self.graph.add_edges(curr_node_id, new_node_id)
+                edges_added_dbg.append((curr_node_id, new_node_id))
+            
+            # DEBUG: Log successful completion (detailed end line)
+            nodes_after_complete = self.graph.num_nodes()
+            edges_after_complete = self.graph.num_edges()
+            # Include both node ids and pids for clarity
+            new_pid_dbg = None
+            if 'persistent_id' in self.graph.ndata and new_node_id < self.graph.num_nodes():
+                try:
+                    new_pid_dbg = int(self.graph.ndata['persistent_id'][new_node_id].item())
+                except Exception:
+                    new_pid_dbg = None
+            parent_pid_txt = str(parent_pid_dbg) if parent_pid_dbg is not None else "?"
+            new_pid_txt = str(new_pid_dbg) if new_pid_dbg is not None else "?"
+            # print(f"DEBUG spawn: parent_pid={parent_pid_txt} (node={curr_node_id}) added new_pid={new_pid_txt} (node={new_node_id}); N={nodes_after_complete} E={edges_after_complete}")
+            # if self.verbose:
+            #     print(f"DEBUG spawn end: parent={curr_node_id} new={new_node_id} N={nodes_after_complete} E={edges_after_complete} edges_added={edges_added_dbg}")
+            if self.verbose and self.preserve_chain:
+                ok, msg = self._check_chain_invariant()
+                if not ok:
+                    print(f"   ⚠️  Chain invariant check failed after spawn: {msg}")
+            self._debug_connectivity_line()
             
             return new_node_id
             
         except Exception as e:
             # If spawn fails, restore the graph to its previous state
-            # This is important to maintain consistency
+            # Log error only in verbose mode to avoid noise during large-scale training
+            if self.verbose:
+                import traceback
+                print(f"⚠️  Spawn failed for node {curr_node_id}: {e}")
+                traceback.print_exc()
             return None
     
     def _update_spawn_parameters(self, num_nodes_before, gamma, alpha, noise, theta):
@@ -287,7 +580,7 @@ class Topology:
         Returns:
             float: The computed Hill equation value for the specified node.
         """
-        node_pos = self.graph.ndata['pos'][node_id].numpy()
+        node_pos = self.graph.ndata['pos'][node_id].detach().cpu().numpy()
         node_intensity = self.substrate.get_intensity(node_pos)
         # Guard against zero or non-finite intensities
         try:
@@ -321,8 +614,27 @@ class Topology:
             After node removal, indices of nodes greater than curr_node_id are decremented by 1.
         """
         # Find predecessors and successors of the current node
+        nodes_before_dbg = self.graph.num_nodes()
+        edges_before_dbg = self.graph.num_edges()
+        # Bounds guard to avoid confusing logs and out-of-range ops after prior deletions
+        if curr_node_id < 0 or curr_node_id >= nodes_before_dbg:
+            # print(f"DEBUG delete skipped: node={curr_node_id} out of bounds; N={nodes_before_dbg} E={edges_before_dbg}")
+            return
+        # Compute persistent_id for the target and print initial line with edge summary
+        pid_dbg = None
+        if 'persistent_id' in self.graph.ndata and curr_node_id < self.graph.num_nodes():
+            try:
+                pid_dbg = int(self.graph.ndata['persistent_id'][curr_node_id].item())
+            except Exception:
+                pid_dbg = None
+        edges_str_before = self._edges_to_string(use_persistent_ids=True)
+        pid_txt = str(pid_dbg) if pid_dbg is not None else "?"
+        # Backwards-compatible simple line (always print, like spawn)
+        # print(f"DEBUG delete called: pid={pid_txt} (node={curr_node_id}); N={nodes_before_dbg} E={edges_before_dbg} | edges: {edges_str_before}")
         predecessors = self.graph.predecessors(curr_node_id).tolist()
         successors = self.graph.successors(curr_node_id).tolist()
+        # if self.verbose:
+        #     print(f"DEBUG delete start: node={curr_node_id} pid={pid_dbg} N={nodes_before_dbg} E={edges_before_dbg} preds={predecessors} succs={successors}")
         
         # Store new_node flags before removal (if they exist)
         if 'new_node' in self.graph.ndata:
@@ -362,7 +674,8 @@ class Topology:
             self.graph.ndata['persistent_id'] = remaining_persistent_ids
         
         # Restore to_delete flags for remaining nodes (excluding deleted node)
-        if 'to_delete' in locals() and 'to_delete_flags' in locals():
+        # Clearer pattern: check existence before cloning (consistent with other guards)
+        if 'to_delete' in self.graph.ndata:
             remaining_to_delete_flags = torch.cat([
                 to_delete_flags[:curr_node_id],
                 to_delete_flags[curr_node_id+1:]
@@ -383,21 +696,137 @@ class Topology:
             return idx if idx < curr_node_id else idx - 1
         adjusted_predecessors = [adjust_idx(p) for p in predecessors]
         adjusted_successors = [adjust_idx(s) for s in successors]
-        # Connect each predecessor to each successor
-        for p in adjusted_predecessors:
-            for s in adjusted_successors:
-                self.graph.add_edges(p, s)
+        
+        # In chain mode, reconnect children and parent to preserve E=N-1 and rightward orientation by x
+        reconnected_pairs = []
+        if self.preserve_chain:
+            # Helper to get x-position for ordering
+            def x_pos(node_idx: int) -> float:
+                try:
+                    return float(self.graph.ndata['pos'][node_idx][0].item())
+                except Exception:
+                    return float(node_idx)
+
+            # If there are children (successors), choose the child with smallest x as the new pivot parent
+            if adjusted_successors:
+                # Choose pivot among children by smallest x
+                pivot = min(adjusted_successors, key=x_pos)
+
+                # Connect pivot to all other children, orienting edge left→right by x
+                for c in adjusted_successors:
+                    if c == pivot:
+                        continue
+                    u, v = (pivot, c) if x_pos(pivot) <= x_pos(c) else (c, pivot)
+                    if not self.graph.has_edges_between(u, v):
+                        self.graph.add_edges(u, v)
+                        reconnected_pairs.append((u, v))
+
+                # If there are predecessors, connect one predecessor (leftmost by x) to pivot, oriented by x
+                if adjusted_predecessors:
+                    pred = min(adjusted_predecessors, key=x_pos)
+                    u, v = (pred, pivot) if x_pos(pred) <= x_pos(pivot) else (pivot, pred)
+                    if not self.graph.has_edges_between(u, v):
+                        self.graph.add_edges(u, v)
+                        reconnected_pairs.append((u, v))
+            else:
+                # No children: fall back to minimal local reconnect if possible
+                if adjusted_predecessors and adjusted_successors:
+                    p = adjusted_predecessors[0]
+                    s = adjusted_successors[0]
+                    if not self.graph.has_edges_between(p, s):
+                        self.graph.add_edges(p, s)
+                        reconnected_pairs.append((p, s))
+        else:
+            # Connect each predecessor to each successor to repair local connectivity (legacy behavior)
+            # CRITICAL: Check for duplicate edges to prevent edge explosion
+            edges_added = 0
+            if adjusted_predecessors and adjusted_successors:
+                for p in adjusted_predecessors:
+                    for s in adjusted_successors:
+                        if not self.graph.has_edges_between(p, s):
+                            self.graph.add_edges(p, s)
+                            edges_added += 1
+                            reconnected_pairs.append((p, s))
+                if self.verbose and edges_added > 0:
+                    print(f"   🔗 Chain repaired: {len(adjusted_predecessors)} predecessor(s) → {len(adjusted_successors)} successor(s), added {edges_added} new edges")
+        
+        # In chain mode we avoid adding extra connectivity; skip global repairs
+        if not self.preserve_chain:
+            self._repair_connectivity_if_needed()
+        elif self.verbose:
+            ok, msg = self._check_chain_invariant()
+            if not ok:
+                print(f"   ⚠️  Chain invariant check failed after delete: {msg}")
+        # Final debug line for delete transformation
+        if self.verbose:
+            nodes_after_dbg = self.graph.num_nodes()
+            edges_after_dbg = self.graph.num_edges()
+            # print(f"DEBUG delete end: pid={pid_txt} (node={curr_node_id}) N={nodes_after_dbg} E={edges_after_dbg} reconnected={reconnected_pairs}")
+        else:
+            # Always print a simple end line when not verbose
+            nodes_after_dbg = self.graph.num_nodes()
+            edges_after_dbg = self.graph.num_edges()
+            # print(f"DEBUG delete end: pid={pid_txt} (node={curr_node_id}) N={nodes_after_dbg} E={edges_after_dbg}")
+        self._debug_connectivity_line()
 
 
     def compute_centroid(self):
         """Compute the centroid (center of mass) of all nodes"""
+        if self.graph.num_nodes() == 0:
+            return np.array([np.nan, np.nan], dtype=float)
         centroid = torch.mean(self.graph.ndata['pos'], dim=0)
-        return centroid.numpy()
+        return centroid.detach().cpu().numpy()
+    
+    
+    def persistent_id_to_node_id(self, persistent_id: int) -> Optional[int]:
+        """
+        Convert a persistent ID to current node ID.
+        Returns None if the persistent ID doesn't exist in the graph.
+        
+        Args:
+            persistent_id: The persistent ID to look up
+            
+        Returns:
+            Current node ID (index in graph) or None if not found
+        """
+        if 'persistent_id' not in self.graph.ndata:
+            # Fallback: assume persistent_id == node_id (for backward compatibility)
+            if persistent_id < self.graph.num_nodes():
+                return persistent_id
+            return None
+        
+        persistent_ids = self.graph.ndata['persistent_id']
+        matches = (persistent_ids == persistent_id).nonzero(as_tuple=True)[0]
+        
+        if len(matches) == 0:
+            return None
+        return matches[0].item()
+    
+    
+    def node_id_to_persistent_id(self, node_id: int) -> Optional[int]:
+        """
+        Convert a current node ID to persistent ID.
+        Returns None if node_id is out of bounds.
+        
+        Args:
+            node_id: The current node ID (index in graph)
+            
+        Returns:
+            Persistent ID or None if node_id is invalid
+        """
+        if node_id < 0 or node_id >= self.graph.num_nodes():
+            return None
+        
+        if 'persistent_id' not in self.graph.ndata:
+            # Fallback: assume persistent_id == node_id
+            return node_id
+        
+        return self.graph.ndata['persistent_id'][node_id].item()
     
     
     def get_node_positions(self):
         """Get all node positions as a dictionary"""
-        return {i: self.graph.ndata['pos'][i].numpy() for i in range(self.graph.num_nodes())}
+        return {i: self.graph.ndata['pos'][i].detach().cpu().numpy() for i in range(self.graph.num_nodes())}
     
     
     def get_outmost_nodes(self):
@@ -410,7 +839,7 @@ class Topology:
             return list(range(self.graph.num_nodes()))
         
         # Get all node positions
-        positions = self.graph.ndata['pos'].numpy()
+        positions = self.graph.ndata['pos'].detach().cpu().numpy()
         
         try:
             # Suppress qhull warnings by checking for collinearity first
@@ -439,7 +868,7 @@ class Topology:
         Fallback method: get nodes with extreme coordinates
         (leftmost, rightmost, topmost, bottommost)
         """
-        positions = self.graph.ndata['pos'].numpy()
+        positions = self.graph.ndata['pos'].detach().cpu().numpy()
         
         # Find extreme points
         min_x_idx = np.argmin(positions[:, 0])  # leftmost
@@ -515,15 +944,28 @@ class Topology:
         # Reset the next persistent ID counter
         self._next_persistent_id = 0
         
+        # CRITICAL FIX: Explicitly delete old graph to prevent stale references
+        # This ensures clean reset across multiple episodes/workers
+        if hasattr(self, 'graph') and self.graph is not None:
+            del self.graph
+        
         # Create new graph - handle zero nodes case
         if init_num_nodes <= 0:
-            # Create empty graph with minimal node features for consistency
-            self.graph = dgl.graph(([], []))
-            # No nodes to add, but ensure node data tensors exist for compatibility
-            return
+            # Create empty graph with properly initialized ndata tensors on correct device
+            # This prevents errors when other methods assume ndata exists
+            self.graph = dgl.graph(([], []), device=self.device)
+            self.graph.ndata['pos'] = torch.zeros((0, 2), dtype=torch.float32, device=self.device)
+            self.graph.ndata['persistent_id'] = torch.zeros((0,), dtype=torch.long, device=self.device)
+            self.graph.ndata['new_node'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['to_delete'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['gamma'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['alpha'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['noise'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            self.graph.ndata['theta'] = torch.zeros((0,), dtype=torch.float32, device=self.device)
+            return self.graph
         
-        # Create new graph with initial nodes
-        self.graph = dgl.graph(([], []))
+        # Create new graph with initial nodes on the correct device
+        self.graph = dgl.graph(([], []), device=self.device)
         
         # Add initial nodes
         self.graph.add_nodes(init_num_nodes)
@@ -551,17 +993,17 @@ class Topology:
             self._next_persistent_id += 1
         
         # Set node features
-        # Use CPU tensors - they will be moved to device when passed through training pipeline
-        self.graph.ndata['pos'] = torch.tensor(positions, dtype=torch.float32)
-        self.graph.ndata['persistent_id'] = torch.tensor(persistent_ids, dtype=torch.long)
-        self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32)
-        self.graph.ndata['to_delete'] = torch.zeros(init_num_nodes, dtype=torch.float32)  # Initialize to_delete flags
+        # Create tensors on the proper device
+        self.graph.ndata['pos'] = torch.tensor(positions, dtype=torch.float32, device=self.device)
+        self.graph.ndata['persistent_id'] = torch.tensor(persistent_ids, dtype=torch.long, device=self.device)
+        self.graph.ndata['new_node'] = torch.zeros(init_num_nodes, dtype=torch.float32, device=self.device)
+        self.graph.ndata['to_delete'] = torch.zeros(init_num_nodes, dtype=torch.float32, device=self.device)  # Initialize to_delete flags
         
         # Initialize spawn parameters for initial nodes (zeros for safety to avoid NaN propagation)
-        self.graph.ndata['gamma'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
-        self.graph.ndata['alpha'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
-        self.graph.ndata['noise'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
-        self.graph.ndata['theta'] = torch.zeros((init_num_nodes,), dtype=torch.float32)
+        self.graph.ndata['gamma'] = torch.zeros((init_num_nodes,), dtype=torch.float32, device=self.device)
+        self.graph.ndata['alpha'] = torch.zeros((init_num_nodes,), dtype=torch.float32, device=self.device)
+        self.graph.ndata['noise'] = torch.zeros((init_num_nodes,), dtype=torch.float32, device=self.device)
+        self.graph.ndata['theta'] = torch.zeros((init_num_nodes,), dtype=torch.float32, device=self.device)
         
         # Initial graph may start with no edges
         # Add some random initial connections
@@ -571,8 +1013,18 @@ class Topology:
         return self.graph
 
     def _add_initial_edges(self, init_num_nodes):
-        """Add initial edges to the graph based on x-coordinates, connecting from left to right."""
-        positions = self.graph.ndata['pos'].numpy()
+        """
+        Add initial edges to create a simple chain based on x-coordinates.
+        
+        Creates a linear chain where each node connects to the next rightmost node.
+        This ensures:
+        - All nodes are connected in a simple chain
+        - All edges point rightward (left→right based on x-coordinate)
+        - Clean, interpretable topology structure
+        
+        For N nodes, creates N-1 edges (e.g., 4 nodes → 3 edges: A→B→C→D).
+        """
+        positions = self.graph.ndata['pos'].detach().cpu().numpy()
         
         # Create node index pairs with their x-coordinates
         node_x_pairs = [(i, positions[i][0]) for i in range(init_num_nodes)]
@@ -583,7 +1035,7 @@ class Topology:
         # Extract sorted node indices
         sorted_node_indices = [pair[0] for pair in node_x_pairs]
         
-        # Create edges connecting each node to the next rightmost node
+        # Create edges connecting each node to the next rightmost node (chain)
         edges_src = []
         edges_dst = []
         
@@ -598,6 +1050,13 @@ class Topology:
         # Add edges to the graph if any were created
         if edges_src:
             self.graph.add_edges(edges_src, edges_dst)
+            # Only print if verbose mode is enabled (prevents spam in training)
+            if self.verbose:
+                print(f"   ✅ Initial topology: {init_num_nodes} nodes, {len(edges_src)} edges (chain, rightward)")
+                ok, msg = self._check_chain_invariant()
+                if not ok:
+                    print(f"   ⚠️  Chain invariant check failed after reset: {msg}")
+                self._debug_connectivity_line()
 
 
     def show(self, size=(10, 8), flush_delay=None, highlight_outmost=False, update_only=True, episode_num=None):        
@@ -633,7 +1092,7 @@ class Topology:
         # Check if we have any nodes
         num_nodes = self.graph.num_nodes()
         if num_nodes > 0:
-            positions = self.graph.ndata['pos'].numpy()
+            positions = self.graph.ndata['pos'].detach().cpu().numpy()
         else:
             positions = None
         

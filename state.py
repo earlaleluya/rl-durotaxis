@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import dgl 
 from scipy.spatial import ConvexHull
+from device import cpu_numpy
 
 
 class TopologyState:
@@ -76,8 +77,8 @@ class TopologyState:
         Note: 'topology' reference is NOT included to prevent aliasing.
         """
         
-        # Determine device from graph data (all tensors will use this device)
-        device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+        # Determine device from topology (consistent device for all tensors)
+        device = self.topology.device if self.topology is not None else torch.device('cpu')
         
         # Extract features (these return tensors on the graph's device)
         node_features = self._get_node_features(
@@ -219,8 +220,8 @@ class TopologyState:
             new_node_flags = self.graph.ndata['new_node'].unsqueeze(1)
         else:
             # Default to all zeros if new_node flag not initialized
-            # Infer device from positions
-            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            # Infer device from topology
+            device = self.topology.device if self.topology is not None else torch.device('cpu')
             new_node_flags = torch.zeros(num_nodes, 1, dtype=torch.float32, device=device)
         features.append(new_node_flags)
         
@@ -246,8 +247,8 @@ class TopologyState:
             - Normalized direction vector [dx, dy]
         """
         if self.graph.num_edges() == 0:
-            # Infer device from positions if available
-            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            # Infer device from topology
+            device = self.topology.device if self.topology is not None else torch.device('cpu')
             return torch.empty(0, 3, dtype=torch.float32, device=device)
         
         # Get edge endpoints
@@ -287,8 +288,8 @@ class TopologyState:
         
         features = []
         
-        # Infer device from existing positions tensor for device consistency
-        device = positions.device if positions.numel() > 0 else torch.device('cpu')
+        # Infer device from topology for device consistency
+        device = self.topology.device if self.topology is not None else (positions.device if positions.numel() > 0 else torch.device('cpu'))
         
         # 1. Basic graph statistics
         num_nodes = torch.tensor([self.graph.num_nodes()], dtype=torch.float32, device=device)
@@ -299,18 +300,19 @@ class TopologyState:
         
         # 2. Spatial statistics
         if num_nodes > 0:
-            centroid = torch.mean(positions, dim=0)  # [2] for 2D positions
+            centroid = torch.mean(positions, dim=0).to(device)  # [2] for 2D positions
             
             # Bounding box features
-            bbox_min = torch.min(positions, dim=0)[0]  # [2]
-            bbox_max = torch.max(positions, dim=0)[0]  # [2]
+            bbox_min = torch.min(positions, dim=0)[0].to(device)  # [2]
+            bbox_max = torch.max(positions, dim=0)[0].to(device)  # [2]
             bbox_size = bbox_max - bbox_min  # [2]
             bbox_area = torch.prod(bbox_size) if len(bbox_size) > 1 else bbox_size[0]  # scalar
             bbox_area = bbox_area.unsqueeze(0) if bbox_area.dim() == 0 else bbox_area  # [1]
+            bbox_area = bbox_area.to(device)  # Ensure on correct device
             
             # ENHANCED: Add max pooling of positions for better shape representation
-            pos_max = torch.max(positions, dim=0)[0]  # [2] - rightmost and highest positions
-            pos_min = torch.min(positions, dim=0)[0]  # [2] - leftmost and lowest positions
+            pos_max = torch.max(positions, dim=0)[0].to(device)  # [2] - rightmost and highest positions
+            pos_min = torch.min(positions, dim=0)[0].to(device)  # [2] - leftmost and lowest positions
         else:
             centroid = torch.zeros(2, device=device)
             bbox_min = torch.zeros(2, device=device)
@@ -330,11 +332,11 @@ class TopologyState:
         # 3. Convex hull area
         try:
             if num_nodes >= 3:
-                hull = ConvexHull(positions.cpu().numpy())  # Convert to CPU for scipy
+                hull = ConvexHull(cpu_numpy(positions))  # Convert to CPU for scipy safely
                 hull_area = torch.tensor([hull.volume], dtype=torch.float32, device=device)  # [1]
             else:
                 hull_area = torch.tensor([0.0], device=device)  # [1]
-        except:
+        except Exception:
             hull_area = torch.tensor([0.0], device=device)  # [1]
         
         features.append(hull_area)
@@ -342,9 +344,9 @@ class TopologyState:
         # 4. Average node degree
         if num_nodes > 0:
             degrees = self._get_node_degrees()
-            avg_degree = torch.mean(degrees).unsqueeze(0)  # [1]
-            max_degree = torch.max(degrees).unsqueeze(0)  # [1] - ENHANCED
-            sum_degree = torch.sum(degrees).unsqueeze(0)  # [1] - ENHANCED
+            avg_degree = torch.mean(degrees).unsqueeze(0).to(device)  # [1]
+            max_degree = torch.max(degrees).unsqueeze(0).to(device)  # [1] - ENHANCED
+            sum_degree = torch.sum(degrees).unsqueeze(0).to(device)  # [1] - ENHANCED
         else:
             avg_degree = torch.tensor([0.0], device=device)  # [1]
             max_degree = torch.tensor([0.0], device=device)  # [1]
@@ -357,9 +359,9 @@ class TopologyState:
         # 5. ENHANCED: Substrate intensity statistics (mean/max/sum pooling)
         if num_nodes > 0 and 'substrate_intensity' in self.graph.ndata:
             intensities = self.graph.ndata['substrate_intensity'].unsqueeze(1) if self.graph.ndata['substrate_intensity'].dim() == 1 else self.graph.ndata['substrate_intensity']
-            mean_intensity = torch.mean(intensities).unsqueeze(0)  # [1]
-            max_intensity = torch.max(intensities).unsqueeze(0)   # [1]
-            sum_intensity = torch.sum(intensities).unsqueeze(0)   # [1]
+            mean_intensity = torch.mean(intensities).unsqueeze(0).to(device)  # [1]
+            max_intensity = torch.max(intensities).unsqueeze(0).to(device)   # [1]
+            sum_intensity = torch.sum(intensities).unsqueeze(0).to(device)   # [1]
         else:
             mean_intensity = torch.tensor([0.0], device=device)
             max_intensity = torch.tensor([0.0], device=device)
@@ -373,19 +375,19 @@ class TopologyState:
 
     def _get_node_degrees(self):
         """Get node degree features."""
+        device = self.topology.device if self.topology is not None else torch.device('cpu')
         if self.graph.num_nodes() == 0:
-            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
             return torch.empty(0, 2, dtype=torch.float32, device=device)
         
-        in_degrees = self.graph.in_degrees().float().unsqueeze(1)
-        out_degrees = self.graph.out_degrees().float().unsqueeze(1)
+        in_degrees = self.graph.in_degrees().float().unsqueeze(1).to(device)
+        out_degrees = self.graph.out_degrees().float().unsqueeze(1).to(device)
         return torch.cat([in_degrees, out_degrees], dim=1)
 
     def _get_node_centralities(self):
         """Get basic centrality measures."""
         num_nodes = self.graph.num_nodes()
         if num_nodes == 0:
-            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            device = self.topology.device if self.topology is not None else torch.device('cpu')
             return torch.empty(0, 1, dtype=torch.float32, device=device)
         
         positions = self.graph.ndata['pos']
@@ -417,7 +419,7 @@ class TopologyState:
         """Get binary flags indicating if nodes are on the convex hull boundary."""
         num_nodes = self.graph.num_nodes()
         if num_nodes == 0:
-            device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata and self.graph.ndata['pos'].numel() > 0 else torch.device('cpu')
+            device = self.topology.device if self.topology is not None else torch.device('cpu')
             return torch.empty(0, 1, dtype=torch.float32, device=device)
         
         positions = self.graph.ndata['pos']
@@ -449,8 +451,8 @@ class TopologyState:
         Returns:
             torch.Tensor: Age features [num_nodes, 1], normalized to ~[0, 1] range.
         """
-        # Infer device from existing graph data
-        device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata else torch.device('cpu')
+        # Infer device from topology
+        device = self.topology.device if self.topology is not None else torch.device('cpu')
         
         if num_nodes == 0:
             return torch.empty(0, 1, dtype=torch.float32, device=device)
@@ -492,8 +494,8 @@ class TopologyState:
         Returns:
             torch.Tensor: Stagnation features [num_nodes, 1], normalized to ~[0, 1] range.
         """
-        # Infer device from existing graph data
-        device = self.graph.ndata['pos'].device if 'pos' in self.graph.ndata else torch.device('cpu')
+        # Infer device from topology
+        device = self.topology.device if self.topology is not None else torch.device('cpu')
         
         if num_nodes == 0:
             return torch.empty(0, 1, dtype=torch.float32, device=device)

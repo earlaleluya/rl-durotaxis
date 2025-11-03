@@ -518,6 +518,8 @@ class DurotaxisTrainer:
         self.encoder_output_dim = config.get('encoder_output_dim', 64)
         self.encoder_num_layers = config.get('encoder_num_layers', 4)
         
+        print(f"🖥️  Using device: {self.device}")
+        
         # Random substrate parameter ranges
         self.linear_m_range = tuple(config.get('linear_m_range', [0.01, 0.1]))
         self.linear_b_range = tuple(config.get('linear_b_range', [0.5, 2.0]))
@@ -685,6 +687,7 @@ class DurotaxisTrainer:
 
         self.env = DurotaxisEnv(
             config_path=config_path,
+            device=self.device,  # Pass device to environment
             **env_overrides  # Allow overrides for environment parameters too
         )
         
@@ -1293,13 +1296,13 @@ class DurotaxisTrainer:
         if not states:
             return {}
         
-        # Handle empty states
+        # Handle empty states - ensure device consistency
         valid_states = [s for s in states if s.get('num_nodes', 0) > 0]
         if not valid_states:
             return {
                 'node_features': torch.empty(0, states[0]['node_features'].shape[-1], device=self.device),
-                'graph_features': torch.stack([s['graph_features'] for s in states]).to(self.device),
-                'edge_attr': torch.empty(0, states[0].get('edge_attr', torch.empty(0, 3)).shape[-1], device=self.device),
+                'graph_features': torch.stack([s['graph_features'].to(self.device) for s in states]),
+                'edge_attr': torch.empty(0, states[0].get('edge_attr', torch.empty(0, 3, device=self.device)).shape[-1], device=self.device),
                 'edge_index': torch.empty(2, 0, dtype=torch.long, device=self.device),
                 'batch': torch.empty(0, dtype=torch.long, device=self.device),
                 'num_nodes': 0,
@@ -1307,7 +1310,7 @@ class DurotaxisTrainer:
                 'node_counts': [0] * len(states)
             }
         
-        # Collect features (keep on CPU during collection for efficiency)
+        # Collect features and ensure they're all on the same device
         all_node_features = []
         all_edge_features = []
         all_edge_indices = []
@@ -1321,8 +1324,8 @@ class DurotaxisTrainer:
             node_counts.append(num_nodes)
             
             if num_nodes > 0:
-                # Node features (keep on CPU for now)
-                node_feats = state['node_features']
+                # Node features - ensure on target device
+                node_feats = state['node_features'].to(self.device)
                 all_node_features.append(node_feats)
                 
                 # Batch indices for nodes
@@ -1330,13 +1333,15 @@ class DurotaxisTrainer:
                 
                 # Edge features and indices
                 if 'edge_attr' in state and 'edge_index' in state:
-                    edge_attr = state['edge_attr']
+                    edge_attr = state['edge_attr'].to(self.device)
                     edge_index = state['edge_index']
                     
                     # Convert edge_index from tuple to tensor if needed
                     if isinstance(edge_index, tuple):
                         src, dst = edge_index
-                        edge_index = torch.stack([src, dst], dim=0)
+                        edge_index = torch.stack([src.to(self.device), dst.to(self.device)], dim=0)
+                    else:
+                        edge_index = edge_index.to(self.device)
                     
                     if edge_index.shape[1] > 0:  # Has edges
                         # Adjust edge indices for batching
@@ -1346,25 +1351,25 @@ class DurotaxisTrainer:
                 
                 node_offset += num_nodes
         
-        # Concatenate all features on CPU, then transfer to GPU once
+        # Concatenate all features (already on correct device)
         if all_node_features:
-            batched_node_features = torch.cat(all_node_features, dim=0).to(self.device)
+            batched_node_features = torch.cat(all_node_features, dim=0)
             batched_batch = torch.tensor(batch_indices, dtype=torch.long, device=self.device)
         else:
             batched_node_features = torch.empty(0, states[0]['node_features'].shape[-1], device=self.device)
             batched_batch = torch.empty(0, dtype=torch.long, device=self.device)
         
         if all_edge_features and all_edge_indices:
-            batched_edge_features = torch.cat(all_edge_features, dim=0).to(self.device)
-            batched_edge_index = torch.cat(all_edge_indices, dim=1).to(self.device)
+            batched_edge_features = torch.cat(all_edge_features, dim=0)
+            batched_edge_index = torch.cat(all_edge_indices, dim=1)
         else:
             # Handle case with no edges
-            edge_dim = states[0].get('edge_attr', torch.empty(0, 3)).shape[-1]
+            edge_dim = states[0].get('edge_attr', torch.empty(0, 3, device=self.device)).shape[-1]
             batched_edge_features = torch.empty(0, edge_dim, device=self.device)
             batched_edge_index = torch.empty(2, 0, dtype=torch.long, device=self.device)
         
-        # Graph-level features (one per graph in batch) - transfer once
-        graph_features = torch.stack([s['graph_features'] for s in states]).to(self.device)
+        # Graph-level features (one per graph in batch) - ensure on device
+        graph_features = torch.stack([s['graph_features'].to(self.device) for s in states])
         
         return {
             'node_features': batched_node_features,
@@ -2517,9 +2522,15 @@ class DurotaxisTrainer:
             with torch.no_grad():
                 output = self.network(state_dict, deterministic=False, action_mask=action_mask)
             
-            # Store state and predictions
-            states.append(state_dict)
-            values.append(output['value_predictions'])
+            # Store state and predictions (ensure tensors are detached and on correct device)
+            # This prevents memory corruption from shared references
+            safe_state = {
+                k: v.detach().clone() if isinstance(v, torch.Tensor) else v
+                for k, v in state_dict.items()
+            }
+            states.append(safe_state)
+            values.append({k: v.detach().clone() if isinstance(v, torch.Tensor) else v 
+                          for k, v in output['value_predictions'].items()})
             
             # Extract actions and log probs (DELETE RATIO ARCHITECTURE)
             # Network now outputs single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
@@ -4115,16 +4126,6 @@ class DurotaxisTrainer:
                     'max': 0.0,
                     'sum': 0.0
                 }
-                stats['parameters'][param_name] = {
-                    'count': 0,
-                    'mean': None,
-                    'std': None,
-                    'min': None,
-                    'max': None,
-                    'median': None,
-                    'range': None,
-                    'variance': None
-                }
         
         return stats
     
@@ -4315,7 +4316,7 @@ class DurotaxisTrainer:
                     'progress': float(kpis['progress']),
                     'return_mean': float(kpis['return_mean'])
                 },
-                'best_kpis': self.best_model_metrics.copy() if self.best_model_metrics else None
+                'best_kpis': self.best_model_metrics.copy() if isinstance(self.best_model_metrics, dict) else {}
             }
         }
         # Append to file
@@ -4440,9 +4441,9 @@ class DurotaxisTrainer:
             'smoothed_losses': self.smoothed_losses,
             # Model selection metrics (for preserving across restarts)
             'best_model_score': self.best_model_score,
-            'best_model_metrics': self.best_model_metrics.copy() if self.best_model_metrics else {},
+            'best_model_metrics': self.best_model_metrics.copy() if isinstance(self.best_model_metrics, dict) else {},
             'best_model_filename': self.best_model_filename,
-            'episode_history': self.episode_history.copy() if self.episode_history else [],
+            'episode_history': self.episode_history.copy() if isinstance(self.episode_history, list) else [],
         }
         
         filepath = os.path.join(self.run_dir, filename)
@@ -4609,23 +4610,34 @@ class DurotaxisTrainer:
     def save_metrics(self):
         """Save training metrics"""
         import json
+        import math
+        
+        # Helper function to safely convert to float, handling NaN/Inf
+        def safe_float(val, default=0.0):
+            try:
+                f = float(val)
+                if math.isnan(f) or math.isinf(f):
+                    return default
+                return f
+            except (ValueError, TypeError):
+                return default
         
         # Prepare scaling statistics for saving
         scaling_stats = {}
         for component, stats in self.component_running_stats.items():
             scaling_stats[component] = {
-                'final_mean': float(stats['mean']),
-                'final_std': float(stats.get('std', 1.0)),
+                'final_mean': safe_float(stats['mean']),
+                'final_std': safe_float(stats.get('std', 1.0), 1.0),
                 'sample_count': int(stats['count']),
-                'recent_rewards': [float(x) for x in list(stats['raw_rewards'])]
+                'recent_rewards': [safe_float(x) for x in list(stats['raw_rewards'])]
             }
         
         metrics = {
-            'episode_rewards': {k: [float(x) for x in v] for k, v in self.episode_rewards.items()},
-            'losses': {k: [float(x) for x in v] for k, v in self.losses.items()},
+            'episode_rewards': {k: [safe_float(x) for x in v] for k, v in self.episode_rewards.items()},
+            'losses': {k: [safe_float(x) for x in v] for k, v in self.losses.items()},
             'component_weights': self.component_weights,
             'policy_loss_weights': self.policy_loss_weights,  # Save hybrid policy config
-            'best_reward': float(self.best_total_reward),
+            'best_reward': safe_float(self.best_total_reward),
             'adaptive_scaling_enabled': self.enable_adaptive_scaling,
             'scaling_warmup_episodes': self.scaling_warmup_episodes,
             'component_scaling_stats': scaling_stats,

@@ -218,7 +218,7 @@ trainer:
   
   # Return normalization (prevents value loss explosion)
   normalize_returns: true
-  return_scale: 10.0
+  return_scale: 1.0
   
   # Logging
   moving_avg_window: 20

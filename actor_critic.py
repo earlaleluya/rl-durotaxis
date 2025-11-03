@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 from typing import Dict, Tuple, Optional, List
 from torchvision.models import resnet18, ResNet18_Weights
 from encoder import GraphInputEncoder
@@ -589,12 +590,20 @@ class HybridActorCritic(nn.Module):
         graph_features = state_dict['graph_features']
         edge_features = state_dict['edge_attr']
         edge_index = state_dict['edge_index']
-        
+
+        # Ensure all inputs are on the same device as the network
+        device = self.action_bounds.device
+        node_features = node_features.to(device)
+        graph_features = graph_features.to(device)
+        edge_features = edge_features.to(device)
+
         if isinstance(edge_index, tuple):
             src, dst = edge_index
+            src = src.to(device)
+            dst = dst.to(device)
             edge_index_tensor = torch.stack([src, dst], dim=0)
         else:
-            edge_index_tensor = edge_index
+            edge_index_tensor = edge_index.to(device)
         
         num_nodes = node_features.shape[0]
         if num_nodes == 0:
@@ -905,6 +914,10 @@ class HybridPolicyAgent:
                        action_mask: Optional[torch.Tensor] = None) -> Dict[int, str]:
         """
         Execute actions using the hybrid network with delete ratio strategy.
+        
+        CRITICAL: Uses persistent_id to track nodes across spawn/delete operations.
+        Since spawning shifts node IDs, we must convert current node_ids to persistent_ids
+        before executing actions, then look them up after spawning completes.
         """
         actions, spawn_params_global, value_predictions = self.get_actions_and_values(deterministic, action_mask)
         
@@ -914,32 +927,64 @@ class HybridPolicyAgent:
         spawn_actions = {node_id: action for node_id, action in actions.items() if action == 'spawn'}
         delete_actions = {node_id: action for node_id, action in actions.items() if action == 'delete'}
         
-        # First, mark nodes for deletion (set to_delete flag)
+        # CRITICAL FIX: Convert current node_ids to persistent_ids BEFORE any modifications
+        # This prevents index shifting bugs when spawns execute before deletes
+        spawn_persistent_ids = {}
+        for node_id in spawn_actions.keys():
+            persistent_id = self.topology.node_id_to_persistent_id(node_id)
+            if persistent_id is not None:
+                spawn_persistent_ids[persistent_id] = node_id  # Map persistent_id -> original_node_id for logging
+        
+        delete_persistent_ids = {}
+        for node_id in delete_actions.keys():
+            persistent_id = self.topology.node_id_to_persistent_id(node_id)
+            if persistent_id is not None:
+                delete_persistent_ids[persistent_id] = node_id  # Map persistent_id -> original_node_id for logging
+        
+        # First, mark nodes for deletion (set to_delete flag) using CURRENT node IDs (before spawning)
         if 'to_delete' in self.topology.graph.ndata and len(delete_actions) > 0:
             # Reset all to_delete flags to 0
             self.topology.graph.ndata['to_delete'] = torch.zeros(
-                self.topology.graph.num_nodes(), dtype=torch.float32
+                self.topology.graph.num_nodes(), dtype=torch.float32, device=self.topology.device
             )
-            # Set to_delete=1 for nodes that should be deleted
+            # Set to_delete=1 for nodes that should be deleted (use current node_id)
             for node_id in delete_actions.keys():
                 if node_id < self.topology.graph.num_nodes():
                     self.topology.graph.ndata['to_delete'][node_id] = 1.0
         
         # Execute spawn actions (ALL use the same global spawn parameters)
+        # Use persistent_ids to handle index shifting via topology helper
         gamma, alpha, noise, theta = spawn_params_global
-        for node_id in spawn_actions:
+        for persistent_id, original_node_id in spawn_persistent_ids.items():
             try:
-                self.topology.spawn(node_id, gamma=gamma, alpha=alpha, noise=noise, theta=theta)
+                new_id = self.topology.spawn_by_persistent_id(persistent_id, gamma=gamma, alpha=alpha, noise=noise, theta=theta)
+                if new_id is None:
+                    print(f"⚠️  Spawn skipped: persistent_id={persistent_id} no longer exists")
             except Exception as e:
-                print(f"Failed to spawn from node {node_id}: {e}")
+                print(f"Failed to spawn (persistent_id={persistent_id}): {e}")
         
-        # Execute delete actions (now that to_delete flags are set)
-        delete_node_ids = sorted(delete_actions.keys(), reverse=True)
-        for node_id in delete_node_ids:
+        # Execute delete actions using persistent_ids (handles index shifting from spawns)
+        # Sort by CURRENT node_id in reverse order to prevent shifting issues during deletion
+        delete_items = []
+        for persistent_id, original_node_id in delete_persistent_ids.items():
+            current_node_id = self.topology.persistent_id_to_node_id(persistent_id)
+            if current_node_id is not None:
+                # Validate current_node_id is a valid integer in range
+                if isinstance(current_node_id, (int, np.integer)) and 0 <= current_node_id < self.topology.graph.num_nodes():
+                    delete_items.append((int(current_node_id), persistent_id))
+                else:
+                    print(f"⚠️  Delete skipped: persistent_id={persistent_id} maps to invalid node_id={current_node_id} (type={type(current_node_id)})")
+        
+        # Sort by current_node_id in reverse order (highest first)
+        delete_items.sort(reverse=True, key=lambda x: x[0])
+        
+        for current_node_id, persistent_id in delete_items:
             try:
-                self.topology.delete(node_id)
+                ok = self.topology.delete_by_persistent_id(persistent_id)
+                if not ok:
+                    print(f"⚠️  Delete skipped: persistent_id={persistent_id} no longer exists")
             except Exception as e:
-                print(f"Failed to delete node {node_id}: {e}")
+                print(f"Failed to delete (persistent_id={persistent_id}): {e}")
         
         return actions
 
