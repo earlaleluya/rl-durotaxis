@@ -953,18 +953,15 @@ class HybridPolicyAgent:
                     self.topology.graph.ndata['to_delete'][node_id] = 1.0
         
         # Execute spawn actions (ALL use the same global spawn parameters)
-        # Use persistent_ids to handle index shifting
+        # Use persistent_ids to handle index shifting via topology helper
         gamma, alpha, noise, theta = spawn_params_global
         for persistent_id, original_node_id in spawn_persistent_ids.items():
-            # Convert persistent_id back to current node_id (may have shifted due to previous spawns)
-            current_node_id = self.topology.persistent_id_to_node_id(persistent_id)
-            if current_node_id is not None:
-                try:
-                    self.topology.spawn(current_node_id, gamma=gamma, alpha=alpha, noise=noise, theta=theta)
-                except Exception as e:
-                    print(f"Failed to spawn from node {current_node_id} (persistent_id={persistent_id}): {e}")
-            else:
-                print(f"⚠️  Spawn skipped: persistent_id={persistent_id} no longer exists")
+            try:
+                new_id = self.topology.spawn_by_persistent_id(persistent_id, gamma=gamma, alpha=alpha, noise=noise, theta=theta)
+                if new_id is None:
+                    print(f"⚠️  Spawn skipped: persistent_id={persistent_id} no longer exists")
+            except Exception as e:
+                print(f"Failed to spawn (persistent_id={persistent_id}): {e}")
         
         # Execute delete actions using persistent_ids (handles index shifting from spawns)
         # Sort by CURRENT node_id in reverse order to prevent shifting issues during deletion
@@ -983,13 +980,11 @@ class HybridPolicyAgent:
         
         for current_node_id, persistent_id in delete_items:
             try:
-                # Double-check node still exists (may have been deleted in previous iteration)
-                if current_node_id < self.topology.graph.num_nodes():
-                    self.topology.delete(current_node_id)
-                else:
-                    print(f"⚠️  Delete skipped: node {current_node_id} (persistent_id={persistent_id}) no longer exists")
+                ok = self.topology.delete_by_persistent_id(persistent_id)
+                if not ok:
+                    print(f"⚠️  Delete skipped: persistent_id={persistent_id} no longer exists")
             except Exception as e:
-                print(f"Failed to delete node {current_node_id} (persistent_id={persistent_id}): {e}")
+                print(f"Failed to delete (persistent_id={persistent_id}): {e}")
         
         return actions
 
