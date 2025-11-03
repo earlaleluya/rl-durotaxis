@@ -88,7 +88,7 @@ environment:
     substrate_aware_scaling: true      # Use substrate gradient for scaling
     use_tanh_normalization: true       # Use tanh (true) or softsign (false)
     target_delta_x: 0.05              # Expected good step size for tuning
-    tanh_scale: 1.4722                # atanh(0.9) ≈ 1.4722 for sensitivity tuning
+    tanh_scale: 1.4722                # atanh(0.9) = (approx.) 1.4722 for sensitivity tuning
     gradient_cap: null                # Optional: cap gradient for exponential substrates (e.g., 10.0)
     
     # PBRS: Potential-Based Reward Shaping (optional)
