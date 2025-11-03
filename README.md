@@ -16,11 +16,15 @@ bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
 rm ~/miniconda3/miniconda.sh
 ```
 
-Create a new conda environment:
+Create a new conda environment and install dependencies:
 ```bash
 conda create -n durotaxis python=3.12.11
 conda activate durotaxis
 pip install torch==2.4.0 torchvision stable-baselines3 dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
+```
+For installing with GPU, replace last command with:
+```bash
+pip install stable-baselines3 torch==2.4.0 torchvision --index-url https://download.pytorch.org/whl/cu124 dgl -f https://data.dgl.ai/wheels/torch-2.4/cu124/repo.html
 ```
 
 Clone the files to your preferred directory. Then in Ubuntu terminal,

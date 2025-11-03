@@ -876,7 +876,7 @@ class DurotaxisEnv(gym.Env):
         # Store a snapshot of topology for history tracking (not stored in state to avoid aliasing)
         # We store just the persistent_ids and positions for history purposes
         topology_snapshot = {
-            'persistent_ids': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0),
+            'persistent_ids': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0, device=self.device),
             'num_nodes': prev_state['num_nodes'],
             'num_edges': prev_state['num_edges'],
             'centroid_x': prev_state['centroid_x']
@@ -2475,7 +2475,7 @@ class DurotaxisEnv(gym.Env):
         """Clear all to_delete flags (set to 0.0)."""
         if self.topology.graph.num_nodes() > 0:
             self.topology.graph.ndata['to_delete'] = torch.zeros(
-                self.topology.graph.num_nodes(), dtype=torch.float32
+                self.topology.graph.num_nodes(), dtype=torch.float32, device=self.topology.device
             )
     
     def get_deletion_analysis(self):

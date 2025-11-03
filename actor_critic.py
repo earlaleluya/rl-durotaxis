@@ -590,12 +590,20 @@ class HybridActorCritic(nn.Module):
         graph_features = state_dict['graph_features']
         edge_features = state_dict['edge_attr']
         edge_index = state_dict['edge_index']
-        
+
+        # Ensure all inputs are on the same device as the network
+        device = self.action_bounds.device
+        node_features = node_features.to(device)
+        graph_features = graph_features.to(device)
+        edge_features = edge_features.to(device)
+
         if isinstance(edge_index, tuple):
             src, dst = edge_index
+            src = src.to(device)
+            dst = dst.to(device)
             edge_index_tensor = torch.stack([src, dst], dim=0)
         else:
-            edge_index_tensor = edge_index
+            edge_index_tensor = edge_index.to(device)
         
         num_nodes = node_features.shape[0]
         if num_nodes == 0:

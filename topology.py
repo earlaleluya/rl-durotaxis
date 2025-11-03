@@ -268,7 +268,7 @@ class Topology:
         torch.Tensor : Substrate intensities [num_nodes, 1]
         """
         if self.substrate is None:
-            return torch.empty(0, 1, dtype=torch.float32)
+            return torch.empty(0, 1, dtype=torch.float32, device=self.device)
         
         positions = self.graph.ndata['pos']
         device = positions.device
