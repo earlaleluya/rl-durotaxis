@@ -408,12 +408,20 @@ class Topology:
             edges_after_step1 = self.graph.num_edges()
             
             # === Step 2: Reconnect parent's successors to new node (chain continuity) ===
+            # CRITICAL FIX: Limit successor inheritance to prevent edge explosion
+            # Only connect to a subset of successors to maintain sparse graph structure
+            # Sparse graphs (E ~= N) are crucial for computational efficiency and interpretability
             if parent_successors:
-                for successor in parent_successors:
+                # Limit to at most 2 successors to maintain sparsity (prevents exponential edge growth)
+                max_successors_to_inherit = 2
+                successors_to_connect = parent_successors[:max_successors_to_inherit]
+                
+                for successor in successors_to_connect:
                     self.graph.add_edges(new_node_id, successor)
+                
                 edges_after_step2 = self.graph.num_edges()
-                if len(parent_successors) > 2:  # Log if parent had many successors
-                    print(f"  DEBUG spawn: parent={curr_node_id} had {len(parent_successors)} successors, added {edges_after_step2 - edges_after_step1} edges to redirect them")
+                if len(parent_successors) > max_successors_to_inherit:  # Log if we limited inheritance
+                    print(f"  DEBUG spawn: parent={curr_node_id} had {len(parent_successors)} successors, inherited {len(successors_to_connect)} (limited to prevent edge explosion)")
             
             # === Step 3: Ensure global connectivity (prevents isolated branches) ===
             # If the new node has few connections, connect it to its nearest neighbor

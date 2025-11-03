@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 from typing import Dict, Tuple, Optional, List
 from torchvision.models import resnet18, ResNet18_Weights
 from encoder import GraphInputEncoder
@@ -963,14 +964,22 @@ class HybridPolicyAgent:
         for persistent_id, original_node_id in delete_persistent_ids.items():
             current_node_id = self.topology.persistent_id_to_node_id(persistent_id)
             if current_node_id is not None:
-                delete_items.append((current_node_id, persistent_id))
+                # Validate current_node_id is a valid integer in range
+                if isinstance(current_node_id, (int, np.integer)) and 0 <= current_node_id < self.topology.graph.num_nodes():
+                    delete_items.append((int(current_node_id), persistent_id))
+                else:
+                    print(f"⚠️  Delete skipped: persistent_id={persistent_id} maps to invalid node_id={current_node_id} (type={type(current_node_id)})")
         
         # Sort by current_node_id in reverse order (highest first)
         delete_items.sort(reverse=True, key=lambda x: x[0])
         
         for current_node_id, persistent_id in delete_items:
             try:
-                self.topology.delete(current_node_id)
+                # Double-check node still exists (may have been deleted in previous iteration)
+                if current_node_id < self.topology.graph.num_nodes():
+                    self.topology.delete(current_node_id)
+                else:
+                    print(f"⚠️  Delete skipped: node {current_node_id} (persistent_id={persistent_id}) no longer exists")
             except Exception as e:
                 print(f"Failed to delete node {current_node_id} (persistent_id={persistent_id}): {e}")
         
