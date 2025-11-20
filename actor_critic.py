@@ -137,6 +137,11 @@ class Actor(nn.Module):
         # Output: [delete_ratio, gamma, alpha, noise, theta]
         self.continuous_mu_head = nn.Linear(hidden_dim, continuous_dim)
         self.continuous_logstd_head = nn.Linear(hidden_dim, continuous_dim)
+        
+        # Initialize log_std to -0.5 (std ≈ 0.6) to maintain exploration
+        # Default initialization often leads to std collapse
+        nn.init.constant_(self.continuous_logstd_head.bias, -0.5)
+        nn.init.normal_(self.continuous_logstd_head.weight, mean=0.0, std=0.01)
 
     def _apply_freeze(self, backbone: nn.Module, mode: str):
         # mode: 'all' | 'until_layer3' | 'last_block' | 'none'
@@ -631,6 +636,8 @@ class HybridActorCritic(nn.Module):
         continuous_logstd = torch.nan_to_num(continuous_logstd, nan=0.0)
         continuous_logstd = torch.clamp(continuous_logstd, min=-10.0, max=5.0)
         continuous_std = torch.exp(continuous_logstd)
+        # Ensure minimum std to prevent policy collapse
+        continuous_std = torch.clamp(continuous_std, min=0.01, max=10.0)
         
         continuous_mu_bounded = self._apply_bounds(continuous_mu)
         
@@ -730,7 +737,8 @@ class HybridActorCritic(nn.Module):
         continuous_std = torch.exp(continuous_logstd)
         
         # Ensure std is not too small (avoid division by zero or extreme log-probs)
-        continuous_std = torch.clamp(continuous_std, min=1e-6, max=10.0)
+        # Minimum of 0.01 prevents entropy collapse and massive KL divergence
+        continuous_std = torch.clamp(continuous_std, min=0.01, max=10.0)
         
         # Evaluate continuous actions with safety checks
         continuous_dist = torch.distributions.Normal(continuous_mu, continuous_std)
