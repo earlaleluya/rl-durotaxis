@@ -874,9 +874,10 @@ class DurotaxisEnv(gym.Env):
         prev_num_nodes = prev_state['num_nodes']
         
         # Store a snapshot of topology for history tracking (not stored in state to avoid aliasing)
-        # We store just the persistent_ids and positions for history purposes
+        # We store persistent_ids, node_features (for intensity), and basic stats
         topology_snapshot = {
-            'persistent_ids': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0, device=self.device),
+            'persistent_id': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0, device=self.device),
+            'node_features': prev_state['node_features'].clone() if 'node_features' in prev_state else torch.empty(0, 3, device=self.device),
             'num_nodes': prev_state['num_nodes'],
             'num_edges': prev_state['num_edges'],
             'centroid_x': prev_state['centroid_x']
@@ -938,19 +939,27 @@ class DurotaxisEnv(gym.Env):
             else:
                 executed_actions = {}
         
-        # Get new state after actions
+        # Get initial new state after actions (without updated marking)
         new_state = self.state_extractor.get_state_features(
             include_substrate=True,
             node_age=self._node_age,
             node_stagnation=self._node_stagnation
         )
 
-        # NEW: Update and inject advanced node features (age, stagnation)
+        # Update and inject advanced node features (age, stagnation)
         self._update_and_inject_node_features(new_state)
 
-        # NEW: Heuristically mark nodes for deletion based on lab rules
-        # This provides intelligent guidance to the agent about what to prune
+        # Heuristically mark nodes for deletion based on lab rules
+        # This modifies topology's to_delete flags based on dequeued topology comparison
         self._heuristically_mark_nodes_for_deletion()
+        
+        # Re-capture new_state to include updated to_delete flags from marking
+        # This ensures reward calculation sees the marks that were just applied
+        new_state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
 
         # Attempt graceful recovery if topology collapsed to zero nodes AFTER actions
         empty_graph_recovered_post = False
@@ -1659,7 +1668,12 @@ class DurotaxisEnv(gym.Env):
         - RULE 1: If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
         - RULE 2: If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence penalty)
         - RULE 3: If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper deletion)
-        - RULE 4: If a node from previous topology was NOT marked (to_delete=0) AND still exists: +delete_reward (proper persistence)
+        - RULE 4: If a node from previous topology was NOT marked (to_delete=0) AND still exists: 0 (neutral - no reward or penalty)
+        
+        Rationale for RULE 4 = 0:
+        - Prevents exploitation where agent keeps unmarked nodes to farm per-step rewards
+        - Maintains [-1, 1] range: worst case all nodes violate rules (-1), best case all comply (+1)
+        - Focuses reward signal on active decisions (mark+delete or mark+persist) rather than passive persistence
         
         Scaling: Total raw reward is divided by prev_num_nodes to ensure output in [-1, 1]
         
@@ -1691,11 +1705,24 @@ class DurotaxisEnv(gym.Env):
         prev_to_delete_flags = prev_state['to_delete']
         prev_persistent_ids = prev_state['persistent_id']
         
+        # Debug: Count marked nodes in prev_state
+        num_marked_prev = (prev_to_delete_flags > 0.5).sum().item()
+        
         # Get current persistent IDs
         if new_state['num_nodes'] > 0 and 'persistent_id' in new_state:
             current_persistent_ids = set(new_state['persistent_id'].cpu().tolist())
         else:
             current_persistent_ids = set()
+        
+        # Debug: Count marked nodes in new_state  
+        if new_state['num_nodes'] > 0 and 'to_delete' in new_state:
+            num_marked_new = (new_state['to_delete'] > 0.5).sum().item()
+        else:
+            num_marked_new = 0
+        
+        # Debug logging every 50 steps to verify marking
+        if self.current_step % 50 == 0 and (num_marked_prev > 0 or num_marked_new > 0):
+            print(f"🔍 Delete Reward Debug (Step {self.current_step}): prev_marked={num_marked_prev}/{prev_num_nodes}, new_marked={num_marked_new}/{new_state['num_nodes']}")
         
         # Accumulate raw reward (will be scaled by num_nodes at the end)
         raw_delete_reward = 0.0
@@ -1717,8 +1744,10 @@ class DurotaxisEnv(gym.Env):
                     # RULE 3: Node was NOT marked but was deleted anyway - penalty
                     raw_delete_reward -= self.delete_improper_penalty
                 else:
-                    # RULE 4: Node was NOT marked and still exists - reward (proper persistence)
-                    raw_delete_reward += self.delete_proper_reward
+                    # RULE 4: Node was NOT marked and still exists - NO REWARD
+                    # This prevents exploitation where agent keeps unmarked nodes for per-step reward
+                    # Setting to 0 maintains [-1, 1] range while removing passive reward farming
+                    pass  # No reward or penalty (neutral)
         
         # ============================================================================
         # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
@@ -2124,7 +2153,7 @@ class DurotaxisEnv(gym.Env):
             if pid in self._node_stagnation:
                 del self._node_stagnation[pid]
     
-    def _heuristically_mark_nodes_for_deletion(self):
+    def _heuristically_mark_nodes_for_deletion(self, debug=False):
         """
         Mark nodes for deletion based on the two rules from physical experiments.
         
@@ -2134,20 +2163,31 @@ class DurotaxisEnv(gym.Env):
         
         This implements the domain-specific deletion strategy observed in lab
         experiments, where the organism prunes inefficient parts of its network.
+        
+        Args:
+            debug: If True, print debug information about why marking didn't occur
         """
         # Rule 1: Only apply deletion logic if the number of nodes exceeds the critical threshold
         if self.topology.graph.num_nodes() <= self.max_critical_nodes:
+            if debug:
+                print(f"   🔍 Mark check: nodes={self.topology.graph.num_nodes()} <= max_critical={self.max_critical_nodes}, skipping")
             return
 
         # Ensure we have a past topology to compare against
         if self.dequeued_topology is None:
+            if debug:
+                print(f"   🔍 Mark check: dequeued_topology is None")
             return
         
         # Check if dequeued topology has the required data
         if not isinstance(self.dequeued_topology, dict):
+            if debug:
+                print(f"   🔍 Mark check: dequeued_topology is not a dict")
             return
         
         if 'persistent_id' not in self.dequeued_topology or 'node_features' not in self.dequeued_topology:
+            if debug:
+                print(f"   🔍 Mark check: missing keys in dequeued_topology: {list(self.dequeued_topology.keys())}")
             return
 
         # Rule 2: Identify nodes whose intensity at t-delta_time was less than current average
@@ -2159,6 +2199,8 @@ class DurotaxisEnv(gym.Env):
             node_stagnation=self._node_stagnation
         )
         if current_state['num_nodes'] == 0:
+            if debug:
+                print(f"   🔍 Mark check: current_state has 0 nodes")
             return
             
         current_intensities = current_state['node_features'][:, 2].cpu().numpy()
@@ -2175,6 +2217,8 @@ class DurotaxisEnv(gym.Env):
                 candidate_pids.append(pid)
 
         if not candidate_pids:
+            if debug:
+                print(f"   🔍 Mark check: no candidates (all {len(prev_pids)} prev nodes have intensity >= {current_avg_intensity:.3f})")
             return
 
         # Find these candidates in the current graph and mark the rightmost ones
@@ -2192,6 +2236,8 @@ class DurotaxisEnv(gym.Env):
                 continue
         
         if not nodes_to_mark:
+            if debug:
+                print(f"   🔍 Mark check: {len(candidate_pids)} candidates found but NONE exist in current graph (all deleted)")
             return
 
         # Sort candidates by their x-position (rightmost first)
@@ -2208,7 +2254,11 @@ class DurotaxisEnv(gym.Env):
             self._set_node_to_delete_flag(node_idx_to_mark, 1.0)
             nodes_marked_count += 1
         
-        # Optional: Debug logging (uncomment for debugging)
+        # Debug logging to verify marking is working
+        if nodes_marked_count > 0:
+            total_marked = self._count_nodes_marked_for_deletion()
+            print(f"🏷️  Marked {nodes_marked_count} nodes for deletion (total marked: {total_marked}/{self.topology.graph.num_nodes()}, excess: {excess_nodes})")
+
         # if nodes_marked_count > 0:
         #     print(f"🚩 Marked {nodes_marked_count} rightmost low-intensity nodes for deletion "
         #           f"(excess: {excess_nodes}, total: {self.topology.graph.num_nodes()})")

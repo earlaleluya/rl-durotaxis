@@ -142,6 +142,7 @@ class Actor(nn.Module):
         # Default initialization often leads to std collapse
         nn.init.constant_(self.continuous_logstd_head.bias, -0.5)
         nn.init.normal_(self.continuous_logstd_head.weight, mean=0.0, std=0.01)
+        print(f"  ✅ Initialized log_std head: bias={self.continuous_logstd_head.bias.mean().item():.3f}, weight_std={self.continuous_logstd_head.weight.std().item():.3f}")
 
     def _apply_freeze(self, backbone: nn.Module, mode: str):
         # mode: 'all' | 'until_layer3' | 'last_block' | 'none'
@@ -634,10 +635,11 @@ class HybridActorCritic(nn.Module):
         # Clean continuous parameters
         continuous_mu = torch.nan_to_num(continuous_mu, nan=0.0)
         continuous_logstd = torch.nan_to_num(continuous_logstd, nan=0.0)
-        continuous_logstd = torch.clamp(continuous_logstd, min=-10.0, max=5.0)
+        continuous_logstd = torch.clamp(continuous_logstd, min=-10.0, max=2.0)
         continuous_std = torch.exp(continuous_logstd)
-        # Ensure minimum std to prevent policy collapse
-        continuous_std = torch.clamp(continuous_std, min=0.01, max=10.0)
+        # Ensure minimum std to prevent policy collapse (0.3 gives positive entropy)
+        # Entropy = 0.5 + 0.5*log(2π) + log(σ), with σ=0.3 → entropy ≈ 0.3 per dim
+        continuous_std = torch.clamp(continuous_std, min=0.3, max=2.0)
         
         continuous_mu_bounded = self._apply_bounds(continuous_mu)
         
@@ -733,12 +735,12 @@ class HybridActorCritic(nn.Module):
         
         # Clamp to prevent overflow/underflow
         continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
-        continuous_logstd = torch.clamp(continuous_logstd, -10.0, 5.0)
+        continuous_logstd = torch.clamp(continuous_logstd, -10.0, 2.0)
         continuous_std = torch.exp(continuous_logstd)
         
         # Ensure std is not too small (avoid division by zero or extreme log-probs)
-        # Minimum of 0.01 prevents entropy collapse and massive KL divergence
-        continuous_std = torch.clamp(continuous_std, min=0.01, max=10.0)
+        # Minimum of 0.3 ensures positive entropy (~0.3 per dim, ~1.5 total for 5 dims)
+        continuous_std = torch.clamp(continuous_std, min=0.3, max=2.0)
         
         # Evaluate continuous actions with safety checks
         continuous_dist = torch.distributions.Normal(continuous_mu, continuous_std)
@@ -747,6 +749,15 @@ class HybridActorCritic(nn.Module):
         continuous_actions_clamped = torch.clamp(continuous_actions, -10.0, 10.0)
         continuous_log_probs = continuous_dist.log_prob(continuous_actions_clamped).sum(dim=-1)
         continuous_entropy = continuous_dist.entropy().sum(dim=-1)
+        
+        # Debug: Check std and entropy values (including negative entropy)
+        raw_entropy_mean = continuous_entropy.mean().item()
+        if abs(raw_entropy_mean) < 1.0:  # Very low entropy (positive or negative)
+            print(f"⚠️  WARNING: Entropy is critically low!")
+            print(f"   Raw entropy: {raw_entropy_mean:.6f}")
+            print(f"   std: min={continuous_std.min().item():.6f}, max={continuous_std.max().item():.6f}, mean={continuous_std.mean().item():.6f}")
+            print(f"   logstd: min={continuous_logstd.min().item():.6f}, max={continuous_logstd.max().item():.6f}")
+            print(f"   Expected entropy with std=0.01: {(0.5 + 0.5*np.log(2*np.pi) + np.log(0.01))*5:.6f}")
         
         # Safety: Clamp log_probs to prevent extreme values
         continuous_log_probs = torch.clamp(continuous_log_probs, -20.0, 20.0)
