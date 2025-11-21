@@ -15,8 +15,9 @@ environment:
     b: 1.0
   
   # Node and topology limits
-  init_num_nodes: 5
-  max_critical_nodes: 40
+  init_num_nodes: 60
+  max_critical_nodes: 40  # Marking threshold: marks nodes when N > this value
+  state_space_multiplier: 2.0  # Observation capacity: K = multiplier × max_critical_nodes
   threshold_critical_nodes: 400
   max_steps: 1000
   
@@ -45,21 +46,42 @@ environment:
   # Environment-level weights applied when composing total reward
   # Makes priority explicit in the task reward, not just critic loss weights
   reward_weights:
-    delete_weight: 3.0         
-    distance_weight: 1.0       
-    termination_weight: 1.0
+    delete_weight: 1.0         
+    distance_weight: 0.001       
+    termination_weight: 0.01
   
   # ============================================================================
   # CORE REWARD COMPONENTS 
   # ============================================================================
   
-  # Delete Reward (Proper deletion compliance)
-  # Scaled to [-1, 1] by dividing by num_nodes
-  # Use proper_deletion=1.0 for clean [-1, 1] range
+  # Delete Reward (Growth-friendly design)
+  # Encourages BOTH marking AND growth while preventing collapse
+  # Key: RULE 3 penalty is VERY mild to allow growth exploration
   delete_reward:
-    proper_deletion: 1.0
-    persistence_penalty: 1.0
-    improper_deletion_penalty: 1.0
+    # RULE 1: Marked + deleted (strong positive - teaches mark→delete)
+    proper_deletion: 0.60
+    
+    # RULE 2: Marked + persists (weak negative - persistence is common)
+    persistence_penalty: 0.10
+    
+    # RULE 3: Unmarked + deleted (VERY SMALL - allows growth)
+    improper_deletion_penalty: 0.05
+    
+    # RULE 4: Unmarked + persists (positive - stabilizes high N)
+    persistence_reward: 0.08
+    
+    # Normalization offset (prevents collapse-causing dilution at high N)
+    # delete_reward = raw_reward / (prev_num_nodes + normalization_offset)
+    normalization_offset: 4
+    
+    # Adaptive penalty scaling (RULE 3 shrinks as N grows)
+    # Encourages growth: improper deletion penalty minimal at high N
+    adaptive_scaling:
+      high_node_threshold: 12        # Above this N: penalty scaled to 25% (very soft)
+      low_node_threshold: 6          # Below this N: penalty at 100% (strict)
+      high_penalty_scale: 0.25       # Scale factor at high N (1.00 → 0.25)
+      low_penalty_scale: 1.0         # Scale factor at low N (full penalty)
+      # Linear interpolation: goes 1.00 → 0.25 as N: 6 → 12
     
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
@@ -98,13 +120,17 @@ environment:
     timeout_penalty: 0.0                     # Max steps reached (neutral)
   
   # ============================================================================
-  # OBSERVATION SELECTION
+  # OBSERVATION SELECTION (Deletion-Aware)
   # ============================================================================
+  # Prioritizes nodes important for deletion decisions:
+  # - Rightward nodes (x-coordinate): spatial progress
+  # - High-intensity nodes: candidates for marking (low intensity = marked)
+  # - Representationally important nodes: high embedding norm
   observation_selection:
     method: topk_x
-    w_x: 1.0
-    w_intensity: 0.0
-    w_norm: 0.0
+    w_x: 0.6           # Rightward bias (durotaxis direction)
+    w_intensity: 0.3   # Intensity-based selection (marking criterion)
+    w_norm: 0.1        # Representational importance
 
 # ============================================================================
 # NETWORK ARCHITECTURE
@@ -249,10 +275,10 @@ trainer:
   # Component weights (for multi-head value function)
   # Normalized to sum to 1.0 for balanced critic head learning
   component_weights:
-    total_reward: 0.3
-    delete_reward: 0.3
-    distance_reward: 0.2
-    termination_reward: 0.2
+    total_reward: 0.4
+    delete_reward: 0.4
+    distance_reward: 0.1
+    termination_reward: 0.1
   
   # Policy loss weights
   policy_loss_weights:

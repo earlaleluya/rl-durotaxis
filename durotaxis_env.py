@@ -146,7 +146,8 @@ class DurotaxisEnv(gym.Env):
         Discrete action space (dummy - actual actions determined by policy network).
     observation_space : gym.Space
         Box space for flattened graph embeddings with fast topk selection.
-        Shape: [(max_critical_nodes + 1) * encoder_out_dim] - fixed size.
+        Shape: [(observation_max_nodes + 1) * encoder_out_dim] - fixed size.
+        Where observation_max_nodes = state_space_multiplier × max_critical_nodes.
     
     Methods
     -------
@@ -294,7 +295,9 @@ class DurotaxisEnv(gym.Env):
         self.substrate_type = config.get('substrate_type', 'linear')
         self.substrate_params = config.get('substrate_params', {'m': 0.01, 'b': 1.0})
         self.init_num_nodes = config.get('init_num_nodes', 1)
-        self.max_critical_nodes = config.get('max_critical_nodes', 50)
+        self.max_critical_nodes = config.get('max_critical_nodes', 50)  # Marking threshold
+        self.state_space_multiplier = config.get('state_space_multiplier', 1.0)  # Observation capacity multiplier
+        self.observation_max_nodes = int(self.max_critical_nodes * self.state_space_multiplier)  # K for state space
         self.threshold_critical_nodes = config.get('threshold_critical_nodes', 200)
         self.max_steps = config.get('max_steps', 200)
         
@@ -398,10 +401,19 @@ class DurotaxisEnv(gym.Env):
             'timeout_penalty': 0.0
         })
         
-        # Unpack reward component values for direct access
-        self.delete_proper_reward = self.delete_reward['proper_deletion']
-        self.delete_persistence_penalty = self.delete_reward['persistence_penalty']
-        self.delete_improper_penalty = self.delete_reward.get('improper_deletion_penalty', 2.0)
+        # Unpack reward component values for direct access (growth-friendly design)
+        self.delete_proper_reward = self.delete_reward.get('proper_deletion', 0.60)
+        self.delete_persistence_penalty = self.delete_reward.get('persistence_penalty', 0.10)
+        self.delete_improper_penalty = self.delete_reward.get('improper_deletion_penalty', 0.05)
+        self.delete_persistence_reward = self.delete_reward.get('persistence_reward', 0.08)
+        self.delete_normalization_offset = self.delete_reward.get('normalization_offset', 4)
+        
+        # Adaptive penalty scaling thresholds and factors (for growth-friendly delete reward)
+        adaptive_scaling = self.delete_reward.get('adaptive_scaling', {})
+        self.delete_high_node_threshold = adaptive_scaling.get('high_node_threshold', 12)
+        self.delete_low_node_threshold = adaptive_scaling.get('low_node_threshold', 6)
+        self.delete_high_penalty_scale = adaptive_scaling.get('high_penalty_scale', 0.25)
+        self.delete_low_penalty_scale = adaptive_scaling.get('low_penalty_scale', 1.0)
         
         self.edge_rightward_bonus = self.edge_reward['rightward_bonus']
         self.edge_leftward_penalty = self.edge_reward['leftward_penalty']
@@ -519,7 +531,7 @@ class DurotaxisEnv(gym.Env):
         self.consecutive_left_moves = 0  # Count consecutive leftward moves
         
         # Encoder observation optimization
-        self._max_obs_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
+        self._max_obs_size = (self.observation_max_nodes + 1) * self.encoder_out_dim
         self._pre_allocated_obs = np.zeros(self._max_obs_size, dtype=np.float32)  # Reusable zero array for fixed-size observations
         self._edge_index_cache = None  # Cache for edge_index tensor conversion
         self._last_edge_structure_hash = None  # Hash of edge structure for cache invalidation
@@ -559,9 +571,10 @@ class DurotaxisEnv(gym.Env):
 
         # 2. Observation Space
         # The observation space uses output from GraphInputEncoder directly.
-        # Shape: [num_nodes+1, out_dim] where first element is graph token, rest are node embeddings
-        max_critical_nodes_plus_graph = self.max_critical_nodes + 1  # +1 for graph token
-        obs_dim = max_critical_nodes_plus_graph * self.encoder_out_dim
+        # Shape: [K+1, out_dim] where K = state_space_multiplier × max_critical_nodes
+        # This decouples observation capacity from marking threshold (max_critical_nodes)
+        obs_capacity = self.observation_max_nodes + 1  # +1 for graph token
+        obs_dim = obs_capacity * self.encoder_out_dim
         
         self.observation_space = spaces.Box(
             low=-np.inf, 
@@ -721,7 +734,7 @@ class DurotaxisEnv(gym.Env):
             graph_token = encoder_out[0:1]  # [1, D]
             node_embeddings = encoder_out[1:]  # [N, D]
             N, D = node_embeddings.shape
-            K = int(self.max_critical_nodes)
+            K = int(self.observation_max_nodes)  # Use observation capacity, not marking threshold
             
             # Fast path: N <= K nodes → pad if needed and return fixed size
             if N <= K:
@@ -817,7 +830,7 @@ class DurotaxisEnv(gym.Env):
             import traceback
             traceback.print_exc()
             # Fallback to zero observation with fixed size
-            expected_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
+            expected_size = (self.observation_max_nodes + 1) * self.encoder_out_dim
             if self._pre_allocated_obs.shape[0] != expected_size:
                 self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
             self._pre_allocated_obs.fill(0.0)
@@ -1661,26 +1674,28 @@ class DurotaxisEnv(gym.Env):
 
     def _calculate_delete_reward(self, prev_state, new_state, actions):
         """
-        Calculate reward/penalty based on deletion compliance with to_delete flags.
-        Scaled to [-1, 1] range by dividing by num_nodes.
+        Delete reward rewritten to encourage:
+        - Proper marking (mark nodes before deletion)
+        - Deletion of marked nodes (mark → delete → reward)
+        - Growth (VERY mild penalty for unmarked deletion)
+        - Stability at high node counts (positive reward for persistence)
         
-        Logic (4 Rules): 
-        - RULE 1: If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
-        - RULE 2: If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence penalty)
-        - RULE 3: If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper deletion)
-        - RULE 4: If a node from previous topology was NOT marked (to_delete=0) AND still exists: 0 (neutral - no reward or penalty)
+        ✅ Design Goals:
+        1. Agent will confidently GROW N (RULE 3 penalty tiny at high N)
+        2. Agent will MARK nodes (marking → deletion gives strongest reward)
+        3. Agent will DELETE marked nodes (most profitable behavior)
+        4. Agent will NOT collapse (RULE 4 active stabilization)
         
-        Rationale for RULE 4 = 0:
-        - Prevents exploitation where agent keeps unmarked nodes to farm per-step rewards
-        - Maintains [-1, 1] range: worst case all nodes violate rules (-1), best case all comply (+1)
-        - Focuses reward signal on active decisions (mark+delete or mark+persist) rather than passive persistence
+        Logic (4 Rules - Growth & Marking Friendly):
+        - RULE 1: Marked + deleted → +0.60 (strong positive - teaches mark→delete)
+        - RULE 2: Marked + persists → -0.10 (weak negative - persistence common)
+        - RULE 3: Unmarked + deleted → -0.05 × adaptive_weight (VERY SMALL - allows growth)
+        - RULE 4: Unmarked + persists → +0.08 (positive - stabilizes growth)
         
-        Scaling: Total raw reward is divided by prev_num_nodes to ensure output in [-1, 1]
-        
-        Tagging Strategy:
-        - At step t, if node's intensity < avg(all intensities), tag as to_delete=1 at step t+delta_time
-        - delta_time is configurable (default: 3)
-        - Only triggered when num_nodes > max_critical_nodes (signals need for deletion)
+        Key Innovation:
+        - RULE 3 penalty shrinks to 0.05 × 0.25 = 0.0125 at high N
+        - RULE 4 reward strengthened to +0.08 (natural stabilizer)
+        - Normalization uses (prev_num_nodes + 4) to prevent dilution collapse
         
         Args:
             prev_state: Previous state dict containing topology
@@ -1688,13 +1703,11 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken this step
             
         Returns:
-            float: Delete reward in range [-1, 1] (positive for proper behavior, negative for violations)
+            float: Delete reward (normalized to prevent collapse)
         """
-        # Need previous state with persistent_id and to_delete data  
-        if 'persistent_id' not in prev_state or prev_state['persistent_id'] is None:
-            return 0.0
-        
-        if 'to_delete' not in prev_state or prev_state['to_delete'] is None:
+        # Validate state has required data
+        if ('persistent_id' not in prev_state or prev_state['persistent_id'] is None or
+            'to_delete' not in prev_state or prev_state['to_delete'] is None):
             return 0.0
             
         prev_num_nodes = prev_state['num_nodes']
@@ -1724,50 +1737,68 @@ class DurotaxisEnv(gym.Env):
         if self.current_step % 50 == 0 and (num_marked_prev > 0 or num_marked_new > 0):
             print(f"🔍 Delete Reward Debug (Step {self.current_step}): prev_marked={num_marked_prev}/{prev_num_nodes}, new_marked={num_marked_new}/{new_state['num_nodes']}")
         
-        # Accumulate raw reward (will be scaled by num_nodes at the end)
-        raw_delete_reward = 0.0
+        # Get current node count for adaptive penalty scaling
+        current_num_nodes = new_state['num_nodes']
         
-        # Check each node from previous state
+        # ----------------------------------------------------------
+        # ADAPTIVE RULE 3 WEIGHT (Growth-Friendly)
+        # Encourage growth: improper deletion penalty shrinks as N grows
+        # Goes from 1.0 → 0.25 as N goes from low_threshold → high_threshold
+        # ----------------------------------------------------------
+        if current_num_nodes <= self.delete_low_node_threshold:
+            # Strong penalty when N is small (prevent collapse to N=1-2)
+            adaptive_R3_weight = self.delete_low_penalty_scale
+        elif current_num_nodes >= self.delete_high_node_threshold:
+            # Very small penalty when N is large (allow growth exploration)
+            adaptive_R3_weight = self.delete_high_penalty_scale
+        else:
+            # Linear interpolation between low → high
+            t = ((current_num_nodes - self.delete_low_node_threshold) /
+                 (self.delete_high_node_threshold - self.delete_low_node_threshold))
+            scale_range = self.delete_low_penalty_scale - self.delete_high_penalty_scale
+            adaptive_R3_weight = self.delete_low_penalty_scale - scale_range * t
+        
+        # ----------------------------------------------------------
+        # APPLY 4 RULES PER NODE (Growth & Marking Friendly)
+        # ----------------------------------------------------------
+        raw_reward = 0.0
+        
         for i, to_delete_flag in enumerate(prev_to_delete_flags):
             prev_persistent_id = prev_persistent_ids[i].item()
             node_was_deleted = prev_persistent_id not in current_persistent_ids
+            marked = (to_delete_flag.item() > 0.5)
             
-            if to_delete_flag.item() > 0.5:  # Node was marked for deletion
-                if node_was_deleted:
-                    # RULE 1: Node was marked for deletion and was actually deleted - reward
-                    raw_delete_reward += self.delete_proper_reward
-                else:
-                    # RULE 2: Node was marked for deletion but still exists - penalty
-                    raw_delete_reward -= self.delete_persistence_penalty
-            else:  # Node was NOT marked for deletion (to_delete=0)
-                if node_was_deleted:
-                    # RULE 3: Node was NOT marked but was deleted anyway - penalty
-                    raw_delete_reward -= self.delete_improper_penalty
-                else:
-                    # RULE 4: Node was NOT marked and still exists - NO REWARD
-                    # This prevents exploitation where agent keeps unmarked nodes for per-step reward
-                    # Setting to 0 maintains [-1, 1] range while removing passive reward farming
-                    pass  # No reward or penalty (neutral)
+            # RULE 1: Marked + deleted (STRONG positive - teaches mark→delete)
+            if marked and node_was_deleted:
+                raw_reward += self.delete_proper_reward
+            
+            # RULE 2: Marked + persists (weak negative - persistence is common)
+            elif marked and not node_was_deleted:
+                raw_reward -= self.delete_persistence_penalty
+            
+            # RULE 3: Unmarked + deleted (VERY SMALL penalty - allows growth)
+            elif not marked and node_was_deleted:
+                raw_reward -= self.delete_improper_penalty * adaptive_R3_weight
+            
+            # RULE 4: Unmarked + persists (positive - stabilizes high N)
+            else:
+                raw_reward += self.delete_persistence_reward
         
-        # ============================================================================
-        # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
-        # ============================================================================
-        # Apply PBRS to raw reward BEFORE scaling
-        # PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
-        # This biases learning toward compliant deletions without changing optimal policy
+        # ----------------------------------------------------------
+        # PBRS: Potential-Based Reward Shaping (Optional)
+        # ----------------------------------------------------------
         if self._pbrs_delete_enabled and self._pbrs_delete_coeff != 0.0:
             phi_prev = self._phi_delete_potential(prev_state)
             phi_new = self._phi_delete_potential(new_state)
             pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
-            # Add PBRS to raw reward BEFORE scaling
-            raw_delete_reward += self._pbrs_delete_coeff * pbrs_shaping
+            raw_reward += self._pbrs_delete_coeff * pbrs_shaping
         
-        # Scale by num_nodes to get value in approximately [-1, 1] range
-        # Base reward range: [-1, 1]
-        # PBRS can extend this to approximately [-1.125, 1.125] with default config
-        # (shaping_coeff=0.1, w_pending=1.0, w_safe=0.25, gamma=0.99)
-        # This small exceedance (±0.125) is intentional to allow PBRS guidance
-        delete_reward = raw_delete_reward / prev_num_nodes
+        # ----------------------------------------------------------
+        # NORMALIZATION (prevent dilution at high N)
+        # DO NOT divide by prev_num_nodes directly (causes collapse).
+        # Use offset to prevent reward dilution that discourages growth.
+        # ----------------------------------------------------------
+        delete_reward = raw_reward / (prev_num_nodes + self.delete_normalization_offset)
         
         return delete_reward
 
