@@ -146,7 +146,8 @@ class DurotaxisEnv(gym.Env):
         Discrete action space (dummy - actual actions determined by policy network).
     observation_space : gym.Space
         Box space for flattened graph embeddings with fast topk selection.
-        Shape: [(max_critical_nodes + 1) * encoder_out_dim] - fixed size.
+        Shape: [(observation_max_nodes + 1) * encoder_out_dim] - fixed size.
+        Where observation_max_nodes = state_space_multiplier × max_critical_nodes.
     
     Methods
     -------
@@ -294,7 +295,9 @@ class DurotaxisEnv(gym.Env):
         self.substrate_type = config.get('substrate_type', 'linear')
         self.substrate_params = config.get('substrate_params', {'m': 0.01, 'b': 1.0})
         self.init_num_nodes = config.get('init_num_nodes', 1)
-        self.max_critical_nodes = config.get('max_critical_nodes', 50)
+        self.max_critical_nodes = config.get('max_critical_nodes', 50)  # Marking threshold
+        self.state_space_multiplier = config.get('state_space_multiplier', 1.0)  # Observation capacity multiplier
+        self.observation_max_nodes = int(self.max_critical_nodes * self.state_space_multiplier)  # K for state space
         self.threshold_critical_nodes = config.get('threshold_critical_nodes', 200)
         self.max_steps = config.get('max_steps', 200)
         
@@ -398,10 +401,45 @@ class DurotaxisEnv(gym.Env):
             'timeout_penalty': 0.0
         })
         
-        # Unpack reward component values for direct access
-        self.delete_proper_reward = self.delete_reward['proper_deletion']
-        self.delete_persistence_penalty = self.delete_reward['persistence_penalty']
-        self.delete_improper_penalty = self.delete_reward.get('improper_deletion_penalty', 2.0)
+        # Unpack reward component values for direct access (growth-friendly design)
+        self.delete_proper_reward = self.delete_reward.get('proper_deletion', 0.60)
+        self.delete_persistence_penalty = self.delete_reward.get('persistence_penalty', 0.10)
+        self.delete_improper_penalty = self.delete_reward.get('improper_deletion_penalty', 0.05)
+        self.delete_persistence_reward = self.delete_reward.get('persistence_reward', 0.08)
+        self.delete_normalization_offset = self.delete_reward.get('normalization_offset', 4)
+        
+        # N-Scaling for RULE 1 (keeps marking meaningful at high N)
+        rule1_scaling = self.delete_reward.get('rule1_n_scaling', {})
+        self.delete_rule1_scaling_enabled = rule1_scaling.get('enabled', False)
+        self.delete_rule1_scale_coeff = rule1_scaling.get('scale_coefficient', 0.02)
+        self.delete_rule1_scale_cap = rule1_scaling.get('scale_cap', 100)
+        
+        # Growth reward (encourages expansion beyond max_critical_nodes)
+        growth_cfg = self.delete_reward.get('growth_reward', {})
+        self.delete_growth_enabled = growth_cfg.get('enabled', False)
+        self.delete_growth_coeff = growth_cfg.get('coefficient', 0.02)
+        
+        # Homeostatic band reward (prevents runaway growth)
+        homeostasis_cfg = self.delete_reward.get('homeostasis_reward', {})
+        self.delete_homeostasis_enabled = homeostasis_cfg.get('enabled', True)
+        self.delete_homeostasis_k1 = homeostasis_cfg.get('k1', 0.01)
+        self.delete_homeostasis_k2 = homeostasis_cfg.get('k2', 0.02)
+        self.delete_homeostasis_k3 = homeostasis_cfg.get('k3', 0.01)
+        self.delete_homeostasis_K = homeostasis_cfg.get('K', 1.0)
+        
+        # Stability reward (teaches high-N maintenance)
+        stability_cfg = self.delete_reward.get('stability_reward', {})
+        self.delete_stability_enabled = stability_cfg.get('enabled', False)
+        self.delete_stability_reward = stability_cfg.get('base_reward', 0.10)
+        self.delete_stability_min_nodes = stability_cfg.get('min_nodes', 40)
+        self.delete_stability_max_nodes = stability_cfg.get('max_nodes', 250)
+        
+        # Adaptive penalty scaling thresholds and factors (for growth-friendly delete reward)
+        adaptive_scaling = self.delete_reward.get('adaptive_scaling', {})
+        self.delete_high_node_threshold = adaptive_scaling.get('high_node_threshold', 12)
+        self.delete_low_node_threshold = adaptive_scaling.get('low_node_threshold', 6)
+        self.delete_high_penalty_scale = adaptive_scaling.get('high_penalty_scale', 0.25)
+        self.delete_low_penalty_scale = adaptive_scaling.get('low_penalty_scale', 1.0)
         
         self.edge_rightward_bonus = self.edge_reward['rightward_bonus']
         self.edge_leftward_penalty = self.edge_reward['leftward_penalty']
@@ -519,7 +557,7 @@ class DurotaxisEnv(gym.Env):
         self.consecutive_left_moves = 0  # Count consecutive leftward moves
         
         # Encoder observation optimization
-        self._max_obs_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
+        self._max_obs_size = (self.observation_max_nodes + 1) * self.encoder_out_dim
         self._pre_allocated_obs = np.zeros(self._max_obs_size, dtype=np.float32)  # Reusable zero array for fixed-size observations
         self._edge_index_cache = None  # Cache for edge_index tensor conversion
         self._last_edge_structure_hash = None  # Hash of edge structure for cache invalidation
@@ -559,9 +597,10 @@ class DurotaxisEnv(gym.Env):
 
         # 2. Observation Space
         # The observation space uses output from GraphInputEncoder directly.
-        # Shape: [num_nodes+1, out_dim] where first element is graph token, rest are node embeddings
-        max_critical_nodes_plus_graph = self.max_critical_nodes + 1  # +1 for graph token
-        obs_dim = max_critical_nodes_plus_graph * self.encoder_out_dim
+        # Shape: [K+1, out_dim] where K = state_space_multiplier × max_critical_nodes
+        # This decouples observation capacity from marking threshold (max_critical_nodes)
+        obs_capacity = self.observation_max_nodes + 1  # +1 for graph token
+        obs_dim = obs_capacity * self.encoder_out_dim
         
         self.observation_space = spaces.Box(
             low=-np.inf, 
@@ -721,7 +760,7 @@ class DurotaxisEnv(gym.Env):
             graph_token = encoder_out[0:1]  # [1, D]
             node_embeddings = encoder_out[1:]  # [N, D]
             N, D = node_embeddings.shape
-            K = int(self.max_critical_nodes)
+            K = int(self.observation_max_nodes)  # Use observation capacity, not marking threshold
             
             # Fast path: N <= K nodes → pad if needed and return fixed size
             if N <= K:
@@ -817,7 +856,7 @@ class DurotaxisEnv(gym.Env):
             import traceback
             traceback.print_exc()
             # Fallback to zero observation with fixed size
-            expected_size = (self.max_critical_nodes + 1) * self.encoder_out_dim
+            expected_size = (self.observation_max_nodes + 1) * self.encoder_out_dim
             if self._pre_allocated_obs.shape[0] != expected_size:
                 self._pre_allocated_obs = np.zeros(expected_size, dtype=np.float32)
             self._pre_allocated_obs.fill(0.0)
@@ -874,9 +913,10 @@ class DurotaxisEnv(gym.Env):
         prev_num_nodes = prev_state['num_nodes']
         
         # Store a snapshot of topology for history tracking (not stored in state to avoid aliasing)
-        # We store just the persistent_ids and positions for history purposes
+        # We store persistent_ids, node_features (for intensity), and basic stats
         topology_snapshot = {
-            'persistent_ids': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0, device=self.device),
+            'persistent_id': prev_state['persistent_id'].clone() if 'persistent_id' in prev_state else torch.empty(0, device=self.device),
+            'node_features': prev_state['node_features'].clone() if 'node_features' in prev_state else torch.empty(0, 3, device=self.device),
             'num_nodes': prev_state['num_nodes'],
             'num_edges': prev_state['num_edges'],
             'centroid_x': prev_state['centroid_x']
@@ -938,19 +978,27 @@ class DurotaxisEnv(gym.Env):
             else:
                 executed_actions = {}
         
-        # Get new state after actions
+        # Get initial new state after actions (without updated marking)
         new_state = self.state_extractor.get_state_features(
             include_substrate=True,
             node_age=self._node_age,
             node_stagnation=self._node_stagnation
         )
 
-        # NEW: Update and inject advanced node features (age, stagnation)
+        # Update and inject advanced node features (age, stagnation)
         self._update_and_inject_node_features(new_state)
 
-        # NEW: Heuristically mark nodes for deletion based on lab rules
-        # This provides intelligent guidance to the agent about what to prune
+        # Heuristically mark nodes for deletion based on lab rules
+        # This modifies topology's to_delete flags based on dequeued topology comparison
         self._heuristically_mark_nodes_for_deletion()
+        
+        # Re-capture new_state to include updated to_delete flags from marking
+        # This ensures reward calculation sees the marks that were just applied
+        new_state = self.state_extractor.get_state_features(
+            include_substrate=True,
+            node_age=self._node_age,
+            node_stagnation=self._node_stagnation
+        )
 
         # Attempt graceful recovery if topology collapsed to zero nodes AFTER actions
         empty_graph_recovered_post = False
@@ -1008,8 +1056,13 @@ class DurotaxisEnv(gym.Env):
             'empty_graph_recoveries_this_episode': self.empty_graph_recovery_attempts
         }
         
+        # Add detailed delete reward components for debugging/analysis
+        if hasattr(self, '_last_delete_components'):
+            info['delete_components'] = self._last_delete_components
+        
         # 📊 One-line performance summary with boundary warnings
         centroid_x = new_state.get('graph_features', [0, 0, 0, 0])[3] if new_state['num_nodes'] > 0 else 0
+        centroid_y = new_state.get('graph_features', [0, 0, 0, 0])[4] if new_state['num_nodes'] > 0 else 0
         centroid_direction = "→" if len(self.centroid_history) >= 2 and centroid_x > self.centroid_history[-2] else "←" if len(self.centroid_history) >= 2 and centroid_x < self.centroid_history[-2] else "="
         spawn_r = reward_components.get('spawn_reward', 0)
         node_r = reward_components.get('total_node_reward', 0)
@@ -1041,19 +1094,33 @@ class DurotaxisEnv(gym.Env):
         
         recovery_flag = " ♻️" if empty_graph_recovered else ""
         
-        # Extract reward components
+        # Extract reward components (delete_reward includes embedded growth & stability)
         delete_r = reward_components.get('delete_reward', 0.0)
         distance_r = reward_components.get('distance_reward', 0.0)
         termination_r = reward_components.get('termination_reward', 0.0)
         
+        # Get detailed delete components for logging if available
+        delete_details = ""
+        if hasattr(self, '_last_delete_components'):
+            dc = self._last_delete_components
+            # Show growth, homeostasis, and stability when non-zero
+            parts = []
+            if dc.get('growth_reward', 0) != 0:
+                parts.append(f"G:{dc.get('growth_reward', 0):+.3f}")
+            if dc.get('homeostasis_reward', 0) != 0:
+                parts.append(f"H:{dc.get('homeostasis_reward', 0):+.3f}")
+            if dc.get('stability_reward', 0) != 0:
+                parts.append(f"S:{dc.get('stability_reward', 0):+.3f}")
+            if parts:
+                delete_details = f" [{' '.join(parts)}]"
+        
         print(
             f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
             f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
-            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.3f} Dist:{distance_r:+4.3f} Term:{termination_r:+4.3f}) | "
-            f"C={centroid_x:5.1f}{centroid_direction}{boundary_warning}{recovery_flag} | "
+            f"R={scalar_reward:+6.3f} (D:{delete_r:+4.3f}{delete_details} Dist:{distance_r:+4.3f} Term:{termination_r:+4.3f}) | "
+            f"C={centroid_x:5.1f}{centroid_direction} ({centroid_y:5.1f}){boundary_warning}{recovery_flag} | "
             f"Actions: dr={action_params['delete_ratio']:.3f} γ={action_params['gamma']:.2f} "
-            f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f} | "
-            f"Termi={terminated} Trunc={truncated}"
+            f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f}"
         )
         
         # Auto-render after each step to ensure visualization is always updated
@@ -1141,7 +1208,7 @@ class DurotaxisEnv(gym.Env):
         
         # === CALCULATE CORE REWARD COMPONENTS ===
         
-        # PRIORITY 1: Delete reward (proper deletion compliance)
+        # PRIORITY 1: Delete reward (includes growth & stability embedded)
         delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
         
         # NOTE: Spawn reward calculation function preserved but NOT used in composition
@@ -1169,7 +1236,7 @@ class DurotaxisEnv(gym.Env):
             # === SPECIAL MODES: Use ONLY enabled components (no weighting in special modes) ===
             mode_reward = 0.0
             
-            # Priority 1: Delete (if enabled)
+            # Priority 1: Delete (if enabled) - includes embedded growth & stability
             if has_delete_mode:
                 mode_reward += delete_reward
             
@@ -1190,6 +1257,7 @@ class DurotaxisEnv(gym.Env):
         else:
             # === DEFAULT MODE: Weighted composition (Delete > Distance > Termination) ===
             # Apply environment-level weights to make priority explicit in task reward
+            # Note: delete_reward already includes embedded growth & stability rewards
             total_reward = (
                 self._w_delete * float(delete_reward) +
                 self._w_distance * float(distance_reward) +
@@ -1197,7 +1265,8 @@ class DurotaxisEnv(gym.Env):
             )
         
         # === BUILD REWARD BREAKDOWN ===
-        # Create reward breakdown with all components in refactored system
+        # Create reward breakdown with all components
+        # Note: delete_reward includes embedded growth & stability rewards
         reward_breakdown = {
             'total_reward': total_reward,
             'delete_reward': delete_reward,
@@ -1652,21 +1721,33 @@ class DurotaxisEnv(gym.Env):
 
     def _calculate_delete_reward(self, prev_state, new_state, actions):
         """
-        Calculate reward/penalty based on deletion compliance with to_delete flags.
-        Scaled to [-1, 1] range by dividing by num_nodes.
+        Delete reward rewritten to encourage:
+        - Proper marking (mark nodes before deletion)
+        - Deletion of marked nodes (mark → delete → reward)
+        - Growth (VERY mild penalty for unmarked deletion)
+        - Stability at high node counts (positive reward for persistence)
         
-        Logic (4 Rules): 
-        - RULE 1: If a node from previous topology was marked to_delete=1 AND no longer exists: +delete_reward
-        - RULE 2: If a node from previous topology was marked to_delete=1 BUT still exists: -delete_reward (persistence penalty)
-        - RULE 3: If a node from previous topology was NOT marked (to_delete=0) BUT was deleted: -delete_reward (improper deletion)
-        - RULE 4: If a node from previous topology was NOT marked (to_delete=0) AND still exists: +delete_reward (proper persistence)
+        ✅ Design Goals:
+        1. Agent will confidently GROW N (RULE 3 penalty tiny at high N)
+        2. Agent will MARK nodes (marking → deletion gives strongest reward)
+        3. Agent will DELETE marked nodes (most profitable behavior)
+        4. Agent will NOT collapse (RULE 4 active stabilization)
         
-        Scaling: Total raw reward is divided by prev_num_nodes to ensure output in [-1, 1]
+        Logic (4 Rules - Growth & Marking Friendly):
+        - RULE 1: Marked + deleted → +0.60 (strong positive - teaches mark→delete)
+        - RULE 2: Marked + persists → -0.10 (weak negative - persistence common)
+        - RULE 3: Unmarked + deleted → -0.05 × adaptive_weight (VERY SMALL - allows growth)
+        - RULE 4: Unmarked + persists → +0.08 (positive - stabilizes growth)
         
-        Tagging Strategy:
-        - At step t, if node's intensity < avg(all intensities), tag as to_delete=1 at step t+delta_time
-        - delta_time is configurable (default: 3)
-        - Only triggered when num_nodes > max_critical_nodes (signals need for deletion)
+        Key Innovation:
+        - RULE 3 penalty shrinks to 0.05 × 0.25 = 0.0125 at high N
+        - RULE 4 reward strengthened to +0.08 (natural stabilizer)
+        - Normalization uses (prev_num_nodes + 4) to prevent dilution collapse
+        
+        Three-Part Growth Fix:
+        - FIX 1: N-scaled RULE 1 (keeps marking meaningful at high N)
+        - FIX 2: Growth reward (embedded in delete_reward, encourages expansion)
+        - FIX 3: Stability reward (embedded in delete_reward, teaches high-N maintenance)
         
         Args:
             prev_state: Previous state dict containing topology
@@ -1674,73 +1755,203 @@ class DurotaxisEnv(gym.Env):
             actions: Actions taken this step
             
         Returns:
-            float: Delete reward in range [-1, 1] (positive for proper behavior, negative for violations)
+            float: delete_reward (includes base 4-rule reward + growth + stability, normalized)
         """
-        # Need previous state with persistent_id and to_delete data  
-        if 'persistent_id' not in prev_state or prev_state['persistent_id'] is None:
+        # Basic validation
+        if ('persistent_id' not in prev_state or prev_state['persistent_id'] is None or
+            'to_delete' not in prev_state or prev_state['to_delete'] is None):
             return 0.0
-        
-        if 'to_delete' not in prev_state or prev_state['to_delete'] is None:
-            return 0.0
-            
-        prev_num_nodes = prev_state['num_nodes']
+
+        prev_num_nodes = int(prev_state.get('num_nodes', 0))
         if prev_num_nodes == 0:
             return 0.0
-        
-        # Use the cloned data from prev_state (captured at the time of state extraction)
+
         prev_to_delete_flags = prev_state['to_delete']
         prev_persistent_ids = prev_state['persistent_id']
-        
-        # Get current persistent IDs
-        if new_state['num_nodes'] > 0 and 'persistent_id' in new_state:
-            current_persistent_ids = set(new_state['persistent_id'].cpu().tolist())
+
+        # Get current node count EARLY (fix: used by debug block)
+        current_num_nodes = int(new_state.get('num_nodes', 0))
+
+        # Current persistent IDs (safe conversion with .cpu())
+        if current_num_nodes > 0 and 'persistent_id' in new_state and new_state['persistent_id'] is not None:
+            current_persistent_ids = set([int(x) for x in new_state['persistent_id'].cpu().tolist()])
         else:
             current_persistent_ids = set()
-        
-        # Accumulate raw reward (will be scaled by num_nodes at the end)
-        raw_delete_reward = 0.0
-        
-        # Check each node from previous state
-        for i, to_delete_flag in enumerate(prev_to_delete_flags):
-            prev_persistent_id = prev_persistent_ids[i].item()
-            node_was_deleted = prev_persistent_id not in current_persistent_ids
+
+        # Debug counters (safe: current_num_nodes now available)
+        num_marked_prev = int((prev_to_delete_flags > 0.5).sum().item()) if hasattr(prev_to_delete_flags, 'shape') else 0
+        if current_num_nodes > 0 and 'to_delete' in new_state and new_state['to_delete'] is not None:
+            num_marked_new = int((new_state['to_delete'] > 0.5).sum().item())
+        else:
+            num_marked_new = 0
+
+        # Debug logging every 50 steps to verify marking and track reward components
+        if self.current_step % 50 == 0 and (num_marked_prev > 0 or num_marked_new > 0 or current_num_nodes > self.max_critical_nodes):
+            debug_msg = f"🔍 Delete Reward Debug (Step {self.current_step}): prev_marked={num_marked_prev}/{prev_num_nodes}, new_marked={num_marked_new}/{current_num_nodes}"
+            if getattr(self, 'delete_rule1_scaling_enabled', False):
+                n_cap = min(current_num_nodes, getattr(self, 'delete_rule1_scale_cap', current_num_nodes))
+                scaled_r1 = getattr(self, 'delete_proper_reward', 0.6) + getattr(self, 'delete_rule1_scale_coeff', 0.0) * n_cap
+                debug_msg += f" | RULE1_scaled={scaled_r1:.3f}"
+            if current_num_nodes > self.max_critical_nodes:
+                debug_msg += f" | N>{self.max_critical_nodes} (marking active)"
+            print(debug_msg)
+
+        # -----------------------------------------------------------------
+        # ADAPTIVE RULE 3 WEIGHT (Growth-Friendly, safe interpolation)
+        # -----------------------------------------------------------------
+        low_thr = getattr(self, 'delete_low_node_threshold', 8)
+        high_thr = getattr(self, 'delete_high_node_threshold', 40)
+        low_scale = getattr(self, 'delete_low_penalty_scale', 1.0)
+        high_scale = getattr(self, 'delete_high_penalty_scale', 0.25)
+
+        if current_num_nodes <= low_thr:
+            adaptive_R3_weight = low_scale
+        elif current_num_nodes >= high_thr:
+            adaptive_R3_weight = high_scale
+        else:
+            denom = (high_thr - low_thr)
+            if denom <= 0:
+                # Guard against division by zero if thresholds are equal
+                adaptive_R3_weight = low_scale
+            else:
+                t = (current_num_nodes - low_thr) / denom
+                adaptive_R3_weight = low_scale - (low_scale - high_scale) * t
+        # Clamp to reasonable bounds
+        adaptive_R3_weight = float(max(min(adaptive_R3_weight, low_scale), high_scale))
+
+        # -----------------------------------------------------------------
+        # APPLY 4 RULES PER NODE (iterate safely over min length)
+        # -----------------------------------------------------------------
+        raw_reward = 0.0
+        num_deletions = 0
+
+        # RULE 1 scaling (safe defaults with getattr)
+        if getattr(self, 'delete_rule1_scaling_enabled', False):
+            n_for_scaling = min(current_num_nodes, getattr(self, 'delete_rule1_scale_cap', current_num_nodes))
+            rule1_reward = getattr(self, 'delete_proper_reward', 0.6) + getattr(self, 'delete_rule1_scale_coeff', 0.0) * n_for_scaling
+        else:
+            rule1_reward = getattr(self, 'delete_proper_reward', 0.6)
+
+        # Safe iteration length (protect against mismatched tensor sizes)
+        n_iter = min(len(prev_to_delete_flags), len(prev_persistent_ids))
+        for i in range(n_iter):
+            # Guard conversions to python scalars (safe .cpu().item())
+            flag_val = float(prev_to_delete_flags[i].cpu().item()) if hasattr(prev_to_delete_flags[i], 'item') else float(prev_to_delete_flags[i])
+            pid = int(prev_persistent_ids[i].cpu().item()) if hasattr(prev_persistent_ids[i], 'item') else int(prev_persistent_ids[i])
+            marked = (flag_val > 0.5)
+            node_was_deleted = (pid not in current_persistent_ids)
+            if node_was_deleted:
+                num_deletions += 1
+
+            if marked and node_was_deleted:
+                raw_reward += rule1_reward
+            elif marked and not node_was_deleted:
+                raw_reward -= getattr(self, 'delete_persistence_penalty', 0.10)
+            elif (not marked) and node_was_deleted:
+                raw_reward -= getattr(self, 'delete_improper_penalty', 0.05) * adaptive_R3_weight
+            else:
+                raw_reward += getattr(self, 'delete_persistence_reward', 0.08)
+
+        # -----------------------------------------------------------------
+        # FIX 2: GROWTH REWARD (embedded in delete_reward)
+        # Growth only applies when N < N_min to avoid fighting homeostasis
+        # -----------------------------------------------------------------
+        growth_reward = 0.0
+        if getattr(self, 'delete_growth_enabled', False):
+            delta_nodes = current_num_nodes - prev_num_nodes
+            if delta_nodes > 0:
+                # Only reward growth when below N_min (max_critical_nodes)
+                # This prevents growth reward from fighting homeostatic pressure
+                if current_num_nodes < getattr(self, 'max_critical_nodes', 40):
+                    growth_reward = getattr(self, 'delete_growth_coeff', 0.02) * delta_nodes
+                    raw_reward += growth_reward  # Add to raw_reward (embedded)
+                # else: suppress growth reward at high N (growth_reward remains 0.0)
+
+        # -----------------------------------------------------------------
+        # FIX 3: STABILITY REWARD (embedded, only in homeostatic ideal band)
+        # Aligns with homeostasis: only reward stability in N_min < N ≤ N_mid
+        # -----------------------------------------------------------------
+        stability_reward = 0.0
+        if getattr(self, 'delete_stability_enabled', False):
+            N_min = getattr(self, 'max_critical_nodes', 40)
+            N_max = getattr(self, 'threshold_critical_nodes', 400)
+            N_mid = 0.5 * (N_min + N_max)
+            # Only reward if in ideal band (N_min < N ≤ N_mid) AND no deletions
+            # This prevents stability reward from fighting homeostatic pressure at high N
+            if N_min < current_num_nodes <= N_mid and num_deletions == 0:
+                stability_reward = getattr(self, 'delete_stability_reward', 0.10)
+                raw_reward += stability_reward  # Add to raw_reward (embedded)
+
+        # -----------------------------------------------------------------
+        # FIX 4: NODE-COUNT HOMEOSTASIS REWARD (Critical Fix)
+        # Keeps N between max_critical_nodes and threshold_critical_nodes
+        # Creates smooth feedback loop to prevent runaway growth
+        # -----------------------------------------------------------------
+        homeostasis_reward = 0.0
+        if getattr(self, 'delete_homeostasis_enabled', True):
+            N = current_num_nodes
+            N_min = getattr(self, 'max_critical_nodes', 40)
+            N_max = getattr(self, 'threshold_critical_nodes', 400)
+            N_mid = 0.5 * (N_min + N_max)
             
-            if to_delete_flag.item() > 0.5:  # Node was marked for deletion
-                if node_was_deleted:
-                    # RULE 1: Node was marked for deletion and was actually deleted - reward
-                    raw_delete_reward += self.delete_proper_reward
-                else:
-                    # RULE 2: Node was marked for deletion but still exists - penalty
-                    raw_delete_reward -= self.delete_persistence_penalty
-            else:  # Node was NOT marked for deletion (to_delete=0)
-                if node_was_deleted:
-                    # RULE 3: Node was NOT marked but was deleted anyway - penalty
-                    raw_delete_reward -= self.delete_improper_penalty
-                else:
-                    # RULE 4: Node was NOT marked and still exists - reward (proper persistence)
-                    raw_delete_reward += self.delete_proper_reward
-        
-        # ============================================================================
-        # POTENTIAL-BASED REWARD SHAPING (PBRS) - Preserves Optimal Policy
-        # ============================================================================
-        # Apply PBRS to raw reward BEFORE scaling
-        # PBRS term: F(s,a,s') = gamma*Phi(s') - Phi(s)
-        # This biases learning toward compliant deletions without changing optimal policy
-        if self._pbrs_delete_enabled and self._pbrs_delete_coeff != 0.0:
+            k1 = getattr(self, 'delete_homeostasis_k1', 0.01)
+            k2 = getattr(self, 'delete_homeostasis_k2', 0.02)
+            k3 = getattr(self, 'delete_homeostasis_k3', 0.01)
+            K = getattr(self, 'delete_homeostasis_K', 1.0)
+            
+            if N < N_min:
+                # Encourage growth below min threshold
+                homeostasis_reward = k1 * (N_min - N)
+            elif N_min <= N <= N_mid:
+                # Small bonus for being in ideal band
+                homeostasis_reward = k2
+            elif N_mid < N < N_max:
+                # Discourage runaway growth (linear ramp)
+                homeostasis_reward = -k3 * (N - N_mid)
+            else:  # N >= N_max
+                # Strong penalty to enforce deletion
+                homeostasis_reward = -K
+            
+            raw_reward += homeostasis_reward
+            
+            # Log homeostasis feedback when significant
+            if abs(homeostasis_reward) > 0.1 or N > N_max or (self.current_step % 50 == 0 and N > N_mid):
+                if N < N_min:
+                    print(f"🌱 Homeostasis: +{homeostasis_reward:.3f} (N={N} < {N_min}, encourage growth)")
+                elif N >= N_max:
+                    print(f"🚨 Homeostasis: {homeostasis_reward:.3f} (N={N} ≥ {N_max}, ENFORCE DELETION!)")
+                elif N > N_mid:
+                    print(f"⚠️  Homeostasis: {homeostasis_reward:.3f} (N={N} > {N_mid:.0f}, discourage growth)")
+
+        # -----------------------------------------------------------------
+        # PBRS: Potential-Based Reward Shaping (optional)
+        # -----------------------------------------------------------------
+        if getattr(self, '_pbrs_delete_enabled', False) and getattr(self, '_pbrs_delete_coeff', 0.0) != 0.0:
             phi_prev = self._phi_delete_potential(prev_state)
             phi_new = self._phi_delete_potential(new_state)
-            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
-            # Add PBRS to raw reward BEFORE scaling
-            raw_delete_reward += self._pbrs_delete_coeff * pbrs_shaping
-        
-        # Scale by num_nodes to get value in approximately [-1, 1] range
-        # Base reward range: [-1, 1]
-        # PBRS can extend this to approximately [-1.125, 1.125] with default config
-        # (shaping_coeff=0.1, w_pending=1.0, w_safe=0.25, gamma=0.99)
-        # This small exceedance (±0.125) is intentional to allow PBRS guidance
-        delete_reward = raw_delete_reward / prev_num_nodes
-        
-        return delete_reward
+            raw_reward += getattr(self, '_pbrs_delete_coeff', 0.0) * (getattr(self, '_pbrs_gamma', 1.0) * phi_new - phi_prev)
+
+        # -----------------------------------------------------------------
+        # NORMALIZATION (offset guard to prevent division issues)
+        # -----------------------------------------------------------------
+        offset = max(0, int(getattr(self, 'delete_normalization_offset', 4)))
+        denom = prev_num_nodes + offset
+        delete_reward = raw_reward / float(max(1, denom))
+
+        # Store detailed components for debugging/analysis (will be added to info dict)
+        self._last_delete_components = {
+            'delete_raw': float(raw_reward),
+            'delete_normalized': float(delete_reward),
+            'growth_reward': float(growth_reward),
+            'homeostasis_reward': float(homeostasis_reward),
+            'stability_reward': float(stability_reward),
+            'adaptive_R3_weight': float(adaptive_R3_weight),
+            'num_deletions': num_deletions,
+            'rule1_reward': float(rule1_reward)
+        }
+
+        # Return single delete_reward (growth & stability embedded)
+        return float(delete_reward)
 
     def _node_exists_in_topology(self, node_x, node_y, topology, tolerance=None):
         """
@@ -2124,7 +2335,7 @@ class DurotaxisEnv(gym.Env):
             if pid in self._node_stagnation:
                 del self._node_stagnation[pid]
     
-    def _heuristically_mark_nodes_for_deletion(self):
+    def _heuristically_mark_nodes_for_deletion(self, debug=False):
         """
         Mark nodes for deletion based on the two rules from physical experiments.
         
@@ -2134,20 +2345,31 @@ class DurotaxisEnv(gym.Env):
         
         This implements the domain-specific deletion strategy observed in lab
         experiments, where the organism prunes inefficient parts of its network.
+        
+        Args:
+            debug: If True, print debug information about why marking didn't occur
         """
         # Rule 1: Only apply deletion logic if the number of nodes exceeds the critical threshold
         if self.topology.graph.num_nodes() <= self.max_critical_nodes:
+            if debug:
+                print(f"   🔍 Mark check: nodes={self.topology.graph.num_nodes()} <= max_critical={self.max_critical_nodes}, skipping")
             return
 
         # Ensure we have a past topology to compare against
         if self.dequeued_topology is None:
+            if debug:
+                print(f"   🔍 Mark check: dequeued_topology is None")
             return
         
         # Check if dequeued topology has the required data
         if not isinstance(self.dequeued_topology, dict):
+            if debug:
+                print(f"   🔍 Mark check: dequeued_topology is not a dict")
             return
         
         if 'persistent_id' not in self.dequeued_topology or 'node_features' not in self.dequeued_topology:
+            if debug:
+                print(f"   🔍 Mark check: missing keys in dequeued_topology: {list(self.dequeued_topology.keys())}")
             return
 
         # Rule 2: Identify nodes whose intensity at t-delta_time was less than current average
@@ -2159,6 +2381,8 @@ class DurotaxisEnv(gym.Env):
             node_stagnation=self._node_stagnation
         )
         if current_state['num_nodes'] == 0:
+            if debug:
+                print(f"   🔍 Mark check: current_state has 0 nodes")
             return
             
         current_intensities = current_state['node_features'][:, 2].cpu().numpy()
@@ -2175,6 +2399,8 @@ class DurotaxisEnv(gym.Env):
                 candidate_pids.append(pid)
 
         if not candidate_pids:
+            if debug:
+                print(f"   🔍 Mark check: no candidates (all {len(prev_pids)} prev nodes have intensity >= {current_avg_intensity:.3f})")
             return
 
         # Find these candidates in the current graph and mark the rightmost ones
@@ -2192,6 +2418,8 @@ class DurotaxisEnv(gym.Env):
                 continue
         
         if not nodes_to_mark:
+            if debug:
+                print(f"   🔍 Mark check: {len(candidate_pids)} candidates found but NONE exist in current graph (all deleted)")
             return
 
         # Sort candidates by their x-position (rightmost first)
@@ -2208,7 +2436,11 @@ class DurotaxisEnv(gym.Env):
             self._set_node_to_delete_flag(node_idx_to_mark, 1.0)
             nodes_marked_count += 1
         
-        # Optional: Debug logging (uncomment for debugging)
+        # Debug logging to verify marking is working
+        if nodes_marked_count > 0:
+            total_marked = self._count_nodes_marked_for_deletion()
+            print(f"🏷️  Marked {nodes_marked_count} nodes for deletion (total marked: {total_marked}/{self.topology.graph.num_nodes()}, excess: {excess_nodes})")
+
         # if nodes_marked_count > 0:
         #     print(f"🚩 Marked {nodes_marked_count} rightmost low-intensity nodes for deletion "
         #           f"(excess: {excess_nodes}, total: {self.topology.graph.num_nodes()})")

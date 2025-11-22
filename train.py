@@ -2884,10 +2884,16 @@ class DurotaxisTrainer:
             print(f"WARNING: Non-finite entropy loss detected! Resetting to zero.")
             total_entropy_loss = torch.tensor(0.0, device=self.device)
         
+        # Extract raw entropy value for logging (not the loss)
+        raw_entropy = eval_output.get('continuous_entropy', torch.tensor(0.0, device=self.device))
+        if isinstance(raw_entropy, torch.Tensor):
+            raw_entropy = raw_entropy.item() if raw_entropy.numel() == 1 else raw_entropy.mean().item()
+        
         return {
             'policy_loss_continuous': policy_losses['continuous'],
             'total_policy_loss': total_policy_loss,
             'entropy_loss': total_entropy_loss,
+            'raw_entropy': raw_entropy,  # Add raw entropy value for logging
             'continuous_weight_used': adaptive_continuous_weight,
             'continuous_grad_norm': getattr(self, 'continuous_grad_norm_ema', 0.0),
             # PPO health metrics (device-agnostic, continuous-only)
@@ -3009,18 +3015,23 @@ class DurotaxisTrainer:
             # Average across batch (continuous-only, no discrete)
             avg_continuous_loss = torch.stack([h['policy_loss_continuous'] for h in hybrid_policy_losses]).mean()
             avg_total_policy_loss = torch.stack([h['total_policy_loss'] for h in hybrid_policy_losses]).mean()
-            # Handle entropy loss - ensure all are tensors
+            # Handle entropy loss and raw entropy - ensure all are proper types
             entropy_losses_list = []
+            raw_entropy_list = []
             for h in hybrid_policy_losses:
                 entropy_loss = h['entropy_loss']
                 if not isinstance(entropy_loss, torch.Tensor):
                     entropy_loss = torch.tensor(entropy_loss, device=self.device)
                 entropy_losses_list.append(entropy_loss)
+                # Also aggregate raw entropy values
+                raw_entropy_list.append(h.get('raw_entropy', 0.0))
             avg_entropy_loss = torch.stack(entropy_losses_list).mean()
+            avg_raw_entropy = sum(raw_entropy_list) / len(raw_entropy_list) if raw_entropy_list else 0.0
             
             losses['policy_loss_continuous'] = avg_continuous_loss.item()
             losses['total_policy_loss'] = avg_total_policy_loss.item()
             losses['entropy_loss'] = avg_entropy_loss.item()
+            losses['raw_entropy'] = avg_raw_entropy  # Store averaged raw entropy
             
             # Show weight usage (continuous-only now)
             losses['continuous_weight'] = hybrid_policy_losses[0]['continuous_weight_used']
@@ -3051,8 +3062,8 @@ class DurotaxisTrainer:
         losses['total_value_loss'] = total_value_loss.item()
         
         # === TOTAL LOSS AND OPTIMIZATION ===
-        # Value loss weight (after normalizing component weights)
-        value_loss_weight = 0.5  # Standard PPO value loss weight
+        # Value loss weight (reduced to prevent destabilization)
+        value_loss_weight = 0.25  # Reduced from 0.5 to prevent value loss dominating
         total_loss = avg_total_policy_loss + value_loss_weight * total_value_loss + avg_entropy_loss
         losses['total_loss'] = total_loss.item()
         losses['value_loss_weight'] = value_loss_weight
@@ -3291,18 +3302,23 @@ class DurotaxisTrainer:
             # Average across batch (continuous-only, no discrete)
             avg_continuous_loss = torch.stack([h['policy_loss_continuous'] for h in hybrid_policy_losses]).mean()
             avg_total_policy_loss = torch.stack([h['total_policy_loss'] for h in hybrid_policy_losses]).mean()
-            # Handle entropy loss - ensure all are tensors
+            # Handle entropy loss and raw entropy - ensure all are proper types
             entropy_losses_list = []
+            raw_entropy_list = []
             for h in hybrid_policy_losses:
                 entropy_loss = h['entropy_loss']
                 if not isinstance(entropy_loss, torch.Tensor):
                     entropy_loss = torch.tensor(entropy_loss, device=self.device)
                 entropy_losses_list.append(entropy_loss)
+                # Also aggregate raw entropy values
+                raw_entropy_list.append(h.get('raw_entropy', 0.0))
             avg_entropy_loss = torch.stack(entropy_losses_list).mean()
+            avg_raw_entropy = sum(raw_entropy_list) / len(raw_entropy_list) if raw_entropy_list else 0.0
             
             losses['policy_loss_continuous'] = avg_continuous_loss.item()
             losses['total_policy_loss'] = avg_total_policy_loss.item()
             losses['entropy_loss'] = avg_entropy_loss.item()
+            losses['raw_entropy'] = avg_raw_entropy  # Store averaged raw entropy
             
             # Show weight usage (continuous-only now)
             losses['continuous_weight'] = hybrid_policy_losses[0]['continuous_weight_used']
@@ -3830,14 +3846,15 @@ class DurotaxisTrainer:
                     ratio_continuous = final_losses.get('ratio_continuous', 1.0)
                     value_loss = final_losses.get('total_value_loss', 0.0)
                     policy_loss = final_losses.get('total_policy_loss', 0.0)
-                    entropy = final_losses.get('entropy_loss', 0.0)
+                    entropy_loss = final_losses.get('entropy_loss', 0.0)
+                    raw_entropy = final_losses.get('raw_entropy', 0.0)  # Use raw entropy, not loss
                     explained_var = final_losses.get('explained_variance', 0.0)
                     
                     print(f"   📊 PPO Health Metrics (Delete Ratio Architecture):")
                     print(f"      KL: {approx_kl:.4f} (target: {self.target_kl:.4f}) {'⚠️ HIGH' if approx_kl > self.target_kl else '✓'}")
                     print(f"      Clip Frac: {clip_frac_continuous:.3f}")
                     print(f"      Ratio: {ratio_continuous:.3f}")
-                    print(f"      Loss: Policy={policy_loss:.4f} Value={value_loss:.4f} Entropy={entropy:.4f}")
+                    print(f"      Loss: Policy={policy_loss:.4f} Value={value_loss:.4f} Entropy={raw_entropy:.4f}")
                     print(f"      Explained Var: {explained_var:.3f} {'✓' if explained_var > 0.5 else '⚠️ LOW'}")
                     if early_stopped:
                         print(f"      ⚠️  Training stopped early due to high KL divergence")

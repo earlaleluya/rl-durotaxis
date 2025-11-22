@@ -15,14 +15,15 @@ environment:
     b: 1.0
   
   # Node and topology limits
-  init_num_nodes: 5
-  max_critical_nodes: 50
-  threshold_critical_nodes: 200
+  init_num_nodes: 60
+  max_critical_nodes: 40  # Marking threshold: marks nodes when N > this value
+  state_space_multiplier: 2.0  # Observation capacity: K = multiplier × max_critical_nodes
+  threshold_critical_nodes: 400
   max_steps: 1000
   
   # Simulation parameters
   delta_time: 3
-  delta_intensity: 2.50
+  delta_intensity: 2.5
   consecutive_left_moves_limit: 30
   
   # Visualization
@@ -46,20 +47,72 @@ environment:
   # Makes priority explicit in the task reward, not just critic loss weights
   reward_weights:
     delete_weight: 1.0         
-    distance_weight: 1.0       
-    termination_weight: 1.0   
+    distance_weight: 0.001       
+    termination_weight: 0.01
   
   # ============================================================================
   # CORE REWARD COMPONENTS 
   # ============================================================================
   
-  # Delete Reward (Priority 1: Proper deletion compliance)
-  # Scaled to [-1, 1] by dividing by num_nodes
-  # Use proper_deletion=1.0 for clean [-1, 1] range
+  # Delete Reward (Growth-friendly design)
+  # Encourages BOTH marking AND growth while preventing collapse
+  # Key: RULE 3 penalty is VERY mild to allow growth exploration
   delete_reward:
-    proper_deletion: 1.0
-    persistence_penalty: 1.0
-    improper_deletion_penalty: 1.0
+    # RULE 1: Marked + deleted (strong positive - teaches mark→delete)
+    proper_deletion: 0.60
+    
+    # RULE 2: Marked + persists (weak negative - persistence is common)
+    persistence_penalty: 0.10
+    
+    # RULE 3: Unmarked + deleted (VERY SMALL - allows growth)
+    improper_deletion_penalty: 0.05
+    
+    # RULE 4: Unmarked + persists (positive - stabilizes high N)
+    persistence_reward: 0.08
+    
+    # Normalization offset (prevents collapse-causing dilution at high N)
+    # delete_reward = raw_reward / (prev_num_nodes + normalization_offset)
+    normalization_offset: 4
+    
+    # N-Scaling for RULE 1 (encourages marking at high N)
+    # RULE 1 reward becomes: base + scale_coefficient × min(N, scale_cap)
+    # This keeps deletion signals meaningful even at large N
+    rule1_n_scaling:
+      enabled: true
+      scale_coefficient: 0.02    # Reward increase per node
+      scale_cap: 100             # Maximum N for scaling (prevents explosion)
+    
+    # Growth reward (encourages exploration beyond max_critical_nodes)
+    # Applied when topology grows (new_N > prev_N)
+    growth_reward:
+      enabled: true
+      coefficient: 0.02          # Reward per new node
+    
+    # Homeostatic band reward (keeps N in optimal range)
+    # Prevents runaway growth by creating feedback pressure
+    homeostasis_reward:
+      enabled: true
+      k1: 0.01                   # Growth encouragement below N_min
+      k2: 0.02                   # Small bonus in ideal range
+      k3: 0.01                   # Discouragement above N_mid
+      K: 1.0                     # Strong penalty at/above N_max
+    
+    # Stability reward (teaches high-N maintenance in sweet spot range)
+    # Applied when N is in optimal range AND no deletions occurred
+    stability_reward:
+      enabled: true
+      base_reward: 0.10          # Flat reward for maintaining stable topology
+      min_nodes: 40              # Minimum N to trigger (max_critical_nodes)
+      max_nodes: 250             # Maximum N to trigger (stops encouraging large N)
+    
+    # Adaptive penalty scaling (RULE 3 shrinks as N grows)
+    # Encourages growth: improper deletion penalty minimal at high N
+    adaptive_scaling:
+      high_node_threshold: 12        # Above this N: penalty scaled to 25% (very soft)
+      low_node_threshold: 6          # Below this N: penalty at 100% (strict)
+      high_penalty_scale: 0.25       # Scale factor at high N (1.00 → 0.25)
+      low_penalty_scale: 1.0         # Scale factor at low N (full penalty)
+      # Linear interpolation: goes 1.00 → 0.25 as N: 6 → 12
     
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
@@ -68,18 +121,7 @@ environment:
       phi_weight_pending_marked: 1.0
       phi_weight_safe_unmarked: 0.25
   
-  # Spawn Reward (Priority 2: Intensity-based spawning)
-  spawn_rewards:
-    spawn_success_reward: 1.0     
-    spawn_failure_penalty: 1.0     
-    
-    # PBRS: Potential-Based Reward Shaping (optional)
-    pbrs:
-      enabled: false
-      shaping_coeff: 0.05             # Lower than delete (0.05 vs 0.1)
-      phi_weight_spawnable: 1.0
-  
-  # Distance Reward (Priority 3: Centroid movement toward goal)
+  # Distance Reward (Centroid movement toward goal)
   distance_mode:
     use_delta_distance: true
     distance_reward_scale: 5.0
@@ -87,8 +129,8 @@ environment:
     # Substrate-aware normalization (bounds distance reward to [-1, 1])
     substrate_aware_scaling: true      # Use substrate gradient for scaling
     use_tanh_normalization: true       # Use tanh (true) or softsign (false)
-    target_delta_x: 0.05              # Expected good step size for tuning
-    tanh_scale: 1.4722                # atanh(0.9) ≈ 1.4722 for sensitivity tuning
+    target_delta_x: 2.5              # Expected good step size for tuning
+    tanh_scale: 1.4722                # atanh(0.9) = (approx.) 1.4722 for sensitivity tuning
     gradient_cap: null                # Optional: cap gradient for exponential substrates (e.g., 10.0)
     
     # PBRS: Potential-Based Reward Shaping (optional)
@@ -109,13 +151,17 @@ environment:
     timeout_penalty: 0.0                     # Max steps reached (neutral)
   
   # ============================================================================
-  # OBSERVATION SELECTION
+  # OBSERVATION SELECTION (Deletion-Aware)
   # ============================================================================
+  # Prioritizes nodes important for deletion decisions:
+  # - Rightward nodes (x-coordinate): spatial progress
+  # - High-intensity nodes: candidates for marking (low intensity = marked)
+  # - Representationally important nodes: high embedding norm
   observation_selection:
     method: topk_x
-    w_x: 1.0
-    w_intensity: 0.0
-    w_norm: 0.0
+    w_x: 0.6           # Rightward bias (durotaxis direction)
+    w_intensity: 0.3   # Intensity-based selection (marking criterion)
+    w_norm: 0.1        # Representational importance
 
 # ============================================================================
 # NETWORK ARCHITECTURE
@@ -140,9 +186,9 @@ actor_critic:
   # Action parameter bounds
   action_parameter_bounds:
     delete_ratio: [0.0, 0.7]
-    gamma: [0.5, 15.0]
-    alpha: [0.5, 4.0]
-    noise: [0.05, 0.5]
+    gamma: [0.5, 2.0]
+    alpha: [0.5, 2.0]
+    noise: [0.05, 0.15]
     theta: [-0.5236, 0.5236]  # -30 to 30 deg
   
   # Value function components
@@ -165,18 +211,19 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
   ppo_epochs: 4
-  clip_epsilon: 0.1
-  value_loss_coeff: 0.5
+  clip_epsilon: 0.2
+  value_loss_coeff: 0.25
   max_grad_norm: 0.5
+  target_kl: 0.03
 
 # ============================================================================
 # TRAINER CONFIGURATION
 # ============================================================================
 trainer:
-  substrate_type: linear
+  substrate_type: random
   total_episodes: 1000
   max_steps: 1000
-  learning_rate: 0.000001
+  learning_rate: 0.0001
   save_dir: "./training_results"
   
   # Resume training
@@ -197,7 +244,7 @@ trainer:
     tertiary_weight: 1.0
     window_episodes: 50
     min_improvement: 0.01
-    min_episode_for_best_save: 50
+    min_episode_for_best_save: 20
   
   # Learning rate schedule
   warmup_updates_for_best: 5
@@ -218,7 +265,7 @@ trainer:
   
   # Return normalization (prevents value loss explosion)
   normalize_returns: true
-  return_scale: 1.0
+  return_scale: 10.0
   
   # Logging
   moving_avg_window: 20
@@ -252,17 +299,17 @@ trainer:
     exponential_b_range: [0.5, 1.5]       # Base value range for exponential substrate
   
   # Optimization
-  entropy_bonus_coeff: 0.03
+  entropy_bonus_coeff: 0.1
   weight_momentum: 0.9
   normalize_weights_every: 10
   
   # Component weights (for multi-head value function)
   # Normalized to sum to 1.0 for balanced critic head learning
   component_weights:
-    total_reward: 0.25
-    delete_reward: 0.25
-    distance_reward: 0.25
-    termination_reward: 0.25
+    total_reward: 0.4
+    delete_reward: 0.4
+    distance_reward: 0.1
+    termination_reward: 0.1
   
   # Policy loss weights
   policy_loss_weights:
@@ -300,11 +347,11 @@ trainer:
   # Entropy regularization
   entropy_regularization:
     enable_adaptive_entropy: true
-    entropy_coeff_start: 0.25
-    entropy_coeff_end: 0.05
-    entropy_decay_episodes: 300
+    entropy_coeff_start: 0.5
+    entropy_coeff_end: 0.1
+    entropy_decay_episodes: 500
     continuous_entropy_weight: 1.0
-    min_entropy_threshold: 0.1
+    min_entropy_threshold: 0.5
 
 # ============================================================================
 # SYSTEM CONFIGURATION
