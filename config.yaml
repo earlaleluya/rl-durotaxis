@@ -74,6 +74,37 @@ environment:
     # delete_reward = raw_reward / (prev_num_nodes + normalization_offset)
     normalization_offset: 4
     
+    # N-Scaling for RULE 1 (encourages marking at high N)
+    # RULE 1 reward becomes: base + scale_coefficient × min(N, scale_cap)
+    # This keeps deletion signals meaningful even at large N
+    rule1_n_scaling:
+      enabled: true
+      scale_coefficient: 0.02    # Reward increase per node
+      scale_cap: 100             # Maximum N for scaling (prevents explosion)
+    
+    # Growth reward (encourages exploration beyond max_critical_nodes)
+    # Applied when topology grows (new_N > prev_N)
+    growth_reward:
+      enabled: true
+      coefficient: 0.02          # Reward per new node
+    
+    # Homeostatic band reward (keeps N in optimal range)
+    # Prevents runaway growth by creating feedback pressure
+    homeostasis_reward:
+      enabled: true
+      k1: 0.01                   # Growth encouragement below N_min
+      k2: 0.02                   # Small bonus in ideal range
+      k3: 0.01                   # Discouragement above N_mid
+      K: 1.0                     # Strong penalty at/above N_max
+    
+    # Stability reward (teaches high-N maintenance in sweet spot range)
+    # Applied when N is in optimal range AND no deletions occurred
+    stability_reward:
+      enabled: true
+      base_reward: 0.10          # Flat reward for maintaining stable topology
+      min_nodes: 40              # Minimum N to trigger (max_critical_nodes)
+      max_nodes: 250             # Maximum N to trigger (stops encouraging large N)
+    
     # Adaptive penalty scaling (RULE 3 shrinks as N grows)
     # Encourages growth: improper deletion penalty minimal at high N
     adaptive_scaling:
