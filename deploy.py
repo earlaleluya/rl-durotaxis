@@ -12,10 +12,10 @@ Delete Ratio Architecture:
 
 Usage:
     python deploy.py --substrate_type linear --m 0.05 --b 1.0 \
-                     --substrate_width 200 --substrate_height 100 \
+                     --substrate_width 600 --substrate_height 400 \
                      --deterministic --max_episodes 10 --max_steps 1000 \
-                     --max_critical_nodes 50 --threshold_critical_nodes 200 \
-                     --model_path ./training_results/run0018/best_model_batch2.pt 
+                     --max_critical_nodes 40 --threshold_critical_nodes 400 \
+                     --model_path ./training_results/run0039/best_model_batch3.pt 
     
     # Without visualization, custom substrate size
     python deploy.py --model_path ./training_results/run0018/best_model_batch2.pt \
@@ -32,6 +32,7 @@ import torch
 from device import cpu_numpy
 import numpy as np
 import json
+import pandas as pd
 from typing import Dict, List, Optional, Tuple
 import time
 
@@ -194,6 +195,7 @@ class DurotaxisDeployment:
         episode_rewards = []
         episode_actions = []
         episode_values = []
+        centroid_data = []  # Track centroid positions and substrate intensity
         step_count = 0
         done = False
         
@@ -282,6 +284,32 @@ class DurotaxisDeployment:
             # Store rewards
             episode_rewards.append(reward_components)
             
+            # Track centroid position and substrate intensity
+            if num_nodes > 0:
+                # Get graph features which contain centroid coordinates
+                state_features = self.state_extractor.get_state_features(
+                    include_substrate=True,
+                    node_age=env._node_age,
+                    node_stagnation=env._node_stagnation
+                )
+                graph_features = state_features.get('graph_features', None)
+                
+                if graph_features is not None and len(graph_features) >= 5:
+                    # graph_features typically contains: [num_nodes, num_edges, avg_degree, centroid_x, centroid_y, ...]
+                    cx = float(graph_features[3])
+                    cy = float(graph_features[4])
+                    
+                    # Get substrate intensity at centroid position
+                    intensity = env.substrate.get_intensity((cx, cy))
+                    
+                    centroid_data.append({
+                        'episode': episode_num if episode_num is not None else 0,
+                        'step': step_count,
+                        'cx': cx,
+                        'cy': cy,
+                        'intensity': float(intensity)
+                    })
+            
             if verbose:
                 total_reward = reward_components.get('total_reward', 0.0)
                 print(f"   Step {step_count+1}: N={num_nodes:3d} E={num_edges:3d} | R={total_reward:+7.3f} | Done={done}")
@@ -315,7 +343,8 @@ class DurotaxisDeployment:
             'terminated': done,
             'rewards_per_step': episode_rewards,
             'actions_per_step': episode_actions,
-            'values_per_step': episode_values
+            'values_per_step': episode_values,
+            'centroid_data': centroid_data
         }
         
         if verbose:
@@ -448,6 +477,9 @@ class DurotaxisDeployment:
                 b, 
                 verbose_eval
             )
+            
+            # Save centroid trajectory CSV
+            self._save_centroid_csv(episode_stats, substrate_type, m, b, verbose_eval)
         
         return evaluation_results
     
@@ -659,6 +691,49 @@ class DurotaxisDeployment:
         if verbose:
             print(f"   Loss metrics: loss_metrics_{timestamp}.json (placeholder)")
             print(f"   ✅ All evaluation files saved successfully!")
+    
+    def _save_centroid_csv(self,
+                          episode_stats: List[Dict],
+                          substrate_type: str,
+                          m: float,
+                          b: float,
+                          verbose: bool = True):
+        """
+        Save centroid trajectory data to CSV file.
+        
+        Creates a CSV file with columns: episode, step, cx, cy, intensity
+        
+        Args:
+            episode_stats: List of per-episode statistics
+            substrate_type: Type of substrate used
+            m: Substrate parameter m
+            b: Substrate parameter b
+            verbose: Whether to print save confirmation
+        """
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.dirname(self.model_path)
+        
+        # Collect all centroid data from all episodes
+        all_centroid_data = []
+        for ep_stats in episode_stats:
+            centroid_data = ep_stats.get('centroid_data', [])
+            all_centroid_data.extend(centroid_data)
+        
+        if not all_centroid_data:
+            if verbose:
+                print(f"   ⚠️  No centroid data to save")
+            return
+        
+        # Create DataFrame
+        df = pd.DataFrame(all_centroid_data)
+        
+        # Save to CSV
+        csv_filename = f"centroid_trajectory_{substrate_type}_m{m}_b{b}_{timestamp}.csv"
+        csv_path = os.path.join(output_dir, csv_filename)
+        df.to_csv(csv_path, index=False)
+        
+        if verbose:
+            print(f"   📊 Centroid trajectory: {csv_filename} ({len(df)} data points)")
 
 
 def main():
