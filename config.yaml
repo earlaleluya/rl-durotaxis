@@ -15,8 +15,8 @@ environment:
     b: 1.0
   
   # Node and topology limits
-  init_num_nodes: 60
-  max_critical_nodes: 40  # Marking threshold: marks nodes when N > this value
+  init_num_nodes: 70
+  max_critical_nodes: 40  
   state_space_multiplier: 2.0  # Observation capacity: K = multiplier × max_critical_nodes
   threshold_critical_nodes: 400
   max_steps: 1000
@@ -143,10 +143,10 @@ actor_critic:
   # Action parameter bounds
   action_parameter_bounds:
     delete_ratio: [0.0, 0.7]
-    gamma: [0.5, 2.0]
-    alpha: [0.5, 2.0]
-    noise: [0.05, 0.15]
-    theta: [-0.5236, 0.5236]  # -30 to 30 deg
+    gamma: [0.5, 1.0]
+    alpha: [0.5, 1.0]
+    noise: [0.05, 0.10]
+    theta: [-0.3491, 0.3491]  # -20 to 20 deg
   
   # Value function components
   value_components:
