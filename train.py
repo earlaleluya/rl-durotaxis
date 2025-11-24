@@ -4023,7 +4023,7 @@ class DurotaxisTrainer:
                 
                 # Check if success_rate is 1.0 and save model
                 if kpis['success_rate'] == 1.0:
-                    success_model_filename = f"save_model_batch{batch_count}.pt"
+                    success_model_filename = f"succ_model_batch{batch_count}.pt"
                     self.save_model(success_model_filename, episode_count)
                     print(f"🎯 Perfect success model saved: {success_model_filename} (success_rate=1.0)")
                 

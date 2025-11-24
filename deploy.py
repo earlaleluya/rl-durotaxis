@@ -15,7 +15,7 @@ Usage:
                      --substrate_width 600 --substrate_height 400 \
                      --deterministic --max_episodes 10 --max_steps 1000 \
                      --max_critical_nodes 40 --threshold_critical_nodes 400 \
-                     --model_path ./training_results/run0039/best_model_batch3.pt 
+                     --model_path ./training_results/run0040/save_model_batch39.pt 
     
     # Without visualization, custom substrate size
     python deploy.py --model_path ./training_results/run0018/best_model_batch2.pt \
