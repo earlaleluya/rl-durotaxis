@@ -4021,6 +4021,12 @@ class DurotaxisTrainer:
                 kpis = self._compute_model_selection_kpis()
                 composite_score = self._compute_composite_score(kpis)
                 
+                # Check if success_rate is 1.0 and save model
+                if kpis['success_rate'] == 1.0:
+                    success_model_filename = f"succ_model_batch{batch_count}.pt"
+                    self.save_model(success_model_filename, episode_count)
+                    print(f"🎯 Perfect success model saved: {success_model_filename} (success_rate=1.0)")
+                
                 # Check if this is a new best model (with warmup and episode checks)
                 if self._should_save_best_model(kpis, composite_score, episode_count):
                     prev_score = self.best_model_score

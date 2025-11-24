@@ -15,8 +15,8 @@ environment:
     b: 1.0
   
   # Node and topology limits
-  init_num_nodes: 60
-  max_critical_nodes: 40  # Marking threshold: marks nodes when N > this value
+  init_num_nodes: 70
+  max_critical_nodes: 40  
   state_space_multiplier: 2.0  # Observation capacity: K = multiplier × max_critical_nodes
   threshold_critical_nodes: 400
   max_steps: 1000
@@ -54,72 +54,29 @@ environment:
   # CORE REWARD COMPONENTS 
   # ============================================================================
   
-  # Delete Reward (Growth-friendly design)
-  # Encourages BOTH marking AND growth while preventing collapse
-  # Key: RULE 3 penalty is VERY mild to allow growth exploration
+  # Delete Reward (Simplified Homeostatic Design)
+  # Three-component system optimized for simplicity and interpretability:
+  #   1. Homeostasis: Linear feedback to maintain N in [N_min, N_max] band
+  #      - N < N_min: linear penalty (encourages growth)
+  #      - N_min ≤ N ≤ N_max: stable reward (optimal range)
+  #      - N > N_max: linear penalty (discourages runaway growth)
+  #   2. Marking rewards: Encourage proper mark-then-delete workflow
+  #      - Marked + deleted: positive reward (correct behavior)
+  #      - Marked + persists: small penalty (marking without action)
+  #      - Unmarked + deleted: large penalty (improper deletion)
+  #   3. Total clipping: All rewards clipped to [-1, 1] range
+  #
+  # Key parameters:
+  #   - N_min = max_critical_nodes (from environment config)
+  #   - N_max = delta_time × N_min (adaptive band width)
   delete_reward:
-    # RULE 1: Marked + deleted (strong positive - teaches mark→delete)
-    proper_deletion: 0.60
+    # Homeostasis: reward for stable population in [N_min, N_max] band
+    homeostasis_stable_reward: 0.3
     
-    # RULE 2: Marked + persists (weak negative - persistence is common)
-    persistence_penalty: 0.10
-    
-    # RULE 3: Unmarked + deleted (VERY SMALL - allows growth)
-    improper_deletion_penalty: 0.05
-    
-    # RULE 4: Unmarked + persists (positive - stabilizes high N)
-    persistence_reward: 0.08
-    
-    # Normalization offset (prevents collapse-causing dilution at high N)
-    # delete_reward = raw_reward / (prev_num_nodes + normalization_offset)
-    normalization_offset: 4
-    
-    # N-Scaling for RULE 1 (encourages marking at high N)
-    # RULE 1 reward becomes: base + scale_coefficient × min(N, scale_cap)
-    # This keeps deletion signals meaningful even at large N
-    rule1_n_scaling:
-      enabled: true
-      scale_coefficient: 0.02    # Reward increase per node
-      scale_cap: 100             # Maximum N for scaling (prevents explosion)
-    
-    # Growth reward (encourages exploration beyond max_critical_nodes)
-    # Applied when topology grows (new_N > prev_N)
-    growth_reward:
-      enabled: true
-      coefficient: 0.02          # Reward per new node
-    
-    # Homeostatic band reward (keeps N in optimal range)
-    # Prevents runaway growth by creating feedback pressure
-    homeostasis_reward:
-      enabled: true
-      k1: 0.01                   # Growth encouragement below N_min
-      k2: 0.02                   # Small bonus in ideal range
-      k3: 0.01                   # Discouragement above N_mid
-      K: 1.0                     # Strong penalty at/above N_max
-    
-    # Stability reward (teaches high-N maintenance in sweet spot range)
-    # Applied when N is in optimal range AND no deletions occurred
-    stability_reward:
-      enabled: true
-      base_reward: 0.10          # Flat reward for maintaining stable topology
-      min_nodes: 40              # Minimum N to trigger (max_critical_nodes)
-      max_nodes: 250             # Maximum N to trigger (stops encouraging large N)
-    
-    # Adaptive penalty scaling (RULE 3 shrinks as N grows)
-    # Encourages growth: improper deletion penalty minimal at high N
-    adaptive_scaling:
-      high_node_threshold: 12        # Above this N: penalty scaled to 25% (very soft)
-      low_node_threshold: 6          # Below this N: penalty at 100% (strict)
-      high_penalty_scale: 0.25       # Scale factor at high N (1.00 → 0.25)
-      low_penalty_scale: 1.0         # Scale factor at low N (full penalty)
-      # Linear interpolation: goes 1.00 → 0.25 as N: 6 → 12
-    
-    # PBRS: Potential-Based Reward Shaping (optional)
-    pbrs:
-      enabled: false
-      shaping_coeff: 0.1              
-      phi_weight_pending_marked: 1.0
-      phi_weight_safe_unmarked: 0.25
+    # Marking rewards (proportional to fraction of prev_N, capped to 1.0)
+    marked_deleted_reward: 0.6      # Reward for deleting marked nodes
+    marked_persist_penalty: -0.2    # Penalty for marked nodes that persist
+    bad_delete_penalty: -0.8        # Penalty for deleting unmarked nodes
   
   # Distance Reward (Centroid movement toward goal)
   distance_mode:
@@ -186,10 +143,10 @@ actor_critic:
   # Action parameter bounds
   action_parameter_bounds:
     delete_ratio: [0.0, 0.7]
-    gamma: [0.5, 2.0]
-    alpha: [0.5, 2.0]
-    noise: [0.05, 0.15]
-    theta: [-0.5236, 0.5236]  # -30 to 30 deg
+    gamma: [0.5, 1.0]
+    alpha: [0.5, 1.0]
+    noise: [0.05, 0.10]
+    theta: [-0.3491, 0.3491]  # -20 to 20 deg
   
   # Value function components
   value_components:
