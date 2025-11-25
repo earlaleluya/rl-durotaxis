@@ -13,7 +13,7 @@ Delete Ratio Architecture:
 Usage:
     python deploy.py --substrate_type linear --m 0.05 --b 1.0 \
                      --substrate_width 100 --substrate_height 40 \
-                     --deterministic --max_episodes 10 --max_steps 1000 \
+                     --deterministic --max_episodes 3 --max_steps 1000 \
                      --max_critical_nodes 40 --threshold_critical_nodes 400 \
                      --model_path ./training_results/run0041/succ_model_batch39.pt \
                      --init-nodes 10 
@@ -206,6 +206,42 @@ class DurotaxisDeployment:
         
         initial_node_count = env.topology.graph.num_nodes()  # Track initial count
         
+        # Log initial state at step 0 (before any actions)
+        if initial_node_count > 0:
+            state_features = self.state_extractor.get_state_features(
+                include_substrate=True,
+                node_age=env._node_age,
+                node_stagnation=env._node_stagnation
+            )
+            graph_features = state_features.get('graph_features', None)
+            
+            if graph_features is not None and len(graph_features) >= 11:
+                num_nodes_feature = int(graph_features[0])
+                cx = float(graph_features[3])
+                cy = float(graph_features[4])
+                bbox_width = float(graph_features[9])
+                bbox_height = float(graph_features[10])
+                intensity = env.substrate.get_intensity((cx, cy))
+                
+                # Initial state has no actions yet, so parameters are 0
+                centroid_data.append({
+                    'episode': episode_num if episode_num is not None else 0,
+                    'step': 0,
+                    'num_nodes': num_nodes_feature,
+                    'cx': cx,
+                    'cy': cy,
+                    'intensity': float(intensity),
+                    'bbox_height': bbox_height,
+                    'bbox_width': bbox_width,
+                    'delete_ratio': 0.0,
+                    'gamma': 0.0,
+                    'alpha': 0.0,
+                    'noise': 0.0,
+                    'R_magnitude': 0.0,
+                    'theta': 0.0,
+                    'intensity_spawn': float(intensity)
+                })
+        
         while not done and step_count < max_steps:
             # Get current state with age/stagnation tracking from environment
             state_dict = self.state_extractor.get_state_features(
@@ -258,6 +294,13 @@ class DurotaxisDeployment:
                 # Get single global spawn parameters
                 spawn_params = self.network.get_spawn_parameters(output)
                 
+                # Extract action parameters for logging
+                delete_ratio = float(continuous_actions[0].item()) if len(continuous_actions) > 0 else 0.0
+                gamma = float(spawn_params[0])
+                alpha = float(spawn_params[1])
+                noise_param = float(spawn_params[2])
+                theta = float(spawn_params[3])
+                
                 for node_id, action_type in topology_actions.items():
                     try:
                         if action_type == 'spawn':
@@ -287,7 +330,7 @@ class DurotaxisDeployment:
             # Store rewards
             episode_rewards.append(reward_components)
             
-            # Track centroid position and substrate intensity
+            # Track centroid position and substrate intensity (after step execution)
             if num_nodes > 0:
                 # Get graph features which contain centroid coordinates
                 state_features = self.state_extractor.get_state_features(
@@ -297,20 +340,56 @@ class DurotaxisDeployment:
                 )
                 graph_features = state_features.get('graph_features', None)
                 
-                if graph_features is not None and len(graph_features) >= 5:
-                    # graph_features typically contains: [num_nodes, num_edges, avg_degree, centroid_x, centroid_y, ...]
+                if graph_features is not None and len(graph_features) >= 11:
+                    # graph_features structure: [num_nodes, num_edges, avg_degree, 
+                    #                            centroid_x, centroid_y, bbox_min_x, bbox_min_y,
+                    #                            bbox_max_x, bbox_max_y, bbox_size_x, bbox_size_y, ...]
+                    num_nodes_feature = int(graph_features[0])  # num_nodes from graph features
                     cx = float(graph_features[3])
                     cy = float(graph_features[4])
+                    
+                    # Extract bounding box size (width and height)
+                    bbox_width = float(graph_features[9])   # bbox_size_x
+                    bbox_height = float(graph_features[10])  # bbox_size_y
                     
                     # Get substrate intensity at centroid position
                     intensity = env.substrate.get_intensity((cx, cy))
                     
+                    # Compute R_magnitude using Hill equation
+                    # Hill equation: R = gamma * (1.0 / (1.0 + (alpha / intensity)^2)) + noise
+                    if 'continuous_actions' in output:
+                        intensity_val = max(float(intensity), 1e-6)  # Avoid division by zero
+                        R_magnitude = gamma * (1.0 / (1.0 + (alpha / intensity_val)**2)) + noise_param
+                        
+                        # Compute spawn location (sx, sy) from centroid using R_magnitude and theta
+                        import numpy as np
+                        sx = cx + R_magnitude * np.cos(theta)
+                        sy = cy + R_magnitude * np.sin(theta)
+                        
+                        # Get substrate intensity at spawn location
+                        intensity_spawn = env.substrate.get_intensity((sx, sy))
+                    else:
+                        R_magnitude = 0.0
+                        sx = cx
+                        sy = cy
+                        intensity_spawn = intensity
+                    
                     centroid_data.append({
                         'episode': episode_num if episode_num is not None else 0,
-                        'step': step_count,
+                        'step': step_count + 1,  # Log as next step since actions were executed
+                        'num_nodes': num_nodes_feature,
                         'cx': cx,
                         'cy': cy,
-                        'intensity': float(intensity)
+                        'intensity': float(intensity),
+                        'bbox_height': bbox_height,
+                        'bbox_width': bbox_width,
+                        'delete_ratio': delete_ratio if 'continuous_actions' in output else 0.0,
+                        'gamma': gamma if 'continuous_actions' in output else 0.0,
+                        'alpha': alpha if 'continuous_actions' in output else 0.0,
+                        'noise': noise_param if 'continuous_actions' in output else 0.0,
+                        'R_magnitude': R_magnitude,
+                        'theta': theta if 'continuous_actions' in output else 0.0,
+                        'intensity_spawn': float(intensity_spawn)
                     })
             
             if verbose:
