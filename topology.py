@@ -1167,9 +1167,9 @@ class Topology:
                     except:
                         pass
                 # Add green marker for centroid
-                self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
-                               edgecolor='black', linewidth=1, label='Centroid')
-                self.ax.legend()
+                # self.ax.scatter(centroid[0], centroid[1], c='green', s=100, marker='*', 
+                #                edgecolor='black', linewidth=1, label='Centroid')
+                # self.ax.legend()
                 # Uniform title format
                 episode_str = f"Ep{episode_num:2d}" if episode_num is not None else "Ep??"
                 step_str = f"Step{getattr(self, '_step_counter', '??'):3d}" if hasattr(self, '_step_counter') else "Step???"

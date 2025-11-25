@@ -290,6 +290,15 @@ class DurotaxisEnv(gym.Env):
             if value is not None:
                 config[key] = value
         
+        # Handle legacy substrate_m and substrate_b parameters (convert to substrate_params dict)
+        if 'substrate_m' in kwargs or 'substrate_b' in kwargs:
+            if 'substrate_params' not in config:
+                config['substrate_params'] = {}
+            if 'substrate_m' in kwargs and kwargs['substrate_m'] is not None:
+                config['substrate_params']['m'] = kwargs['substrate_m']
+            if 'substrate_b' in kwargs and kwargs['substrate_b'] is not None:
+                config['substrate_params']['b'] = kwargs['substrate_b']
+        
         # Environment parameters
         self.substrate_size = tuple(config.get('substrate_size', [200, 200]))
         self.substrate_type = config.get('substrate_type', 'linear')
@@ -2025,9 +2034,15 @@ class DurotaxisEnv(gym.Env):
 
         # 5. Terminate if one node from the graph reaches the rightmost area ('success termination')
         if state['num_nodes'] > 0:
-            # Get substrate width to determine success threshold (last 1% of width)
+            # Get substrate width to determine success threshold
             substrate_width = self.substrate.width
-            success_threshold = substrate_width * 0.99  # Success when reaching 99% of width (last 1% area)
+            # Account for spawn margin: margin_x = max(2.0, 0.01 * width)
+            # Nodes can't spawn beyond width - margin, so threshold must be reachable
+            margin_x = max(2.0, 0.01 * substrate_width)
+            max_reachable_x = substrate_width - margin_x
+            # Set success threshold to 95% of max reachable position (or 90% of substrate width, whichever is higher)
+            # This ensures the threshold is always achievable
+            success_threshold = max(max_reachable_x * 0.95, substrate_width * 0.90)
             
             # Check each node's x-position (first element of node_features)
             node_features = state['node_features']

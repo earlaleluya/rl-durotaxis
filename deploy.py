@@ -12,10 +12,10 @@ Delete Ratio Architecture:
 
 Usage:
     python deploy.py --substrate_type linear --m 0.05 --b 1.0 \
-                     --substrate_width 600 --substrate_height 400 \
+                     --substrate_width 100 --substrate_height 40 \
                      --deterministic --max_episodes 10 --max_steps 1000 \
                      --max_critical_nodes 40 --threshold_critical_nodes 400 \
-                     --model_path ./training_results/run0040/save_model_batch39.pt 
+                     --model_path ./training_results/run0041/succ_model_batch39.pt 
     
     # Without visualization, custom substrate size
     python deploy.py --model_path ./training_results/run0018/best_model_batch2.pt \
@@ -401,8 +401,7 @@ class DurotaxisDeployment:
             config_path=self.config_path,
             substrate_type=substrate_type,
             substrate_size=substrate_size,
-            substrate_m=m,
-            substrate_b=b,
+            substrate_params={'m': m, 'b': b},  # Fixed: pass as dict not separate args
             max_critical_nodes=max_critical_nodes,
             threshold_critical_nodes=threshold_critical_nodes
         )

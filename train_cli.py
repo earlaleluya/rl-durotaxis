@@ -97,6 +97,14 @@ Examples:
     # Environment parameters
     parser.add_argument('--substrate-type', type=str, choices=['linear', 'exponential', 'random'], default=None,
                         help='Substrate type for environment')
+    parser.add_argument('--substrate-width', type=float, default=None,
+                        help='Substrate width (default from config.yaml)')
+    parser.add_argument('--substrate-height', type=float, default=None,
+                        help='Substrate height (default from config.yaml)')
+    parser.add_argument('--substrate-m', type=float, default=None,
+                        help='Substrate gradient parameter m (for linear/step types)')
+    parser.add_argument('--substrate-b', type=float, default=None,
+                        help='Substrate offset parameter b (for linear/step types)')
     parser.add_argument('--init-nodes', type=int, default=None,
                         help='Initial number of nodes')
     parser.add_argument('--max-nodes', type=int, default=None,
@@ -193,6 +201,39 @@ def main():
     if args.substrate_type is not None:
         overrides['substrate_type'] = args.substrate_type
         print(f"   Substrate type: {args.substrate_type}")
+    
+    # Substrate dimensions
+    if args.substrate_width is not None or args.substrate_height is not None:
+        substrate_size = []
+        if args.substrate_width is not None:
+            substrate_size.append(args.substrate_width)
+            print(f"   Substrate width: {args.substrate_width}")
+        else:
+            substrate_size.append(None)  # Use config default
+        
+        if args.substrate_height is not None:
+            substrate_size.append(args.substrate_height)
+            print(f"   Substrate height: {args.substrate_height}")
+        else:
+            substrate_size.append(None)  # Use config default
+        
+        # Only override if at least one dimension is specified
+        if args.substrate_width is not None or args.substrate_height is not None:
+            overrides['substrate_size'] = substrate_size
+    
+    # Substrate parameters (m, b)
+    if args.substrate_m is not None or args.substrate_b is not None:
+        substrate_params = {}
+        if args.substrate_m is not None:
+            substrate_params['m'] = args.substrate_m
+            print(f"   Substrate m: {args.substrate_m}")
+        if args.substrate_b is not None:
+            substrate_params['b'] = args.substrate_b
+            print(f"   Substrate b: {args.substrate_b}")
+        
+        if substrate_params:
+            overrides['substrate_params'] = substrate_params
+    
     if args.init_nodes is not None:
         # Map to the correct config key
         print(f"   ⚠️  --init-nodes override requires modifying environment config directly")
