@@ -12,10 +12,11 @@ Delete Ratio Architecture:
 
 Usage:
     python deploy.py --substrate_type linear --m 0.05 --b 1.0 \
-                     --substrate_width 600 --substrate_height 400 \
+                     --substrate_width 100 --substrate_height 40 \
                      --deterministic --max_episodes 10 --max_steps 1000 \
                      --max_critical_nodes 40 --threshold_critical_nodes 400 \
-                     --model_path ./training_results/run0040/save_model_batch39.pt 
+                     --model_path ./training_results/run0041/succ_model_batch39.pt \
+                     --init-nodes 10 
     
     # Without visualization, custom substrate size
     python deploy.py --model_path ./training_results/run0018/best_model_batch2.pt \
@@ -201,7 +202,9 @@ class DurotaxisDeployment:
         
         if verbose:
             print(f"\n🎯 Starting episode (max_steps={max_steps})")
-            print(f"   Initial nodes: {env.topology.graph.num_nodes()}")
+            print(f"   Initial nodes (step 0): {env.topology.graph.num_nodes()}")
+        
+        initial_node_count = env.topology.graph.num_nodes()  # Track initial count
         
         while not done and step_count < max_steps:
             # Get current state with age/stagnation tracking from environment
@@ -312,7 +315,8 @@ class DurotaxisDeployment:
             
             if verbose:
                 total_reward = reward_components.get('total_reward', 0.0)
-                print(f"   Step {step_count+1}: N={num_nodes:3d} E={num_edges:3d} | R={total_reward:+7.3f} | Done={done}")
+                nodes_delta = num_nodes - (initial_node_count if step_count == 0 else episode_rewards[-1]['num_nodes'])
+                print(f"   Step {step_count+1}: N={num_nodes:3d} ({nodes_delta:+d}) E={num_edges:3d} | R={total_reward:+7.3f} | Done={done}")
             
             # Show topology visualization if enabled (independent of verbose)
             if enable_visualization:
@@ -366,7 +370,8 @@ class DurotaxisDeployment:
                       save_results: bool = True,
                       enable_visualization: bool = True,
                       max_critical_nodes: int = 75,
-                      threshold_critical_nodes: int = 500) -> Dict:
+                      threshold_critical_nodes: int = 500,
+                      init_num_nodes: int = None) -> Dict:
         """
         Run evaluation over multiple episodes
         
@@ -382,6 +387,7 @@ class DurotaxisDeployment:
             enable_visualization: Whether to enable visualization during episodes
             max_critical_nodes: Maximum allowed nodes before growth penalties
             threshold_critical_nodes: Critical threshold for episode termination
+            init_num_nodes: Initial number of nodes (default from config.yaml)
             
         Returns:
             Dictionary with evaluation statistics
@@ -394,18 +400,23 @@ class DurotaxisDeployment:
             print(f"   Episodes: {max_episodes}, Max steps: {max_steps}")
             print(f"   Policy: {'Deterministic' if deterministic else 'Stochastic'}")
             print(f"   Node limits: max_critical={max_critical_nodes}, threshold={threshold_critical_nodes}")
+            if init_num_nodes is not None:
+                print(f"   Initial nodes: {init_num_nodes}")
             print(f"   Visualization: {'Enabled' if enable_visualization else 'Disabled'}")
         
         # Create environment with specified substrate
-        env = DurotaxisEnv(
-            config_path=self.config_path,
-            substrate_type=substrate_type,
-            substrate_size=substrate_size,
-            substrate_m=m,
-            substrate_b=b,
-            max_critical_nodes=max_critical_nodes,
-            threshold_critical_nodes=threshold_critical_nodes
-        )
+        env_kwargs = {
+            'config_path': self.config_path,
+            'substrate_type': substrate_type,
+            'substrate_size': substrate_size,
+            'substrate_params': {'m': m, 'b': b},
+            'max_critical_nodes': max_critical_nodes,
+            'threshold_critical_nodes': threshold_critical_nodes
+        }
+        if init_num_nodes is not None:
+            env_kwargs['init_num_nodes'] = init_num_nodes
+        
+        env = DurotaxisEnv(**env_kwargs)
         
         # Run episodes
         episode_stats = []
@@ -774,6 +785,8 @@ def main():
                        help='Device to run on (auto-detect if not specified)')
     
     # Environment node limits
+    parser.add_argument('--init-nodes', type=int, default=None,
+                       help='Initial number of nodes (default from config.yaml)')
     parser.add_argument('--max_critical_nodes', type=int, default=75,
                        help='Maximum allowed nodes before growth penalties (default: 75)')
     parser.add_argument('--threshold_critical_nodes', type=int, default=500,
@@ -819,7 +832,8 @@ def main():
             save_results=args.save_results,
             enable_visualization=args.enable_visualization,
             max_critical_nodes=args.max_critical_nodes,
-            threshold_critical_nodes=args.threshold_critical_nodes
+            threshold_critical_nodes=args.threshold_critical_nodes,
+            init_num_nodes=args.init_nodes
         )
         
         # Only print completion message when not using visualization
