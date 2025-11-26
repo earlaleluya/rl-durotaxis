@@ -23,7 +23,6 @@ environment:
   
   # Simulation parameters
   delta_time: 3
-  delta_intensity: 2.5
   consecutive_left_moves_limit: 30
   
   # Visualization
@@ -33,10 +32,9 @@ environment:
   # ============================================================================
   # REWARD MODES (Special Modes for Ablation Studies)
   # ============================================================================
-  # Normal mode (all three disabled): Delete + Spawn + Distance
-  # Special modes: Enable ONE or MORE for ablation studies
+  # Normal mode (both disabled): Delete + Distance
+  # Special modes: Enable ONE for ablation studies
   simple_delete_only_mode: false
-  simple_spawn_only_mode: false
   centroid_distance_only_mode: false
   include_termination_rewards: false
   
@@ -54,22 +52,82 @@ environment:
   # CORE REWARD COMPONENTS 
   # ============================================================================
   
-  # Delete Reward (Simplified Homeostatic Design)
-  # Three-component system optimized for simplicity and interpretability:
-  #   1. Homeostasis: Linear feedback to maintain N in [N_min, N_max] band
-  #      - N < N_min: linear penalty (encourages growth)
-  #      - N_min ≤ N ≤ N_max: stable reward (optimal range)
-  #      - N > N_max: linear penalty (discourages runaway growth)
-  #   2. Marking rewards: Encourage proper mark-then-delete workflow
-  #      - Marked + deleted: positive reward (correct behavior)
-  #      - Marked + persists: small penalty (marking without action)
-  #      - Unmarked + deleted: large penalty (improper deletion)
-  #   3. Total clipping: All rewards clipped to [-1, 1] range
+  # Delete Reward (State Machine Design)
+  # Node state transitions: UNMARKED → NOT_TO_DELETE → TO_DELETE → DELETED
+  # Encourages growing beyond Nc (max_critical_nodes) and optimal deletion timing
   #
-  # Key parameters:
-  #   - N_min = max_critical_nodes (from environment config)
-  #   - N_max = delta_time × N_min (adaptive band width)
+  # Key behaviors:
+  #   1. Growth incentive: penalize UNMARKED nodes when N ≤ Nc
+  #   2. Marking trigger: when N > Nc, mark nodes based on intensity vs average
+  #   3. Timing constraint: TO_DELETE nodes must be deleted at t + delta_time
+  #   4. State immutability: TO_DELETE nodes cannot be re-marked or reset
+  #
+  # Reward components:
+  #   - Growth encouragement: penalty for N ≤ Nc to push beyond threshold
+  #   - Unmarked penalty: force agent to trigger marking by growing
+  #   - Exact deadline reward: bonus for deleting at correct timestep
+  #   - Early/late penalty: discourage premature or delayed deletion
+  #   - Wrong deletion penalty: prevent deleting NOT_TO_DELETE or UNMARKED nodes
   delete_reward:
+    # Mode selection: 'homeostatic' (old) or 'state_machine' (new)
+    mode: 'state_machine'
+    
+    # ========== STATE MACHINE MODE PARAMETERS ==========
+    # Growth encouragement (push N > Nc)
+    alpha: 1.0                      # Penalty weight when N ≤ Nc
+    beta: 0.1                       # Bonus when N > Nc (marking activated)
+    
+    # Unmarked node penalty (force marking)
+    gamma: 0.5                      # Penalty per UNMARKED node
+    
+    # Timing-based deletion rewards
+    delta_pos: 5.0                  # Reward for deletion exactly at deadline
+    delta_neg: 3.0                  # Penalty for early/late/missed deletion
+    
+    # Wrong deletion penalties
+    zeta: 4.0                       # Penalty for deleting NOT_TO_DELETE node
+    eta: 6.0                        # Penalty for deleting UNMARKED node
+    
+    # Timing tolerance (for floating point comparisons)
+    epsilon_time: 0.000001               # 0.0 = strict exact, or small value like 1e-6
+    
+    # ========== OPTIMAL REWARD SHAPING (RECOMMENDED) ==========
+    # Based on best practices: log scaling, progressive growth, smooth rewards
+    
+    # Growth incentive (small-N death spiral fix)
+    kappa: 0.03                     # Progressive growth coefficient (when N ≤ Nc)
+                                    # Range: [0.02, 0.05] - keeps growth attractive without overpowering
+    
+    # Marking incentives
+    phi: 0.5                        # Continuous marking bonus coefficient (fraction_marked)
+                                    # MUST be ≤ 0.5 to prevent dominance over timing rewards
+                                    # Smooth reward for maintaining marked nodes
+    
+    # Penalty clipping (prevents unbounded negative spikes)
+    deletion_penalty_clip: 30.0     # Max absolute penalty per step from wrong deletions
+    deadline_penalty_clip: 30.0     # Max absolute penalty per step from missed deadlines
+    normalize_penalties_by_n: true  # Normalize deletion/deadline penalties by (1+N)
+    
+    # Penalty scaling (prevents explosion and maintains gradients)
+    use_log_scaling: true           # Use log(1 + n_unmarked) instead of linear scaling
+    alpha_unmarked: 0.1             # Coefficient for U/(1+N) term (normalized unmarked)
+    gamma_log: 0.5                  # Coefficient for log(1+U) term (log-scaled penalty)
+    
+    # Deadline reward smoothing
+    use_smooth_deadline: true       # Use Gaussian instead of binary exact/wrong
+    sigma_deadline: 0.5             # Gaussian width for deadline reward (steps)
+                                    # σ=0.5 means reward drops to ~60% at ±1 step from deadline
+    
+    # Global normalization (auto-scales by system size)
+    use_global_normalization: true  # Divide total reward by (1 + N)
+                                    # Prevents large-N reward explosion automatically
+    
+    # ========== LEGACY PARAMETERS (for backward compatibility) ==========
+    theta: 10.0                     # Old progressive growth scale (deprecated if kappa used)
+    normalize_by_nc: false          # Old Nc-based normalization (deprecated if log scaling used)
+    per_component_normalization: false  # Old per-component norm (deprecated if global norm used)
+    
+    # ========== HOMEOSTATIC MODE PARAMETERS (LEGACY) ==========
     # Homeostasis: reward for stable population in [N_min, N_max] band
     homeostasis_stable_reward: 0.3
     
@@ -78,17 +136,26 @@ environment:
     marked_persist_penalty: -0.2    # Penalty for marked nodes that persist
     bad_delete_penalty: -0.8        # Penalty for deleting unmarked nodes
   
-  # Distance Reward (Centroid movement toward goal)
+  # Distance Reward (Intensity-based centroid movement)
+  # Measures centroid's substrate intensity increase (ΔI_centroid)
+  # Goal: Reward agent for spawning on higher intensity substrate
   distance_mode:
     use_delta_distance: true
     distance_reward_scale: 5.0
     
+    # Intensity-based distance reward
+    target_delta_intensity: 2.5        # Target intensity increase per step
+                                       # Reward = 0 at ΔI = target (threshold)
+                                       # Reward > 0 only when ΔI > target
+    
     # Substrate-aware normalization (bounds distance reward to [-1, 1])
     substrate_aware_scaling: true      # Use substrate gradient for scaling
     use_tanh_normalization: true       # Use tanh (true) or softsign (false)
-    target_delta_x: 2.5              # Expected good step size for tuning
-    tanh_scale: 1.4722                # atanh(0.9) = (approx.) 1.4722 for sensitivity tuning
-    gradient_cap: null                # Optional: cap gradient for exponential substrates (e.g., 10.0)
+    tanh_scale: 2.5                    # Scale factor: c = tanh_scale × target_delta_intensity
+                                       # This ensures tanh(target_delta_intensity / c) = tanh(1) ≈ 0.76
+                                       # For threshold at target: set c = target_delta_intensity (tanh(1)=0.76)
+                                       # For zero at target: use shifted tanh or adjust calculation
+    gradient_cap: null                 # Optional: cap gradient for exponential substrates (e.g., 10.0)
     
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
@@ -143,8 +210,8 @@ actor_critic:
   # Action parameter bounds
   action_parameter_bounds:
     delete_ratio: [0.0, 0.7]
-    gamma: [0.5, 1.0]
-    alpha: [0.5, 1.0]
+    gamma: [0.5, 5.0]
+    alpha: [0.5, 3.0]
     noise: [0.05, 0.10]
     theta: [-0.3491, 0.3491]  # -20 to 20 deg
   

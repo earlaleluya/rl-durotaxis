@@ -63,8 +63,6 @@ class DurotaxisEnv(gym.Env):
         Number of layers in the GraphInputEncoder network.
     delta_time : int, default=3
         Time window for topology history comparison (affects reward calculations).
-    delta_intensity : float, default=2.50
-        Minimum intensity difference required for successful durotaxis spawning.
     
     reward_weights : dict, default={'delete_weight': 1.0, 'distance_weight': 1.0, 'termination_weight': 1.0}
         Environment-level weights for reward component composition:
@@ -88,27 +86,21 @@ class DurotaxisEnv(gym.Env):
         - 'pbrs.phi_weight_pending_marked': Weight for pending/marked nodes in potential
         - 'pbrs.phi_weight_safe_unmarked': Weight for safe/unmarked nodes in potential
     
-    spawn_rewards : dict, default={'spawn_success_reward': 1.0, 'spawn_failure_penalty': 1.0}
-        Spawn reward configuration (for spawn action implementation):
-        
-        - 'spawn_success_reward': Reward for successful durotaxis-based spawning (ΔI ≥ delta_intensity)
-        - 'spawn_failure_penalty': Penalty for spawning without sufficient intensity gradient
-        
-        Optional PBRS shaping terms:
-        - 'pbrs.enabled': Enable potential-based reward shaping
-        - 'pbrs.shaping_coeff': Scaling factor for shaping term (default: 0.05)
-        - 'pbrs.phi_weight_spawnable': Weight for spawnable nodes in potential
-    
     distance_mode : dict, default={'use_delta_distance': True, 'distance_reward_scale': 5.0}
-        Distance reward configuration (Priority 2: Centroid movement toward goal):
+        Distance reward configuration (Intensity-based centroid movement):
         
-        - 'use_delta_distance': Use delta-distance (change in centroid position)
+        - 'use_delta_distance': Use delta-distance (change in centroid)
+        - 'target_delta_intensity': Target intensity increase per step (default: 2.5)
         - 'distance_reward_scale': Scaling factor for distance reward
         - 'substrate_aware_scaling': Use substrate gradient for normalization
         - 'use_tanh_normalization': Use tanh (True) or softsign (False) for bounding
-        - 'target_delta_x': Expected good step size for tuning (default: 0.05)
-        - 'tanh_scale': atanh(0.9) ≈ 1.4722 for sensitivity tuning
+        - 'tanh_scale': Scale factor for tanh normalization (default: 2.5)
         - 'gradient_cap': Optional cap for exponential substrate gradients
+        
+        Reward shaping: Uses shifted tanh to make reward=0 at target threshold
+        - ∆I < target: negative reward (agent should improve)
+        - ∆I = target: zero reward (threshold)
+        - ∆I > target: positive reward (exceeds expectations)
         
         Optional PBRS shaping terms:
         - 'pbrs.enabled': Enable potential-based reward shaping
@@ -252,7 +244,10 @@ class DurotaxisEnv(gym.Env):
     >>> env_config = {
     ...     'substrate_size': [800, 600],
     ...     'substrate_params': {'m': 0.01, 'b': 1.0},
-    ...     'delta_intensity': 3.0,
+    ...     'distance_mode': {
+    ...         'target_delta_intensity': 2.5,  # Centroid-level distance reward target
+    ...         'tanh_scale': 2.5  # Scale factor for shifted tanh
+    ...     },
     ...     'threshold_critical_nodes': 150
     ... }
     >>> env = DurotaxisEnv(env_config)
@@ -319,7 +314,6 @@ class DurotaxisEnv(gym.Env):
         
         # Simulation parameters
         self.delta_time = config.get('delta_time', 3)
-        self.delta_intensity = config.get('delta_intensity', 2.50)
         self.flush_delay = config.get('flush_delay', 0.0001)
         self.enable_visualization = config.get('enable_visualization', True)
         
@@ -356,6 +350,7 @@ class DurotaxisEnv(gym.Env):
         self.dm_delete_scale = float(dm.get('delete_penalty_scale', 1.0))
         # Scheduler knobs already wired in trainer (optional)
         self._prev_centroid_x = None
+        self._prev_centroid_intensity = None
         
         # Observation selection parameters (fast topk approach)
         sel_cfg = config.get('observation_selection', {})
@@ -384,19 +379,50 @@ class DurotaxisEnv(gym.Env):
             'leftward_penalty': 0.1
         })
         
-        self.spawn_rewards = config.get('spawn_rewards', {
-            'spawn_success_reward': 1.0,
-            'spawn_failure_penalty': 1.0
-        })
-        
         self.delete_reward = config.get('delete_reward', {
+            'mode': 'state_machine',
             'homeostasis_stable_reward': 0.3,
             'marked_deleted_reward': 0.6,
             'marked_persist_penalty': -0.2,
             'bad_delete_penalty': -0.8
         })
         
-        # Simplified delete reward constants (homeostatic design)
+        # Delete reward mode selection
+        self.delete_reward_mode = self.delete_reward.get('mode', 'state_machine')
+        
+        # State machine delete reward parameters
+        self.dr_alpha = self.delete_reward.get('alpha', 1.0)
+        self.dr_beta = self.delete_reward.get('beta', 0.1)
+        self.dr_gamma = self.delete_reward.get('gamma', 0.5)
+        self.dr_delta_pos = self.delete_reward.get('delta_pos', 5.0)
+        self.dr_delta_neg = self.delete_reward.get('delta_neg', 3.0)
+        self.dr_zeta = self.delete_reward.get('zeta', 4.0)
+        self.dr_eta = self.delete_reward.get('eta', 6.0)
+        self.dr_epsilon_time = self.delete_reward.get('epsilon_time', 0.0)
+        
+        # Optimal reward shaping parameters
+        self.dr_kappa = self.delete_reward.get('kappa', 0.03)  # Progressive growth coefficient
+        self.dr_phi = self.delete_reward.get('phi', 0.5)
+        self.dr_deletion_clip = self.delete_reward.get('deletion_penalty_clip', 30.0)
+        self.dr_deadline_clip = self.delete_reward.get('deadline_penalty_clip', 30.0)
+        self.dr_normalize_penalties = self.delete_reward.get('normalize_penalties_by_n', True)
+        self.dr_use_log_scaling = self.delete_reward.get('use_log_scaling', True)
+        self.dr_alpha_unmarked = self.delete_reward.get('alpha_unmarked', 0.1)  # U/(1+N) coefficient
+        self.dr_gamma_log = self.delete_reward.get('gamma_log', 0.5)  # log(1+U) coefficient
+        self.dr_use_smooth_deadline = self.delete_reward.get('use_smooth_deadline', True)
+        self.dr_sigma_deadline = self.delete_reward.get('sigma_deadline', 0.5)
+        self.dr_use_global_norm = self.delete_reward.get('use_global_normalization', True)
+        
+        # Legacy parameters (backward compatibility)
+        self.dr_theta = self.delete_reward.get('theta', 10.0)
+        self.dr_normalize_by_nc = self.delete_reward.get('normalize_by_nc', False)
+        self.dr_per_component_norm = self.delete_reward.get('per_component_normalization', False)
+        self.dr_growth_scale = self.delete_reward.get('growth_scale', 10.0)
+        self.dr_unmarked_scale = self.delete_reward.get('unmarked_scale', 20.0)
+        self.dr_deletion_scale = self.delete_reward.get('deletion_scale', 30.0)
+        self.dr_deadline_scale = self.delete_reward.get('deadline_scale', 15.0)
+        
+        # Homeostatic delete reward constants (legacy mode)
         self.homeo_stable_reward = self.delete_reward.get('homeostasis_stable_reward', 0.3)
         self.marked_deleted_reward = self.delete_reward.get('marked_deleted_reward', 0.6)
         self.marked_persist_penalty = self.delete_reward.get('marked_persist_penalty', -0.2)
@@ -447,14 +473,6 @@ class DurotaxisEnv(gym.Env):
         self.critical_zone_threshold = self.position_rewards.get('critical_zone_threshold', 0.03)
         self.safe_center_bonus = self.position_rewards.get('safe_center_bonus', 0.05)
         self.safe_center_range = self.position_rewards.get('safe_center_range', 0.30)
-        
-        self.spawn_success_reward = self.spawn_rewards['spawn_success_reward']
-        self.spawn_failure_penalty = self.spawn_rewards['spawn_failure_penalty']
-        
-        # Boundary-aware spawn penalties
-        self.spawn_near_boundary_penalty = self.spawn_rewards.get('spawn_near_boundary_penalty', 3.0)
-        self.spawn_in_danger_zone_penalty = self.spawn_rewards.get('spawn_in_danger_zone_penalty', 8.0)
-        self.spawn_boundary_check = self.spawn_rewards.get('spawn_boundary_check', True)
         
         self.success_reward = self.termination_rewards['success_reward']
         self.out_of_bounds_penalty = self.termination_rewards['out_of_bounds_penalty']
@@ -513,15 +531,11 @@ class DurotaxisEnv(gym.Env):
         distance_mode_cfg = config.get('distance_mode', {})
         self._dist_substrate_aware = distance_mode_cfg.get('substrate_aware_scaling', True)
         self._dist_use_tanh = distance_mode_cfg.get('use_tanh_normalization', True)
-        self._dist_target_dx = float(distance_mode_cfg.get('target_delta_x', 0.05))
-        self._dist_tanh_scale = float(distance_mode_cfg.get('tanh_scale', 1.4722))  # atanh(0.9) ≈ 1.4722
-        self._dist_gradient_cap = distance_mode_cfg.get('gradient_cap', None)  # Optional cap for exponential gradients
-        
-        # Spawn reward PBRS parameters
-        pbrs_spawn = self.spawn_rewards.get('pbrs', {})
-        self._pbrs_spawn_enabled = pbrs_spawn.get('enabled', False)
-        self._pbrs_spawn_coeff = float(pbrs_spawn.get('shaping_coeff', 0.0))
-        self._pbrs_spawn_w_spawnable = float(pbrs_spawn.get('phi_weight_spawnable', 1.0))
+        self._dist_target_dI = float(distance_mode_cfg.get('target_delta_intensity', 2.5))
+        # Tanh scale: determines reward shape relative to target
+        # For shifted threshold (reward=0 at target), we subtract target from delta before scaling
+        self._dist_tanh_scale = float(distance_mode_cfg.get('tanh_scale', 2.5))
+        self._dist_gradient_cap = distance_mode_cfg.get('gradient_cap', None)
 
         self.current_step = 0
         self.current_episode = 0
@@ -548,6 +562,12 @@ class DurotaxisEnv(gym.Env):
         self._node_age = {}  # Tracks age of each node by persistent_id
         self._node_stagnation = {}  # Tracks stagnation counter for each node
         self._stagnation_threshold = 5.0  # Distance threshold to be considered "stagnant"
+        
+        # State machine tracking for delete reward
+        # Node states: 'UNMARKED', 'NOT_TO_DELETE', 'TO_DELETE', 'DELETED'
+        self._node_state = {}  # Maps persistent_id → state string
+        self._node_t_marked = {}  # Maps persistent_id → timestep when marked as TO_DELETE
+        self._node_t_deadline = {}  # Maps persistent_id → deadline timestep for deletion
         
         # Node-level reward tracking
         self.prev_node_positions = []  # Store previous node positions for movement rewards
@@ -1174,9 +1194,6 @@ class DurotaxisEnv(gym.Env):
         - Distance reward (Priority 2: centroid movement toward goal)
         - Termination reward (Priority 3: sparse terminal signals, always 0 during episode)
         
-        NOTE: Spawn reward calculation function (_calculate_spawn_reward) is preserved 
-        for potential future use but is NOT included in reward composition.
-        
         Special modes (delete-only, centroid-only) still work.
         Priority: Delete > Distance > Termination
         """
@@ -1187,9 +1204,6 @@ class DurotaxisEnv(gym.Env):
         
         # PRIORITY 1: Delete reward (includes growth & stability embedded)
         delete_reward = self._calculate_delete_reward(prev_state, new_state, actions)
-        
-        # NOTE: Spawn reward calculation function preserved but NOT used in composition
-        # spawn_reward = self._calculate_spawn_reward(prev_state, new_state, actions)
         
         # PRIORITY 2: Distance reward (centroid movement toward goal)
         distance_reward = self._calculate_distance_reward(prev_state, new_state)
@@ -1204,10 +1218,9 @@ class DurotaxisEnv(gym.Env):
         # Check which special modes are enabled
         has_delete_mode = self.simple_delete_only_mode
         has_centroid_mode = self.centroid_distance_only_mode
-        has_spawn_mode = self.simple_spawn_only_mode
         
         # Count how many special modes are enabled
-        num_special_modes = sum([has_delete_mode, has_centroid_mode, has_spawn_mode])
+        num_special_modes = sum([has_delete_mode, has_centroid_mode])
         
         if num_special_modes > 0:
             # === SPECIAL MODES: Use ONLY enabled components (no weighting in special modes) ===
@@ -1220,8 +1233,6 @@ class DurotaxisEnv(gym.Env):
             # Priority 2: Distance (if enabled)
             if has_centroid_mode:
                 mode_reward += distance_reward
-            
-            # NOTE: spawn_mode preserved for backward compatibility but spawn_reward NOT used
             
             # Set total reward from special mode composition
             total_reward = mode_reward
@@ -1357,108 +1368,6 @@ class DurotaxisEnv(gym.Env):
 
         self.topology.graph.ndata['pos'] = adjusted_positions
 
-    def _calculate_spawn_reward(self, prev_state, new_state, actions):
-        """
-        Calculate reward for durotaxis-based spawning.
-        
-        Unified behavior (same magnitude for both modes):
-        - Reward += spawn_success_reward if ΔI >= delta_intensity
-        - Penalty -= spawn_failure_penalty if ΔI < delta_intensity
-        - Uses same values from spawn_rewards config regardless of mode
-        - Includes PBRS shaping term when enabled
-        
-        Args:
-            prev_state: Previous topology state
-            new_state: Current topology state  
-            actions: Actions taken (should include spawn actions)
-            
-        Returns:
-            float: Spawn reward (spawn_success_reward per qualifying spawn, 0.0 otherwise)
-        """
-        spawn_reward = 0.0
-        
-        # Get node features from both states
-        new_node_features = new_state['node_features']
-        new_num_nodes = new_state['num_nodes']
-        
-        if new_num_nodes == 0:
-            return spawn_reward
-        
-        # DEBUG: Count new nodes and check flag values
-        num_new_nodes = 0
-        all_new_node_flags = []
-        
-        # Use new_node flag to identify newly spawned nodes
-        # The new_node flag is the last feature in the node feature vector
-        for node_idx in range(new_num_nodes):
-            if node_idx < len(new_node_features):
-                node_feature_vector = new_node_features[node_idx]
-                
-                # Check if this is a newly spawned node (new_node flag = 1.0)
-                # Node features: [x, y, intensity, in_deg, out_deg, centrality, centroid_dist, boundary, new_node, age, stagnation]
-                # new_node is at index 8 (0-indexed), NOT the last feature
-                if len(node_feature_vector) > 8:
-                    new_node_flag = node_feature_vector[8].item()  # Index 8 is new_node flag
-                    all_new_node_flags.append(new_node_flag)
-                    
-                    if new_node_flag == 1.0:  # This is a newly spawned node
-                        num_new_nodes += 1
-                        # Get substrate intensity (3rd feature, index 2)
-                        if len(node_feature_vector) > 2:
-                            new_node_intensity = node_feature_vector[2].item()
-                            new_node_pos = node_feature_vector[:2]  # x, y coordinates
-                            
-                            # REFACTORED: Boundary checks removed in simplified system
-                            # Focus purely on intensity-based spawning
-                            
-                            # Find parent node from previous state by checking actions
-                            # For now, we'll use spatial proximity as backup
-                            best_parent_intensity = None
-                            min_distance = float('inf')
-                            
-                            # Check against previous state nodes
-                            if 'node_features' in prev_state:
-                                prev_node_features = prev_state['node_features']
-                                for prev_idx, prev_node in enumerate(prev_node_features):
-                                    if len(prev_node) > 2:
-                                        prev_node_pos = prev_node[:2]
-                                        distance = ((new_node_pos[0] - prev_node_pos[0])**2 + 
-                                                   (new_node_pos[1] - prev_node_pos[1])**2)**0.5
-                                        
-                                        if distance < min_distance:
-                                            min_distance = distance
-                                            best_parent_intensity = prev_node[2].item()
-                            
-                            # Check spawn reward condition
-                            if best_parent_intensity is not None:
-                                intensity_difference = new_node_intensity - best_parent_intensity
-                                
-                                # Use unified reward values (same magnitude for both modes)
-                                if intensity_difference >= self.delta_intensity:
-                                    spawn_reward += self.spawn_success_reward
-                                    # print(f"🎯 Spawn reward! New node intensity: {new_node_intensity:.3f}, "
-                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
-                                    #       f"Difference: {intensity_difference:.3f} >= {self.delta_intensity}")
-                                else:
-                                    spawn_reward -= self.spawn_failure_penalty
-                                    # print(f"❌ Spawn penalty! New node intensity: {new_node_intensity:.3f}, "
-                                    #       f"Parent intensity: {best_parent_intensity:.3f}, "
-                                    #       f"Difference: {intensity_difference:.3f} < {self.delta_intensity}")
-        
-        # DEBUG: Print spawn detection and reward
-        if not hasattr(self, '_debug_spawn_count'):
-            self._debug_spawn_count = 0
-            self._debug_no_spawn_count = 0
-        
-        # Add PBRS shaping term for simple_spawn_only_mode
-        if self.simple_spawn_only_mode and self._pbrs_spawn_enabled and self._pbrs_spawn_coeff != 0.0:
-            phi_prev = self._phi_spawn_potential(prev_state)
-            phi_new = self._phi_spawn_potential(new_state)
-            pbrs_shaping = self._pbrs_gamma * phi_new - phi_prev
-            spawn_reward += self._pbrs_spawn_coeff * pbrs_shaping
-        
-        return spawn_reward
-    
     # ============================================================================
     # POTENTIAL-BASED REWARD SHAPING (PBRS) - HELPER FUNCTIONS
     # ============================================================================
@@ -1557,146 +1466,652 @@ class DurotaxisEnv(gym.Env):
             # Fail gracefully
             return 0.0
     
-    def _phi_spawn_potential(self, state):
-        """
-        Compute potential function Phi(s) for spawn reward shaping.
-        
-        Uses only current state (Markov property):
-        - spawnable_nodes(s): count of nodes on high-intensity substrate
-        - high-intensity: substrate_intensity >= spawn intensity threshold
-        
-        Phi(s) = w_spawnable * spawnable_nodes(s)
-        
-        Spawning on high-intensity substrate increases spawnable count → Phi increases → positive shaping
-        Spawning on low-intensity substrate doesn't increase count → no Phi change → no shaping bonus
-        
-        Args:
-            state: State dict containing node intensities
-            
-        Returns:
-            float: Potential value Phi(s)
-        """
-        try:
-            if state['num_nodes'] == 0:
-                return 0.0
-            
-            # Get intensities from state
-            intensities = state.get('intensity', None)
-            if intensities is None:
-                return 0.0
-            
-            # Convert to numpy for device-agnostic computation
-            if hasattr(intensities, 'detach'):
-                intensities_np = intensities.detach().cpu().numpy()
-            else:
-                intensities_np = np.asarray(intensities)
-            
-            intensities_np = intensities_np.astype(np.float32)
-            
-            # Count nodes with high substrate intensity (spawnable candidates)
-            # Use self.delta_intensity as threshold (same as spawn success criterion)
-            spawnable_count = float((intensities_np >= self.delta_intensity).sum())
-            
-            phi = self._pbrs_spawn_w_spawnable * spawnable_count
-            return float(phi)
-            
-        except Exception as e:
-            # Fail gracefully
-            return 0.0
-    
     # ============================================================================
     # REWARD CALCULATION FUNCTIONS
     # ============================================================================
     
     def _calculate_distance_reward(self, prev_state, new_state):
         """
-        Calculate distance reward based on centroid movement toward goal.
+        Calculate distance reward based on centroid intensity change.
         
-        Uses substrate-aware tanh normalization with PBRS when enabled.
-        Supports both delta-based (potential-based) and static distance calculation.
+        Intensity-based reward: Measures centroid's substrate intensity increase (∆I)
+        - Goal: Reward agent for spawning on higher intensity substrate
+        - Uniform actions (alpha, gamma, noise) → measure via centroid ∆I
+        - Reward shaping: Zero reward at target threshold, positive only when exceeding
+        
+        Reward formula:
+            ∆I = centroid_intensity_t - centroid_intensity_{t-1}
+            s = ∆I - target_delta_intensity  (shifted: 0 at target)
+            c = tanh_scale × target_delta_intensity
+            r = tanh(s / c)
+        
+        This ensures:
+            - ∆I < target → r < 0 (penalty for underperformance)
+            - ∆I = target → r = 0 (neutral at threshold)
+            - ∆I > target → r > 0 (reward for exceeding expectations)
         
         Args:
             prev_state: Previous state dict containing topology
             new_state: Current state dict containing topology
             
         Returns:
-            float: Distance reward, typically in range (-1, 1) with substrate-aware mode
+            float: Distance reward, in range (-1, 1) with substrate-aware mode
         """
         num_nodes = new_state['num_nodes']
         centroid_x = 0.0
+        centroid_intensity = 0.0
         distance_reward = 0.0
         
-        # Extract centroid x position from new state
+        # Extract centroid information from new state
         if num_nodes > 0:
             try:
                 graph_features = new_state.get('graph_features')
                 if graph_features is not None:
                     if isinstance(graph_features, torch.Tensor):
                         centroid_x = graph_features[3].item()  # Index 3 is centroid_x
+                        centroid_intensity = graph_features[10].item()  # Index 10 is centroid_intensity
                     else:
                         centroid_x = graph_features[3]
+                        centroid_intensity = graph_features[10]
             except (IndexError, TypeError):
-                # Fallback: calculate centroid from node positions
+                # Fallback: calculate centroid from node positions and intensities
                 node_features = new_state.get('node_features', [])
                 if len(node_features) > 0:
                     x_positions = [node[0].item() if isinstance(node[0], torch.Tensor) else node[0] 
                                  for node in node_features]
                     centroid_x = sum(x_positions) / len(x_positions)
+                    
+                    # Extract intensities (index 2 in node_features)
+                    intensities = [node[2].item() if isinstance(node[2], torch.Tensor) else node[2]
+                                 for node in node_features]
+                    centroid_intensity = sum(intensities) / len(intensities)
         
-        # Use delta distance shaping (potential-based) for rightward migration
-        if self.dm_use_delta and self._prev_centroid_x is not None and self.goal_x > 0:
-            # Delta distance: Δx = (cx_t - cx_{t-1})
-            delta_x = centroid_x - self._prev_centroid_x
+        # Use delta intensity shaping for substrate gradient following
+        if self.dm_use_delta and self._prev_centroid_intensity is not None:
+            # Delta intensity: ∆I = (I_t - I_{t-1})
+            delta_I = centroid_intensity - self._prev_centroid_intensity
             
             if self._dist_substrate_aware:
-                # Substrate-aware scaling: compute local gradient at midpoint
-                x_loc = (self._prev_centroid_x + centroid_x) / 2.0
-                g = self._compute_substrate_gradient(x_loc)
+                # SHIFTED REWARD SHAPING: reward = 0 at target threshold
+                # This encourages agent to exceed target, not just reach it
+                s = delta_I - self._dist_target_dI
                 
-                # Convert raw distance to substrate-aware signal: s = g(x) * Δx
-                s = g * delta_x
-                
-                # Optional: add proper PBRS shaping BEFORE normalization (preserves optimal policy)
+                # Optional: add proper PBRS shaping BEFORE normalization
                 if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
                     phi_prev = self._phi_centroid_distance_potential(prev_state)
                     phi_new = self._phi_centroid_distance_potential(new_state)
                     pbrs_term = self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
                     s += pbrs_term
                 
-                # Compute scale constant c based on expected good step size
-                # c = tanh_scale * g * target_dx, where tanh_scale ≈ 1.4722 = atanh(0.9)
-                # This ensures tanh(g * target_dx / c) ≈ 0.9
-                c = self._dist_tanh_scale * g * self._dist_target_dx
+                # Compute scale constant c
+                # c = tanh_scale × target_dI
+                # Default: tanh_scale = 2.5, so c = 2.5 × 2.5 = 6.25
+                # This gives smooth gradients around the threshold
+                c = self._dist_tanh_scale * self._dist_target_dI
                 
                 if self._dist_use_tanh:
                     # Apply tanh squashing: r = tanh(s / c) ∈ (-1, 1)
+                    # When ∆I = target: s = 0, r = tanh(0) = 0
+                    # When ∆I = 2×target: s = target, r = tanh(target/c) = tanh(2.5/6.25) = tanh(0.4) ≈ 0.38
                     distance_reward = np.tanh(s / c) if c > 0 else 0.0
                 else:
                     # Softsign alternative: r = s / (1 + |s|) ∈ (-1, 1)
                     distance_reward = s / (1.0 + abs(s))
             else:
-                # Original scaling (no substrate awareness)
-                distance_reward = self.dm_dist_scale * (delta_x / self.goal_x)
+                # Simple scaling (no substrate awareness)
+                # Still apply shifted threshold
+                s = delta_I - self._dist_target_dI
+                distance_reward = self.dm_dist_scale * (s / self._dist_target_dI) if self._dist_target_dI > 0 else 0.0
                 
-                # Optional: add proper PBRS shaping on top (preserves optimal policy)
-                # Note: When substrate_aware disabled, PBRS is added after (no normalization)
+                # Optional: add PBRS shaping
                 if self._pbrs_centroid_enabled and self._pbrs_centroid_coeff != 0.0:
                     phi_prev = self._phi_centroid_distance_potential(prev_state)
                     phi_new = self._phi_centroid_distance_potential(new_state)
                     distance_reward += self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
         else:
-            # Fallback: static distance penalty
-            if self.goal_x > 0:
-                distance_reward = -(self.goal_x - centroid_x) / self.goal_x
-            else:
-                distance_reward = 0.0
+            # Fallback: no previous data (first step)
+            distance_reward = 0.0
         
         # Update previous centroid for next step
         self._prev_centroid_x = centroid_x
+        self._prev_centroid_intensity = centroid_intensity
         
         return distance_reward
 
+
     def _calculate_delete_reward(self, prev_state, new_state, actions):
+        """
+        Calculate delete reward using selected mode.
+        
+        Modes:
+        - 'state_machine': State-based deletion with timing constraints
+        - 'homeostatic': Simple homeostatic band control (legacy)
+        
+        Args:
+            prev_state: Previous state dict containing topology
+            new_state: Current state dict containing topology  
+            actions: Actions taken this step
+            
+        Returns:
+            float: delete_reward
+        """
+        if self.delete_reward_mode == 'state_machine':
+            return self._calculate_delete_reward_state_machine(prev_state, new_state, actions)
+        else:
+            return self._calculate_delete_reward_homeostatic(prev_state, new_state, actions)
+    
+    def _calculate_delete_reward_state_machine(self, prev_state, new_state, actions):
+        """
+        State machine-based delete reward with timing constraints.
+        
+        Node state transitions:
+        UNMARKED → NOT_TO_DELETE → TO_DELETE → DELETED
+        
+        Key mechanisms:
+        1. Growth incentive: Penalize UNMARKED nodes when N ≤ Nc
+        2. Marking trigger: When N > Nc, automatically mark nodes based on intensity
+        3. Timing constraint: TO_DELETE nodes must be deleted at t + delta_time
+        4. State immutability: TO_DELETE cannot be re-marked or reset
+        
+        Reward components:
+        - Growth encouragement: -alpha * unmarked_count when N ≤ Nc, +beta when N > Nc
+        - Unmarked penalty: -gamma * unmarked_count (always applied)
+        - Exact deadline: +delta_pos for deletion at exact deadline
+        - Early/late deletion: -delta_neg for wrong timing
+        - Wrong deletion: -zeta for NOT_TO_DELETE, -eta for UNMARKED
+        - Missed deadline: -delta_neg for nodes past deadline
+        
+        Args:
+            prev_state: Previous state dict
+            new_state: Current state dict
+            actions: Actions taken
+            
+        Returns:
+            float: Total delete reward
+        """
+        # Basic validation
+        if ('persistent_id' not in prev_state or prev_state['persistent_id'] is None):
+            return 0.0
+        
+        prev_N = int(prev_state.get('num_nodes', 0))
+        if prev_N == 0:
+            return 0.0
+        
+        new_N = int(new_state.get('num_nodes', 0))
+        Nc = getattr(self, 'max_critical_nodes', 40)
+        t = self.current_step
+        delta_t = getattr(self, 'delta_time', 3)
+        
+        # Get persistent IDs
+        prev_pids = prev_state['persistent_id'].detach().cpu().tolist()
+        prev_pids = [int(pid) for pid in prev_pids]
+        
+        new_pids_set = set()
+        if new_N > 0 and 'persistent_id' in new_state and new_state['persistent_id'] is not None:
+            new_pids = new_state['persistent_id'].detach().cpu().tolist()
+            new_pids_set = set([int(pid) for pid in new_pids])
+            
+            # Initialize newly spawned nodes as UNMARKED
+            # These are nodes in new_state that weren't in prev_state
+            for pid in new_pids_set:
+                if pid not in self._node_state:
+                    self._node_state[int(pid)] = 'UNMARKED'
+        
+        # CRITICAL: Create persistent_id → intensity mapping
+        # Node features include: [x, y, intensity, in_deg, out_deg, centrality, centroid_dist, boundary, new_node, age, stagnation]
+        # Intensity is at index 2 (after x, y)
+        pid_to_intensity = {}
+        prev_node_features = prev_state.get('node_features', None)
+        if prev_node_features is not None:
+            for i, pid in enumerate(prev_pids):
+                if i < len(prev_node_features) and len(prev_node_features[i]) > 2:
+                    # Extract intensity (index 2 in node features)
+                    intensity = float(prev_node_features[i][2].item() if hasattr(prev_node_features[i][2], 'item') else prev_node_features[i][2])
+                    pid_to_intensity[pid] = intensity
+        
+        # Calculate average intensity for marking threshold
+        if pid_to_intensity:
+            avg_intensity = float(np.mean(list(pid_to_intensity.values())))
+        else:
+            avg_intensity = 0.0
+        
+        # Initialize new nodes as UNMARKED (explicit initialization for new spawns)
+        for pid in prev_pids:
+            if pid not in self._node_state:
+                self._node_state[pid] = 'UNMARKED'
+        
+        # Validate state consistency: all prev_pids must have states
+        for pid in prev_pids:
+            if pid not in self._node_state:
+                # This should never happen after initialization above, but defensive check
+                print(f"⚠️  State machine ERROR: pid {pid} has no state, initializing as UNMARKED")
+                self._node_state[pid] = 'UNMARKED'
+        
+        # MARKING LOGIC: Trigger when N > Nc
+        if prev_N > Nc:
+            for pid in prev_pids:
+                # Get current state
+                state = self._node_state.get(pid, 'UNMARKED')
+                
+                # Get intensity for this persistent_id
+                node_intensity = pid_to_intensity.get(pid)
+                
+                # State transition rules
+                if state == 'TO_DELETE':
+                    # TO_DELETE is immutable - do not re-mark or reset
+                    pass
+                elif state == 'NOT_TO_DELETE':
+                    # Allow NOT_TO_DELETE → TO_DELETE if intensity drops
+                    if node_intensity is not None and node_intensity < avg_intensity:
+                        self._node_state[pid] = 'TO_DELETE'
+                        self._node_t_marked[pid] = t
+                        self._node_t_deadline[pid] = t + delta_t
+                elif state == 'UNMARKED':
+                    # UNMARKED → TO_DELETE or NOT_TO_DELETE based on intensity
+                    if node_intensity is not None:
+                        if node_intensity < avg_intensity:
+                            self._node_state[pid] = 'TO_DELETE'
+                            self._node_t_marked[pid] = t
+                            self._node_t_deadline[pid] = t + delta_t
+                        else:
+                            self._node_state[pid] = 'NOT_TO_DELETE'
+        
+        # Count node states (no default in get() to ensure accurate counting)
+        n_unmarked = sum(1 for pid in prev_pids if self._node_state.get(pid) == 'UNMARKED')
+        n_to_delete = sum(1 for pid in prev_pids if self._node_state.get(pid) == 'TO_DELETE')
+        n_not_to_delete = sum(1 for pid in prev_pids if self._node_state.get(pid) == 'NOT_TO_DELETE')
+        
+        # Calculate marked fraction (TO_DELETE + NOT_TO_DELETE)
+        n_marked = n_to_delete + n_not_to_delete
+        fraction_marked = n_marked / max(prev_N, 1) if prev_N > 0 else 0.0
+        
+        # Initialize component rewards
+        R_growth = 0.0
+        R_unmarked = 0.0
+        R_marking_bonus = 0.0
+        
+        # ===== COMPONENT 1: Progressive growth encouragement =====
+        # Small linear reward for growing when N ≤ Nc (fixes small-N death spiral)
+        if prev_N <= Nc:
+            R_growth = self.dr_kappa * prev_N
+        else:
+            # Above threshold: small constant bonus
+            R_growth = self.dr_beta
+        
+        # ===== COMPONENT 2: Log-scaled unmarked penalty =====
+        # Dual penalty: normalized + log-scaled (prevents explosion, maintains pressure)
+        if self.dr_use_log_scaling:
+            # Optimal: adaptive scaling across all N
+            R_unmarked = -self.dr_alpha_unmarked * (n_unmarked / max(1 + prev_N, 1))
+            R_unmarked -= self.dr_gamma_log * np.log(1 + n_unmarked)
+        else:
+            # Legacy fallback
+            if self.dr_normalize_by_nc:
+                unmarked_ratio = n_unmarked / max(Nc, 1)
+                R_unmarked = -self.dr_gamma * unmarked_ratio * Nc
+            else:
+                R_unmarked = -self.dr_gamma * n_unmarked
+        
+        # ===== COMPONENT 3: Continuous marking bonus =====
+        # Smooth reward for maintaining marked nodes (dense signal)
+        R_marking_bonus = self.dr_phi * fraction_marked
+        
+        # ===== COMPONENT 3: Process deletions this timestep =====
+        deleted_pids = [pid for pid in prev_pids if pid not in new_pids_set]
+        
+        n_exact_deadline = 0
+        n_early_late = 0
+        n_wrong_not_to_delete = 0
+        n_wrong_unmarked = 0
+        
+        R_deletion = 0.0  # Track deletion component
+        
+        for pid in deleted_pids:
+            state = self._node_state.get(pid, 'UNMARKED')
+            
+            if state == 'TO_DELETE':
+                # Check timing with smooth Gaussian reward
+                t_deadline = self._node_t_deadline.get(pid, t)
+                
+                if self.dr_use_smooth_deadline:
+                    # Smooth Gaussian: reward = delta_pos × exp(-[(t - deadline)² / (2σ²)])
+                    # σ controls width: smaller σ = stricter timing requirement
+                    time_diff = t - t_deadline
+                    gaussian_reward = self.dr_delta_pos * np.exp(-(time_diff ** 2) / (2 * self.dr_sigma_deadline ** 2))
+                    R_deletion += gaussian_reward
+                    
+                    # Count as "exact" if within tolerance for logging
+                    if abs(time_diff) <= self.dr_epsilon_time:
+                        n_exact_deadline += 1
+                    else:
+                        n_early_late += 1
+                else:
+                    # Legacy binary reward
+                    if abs(t - t_deadline) <= self.dr_epsilon_time:
+                        R_deletion += self.dr_delta_pos
+                        n_exact_deadline += 1
+                    else:
+                        R_deletion -= self.dr_delta_neg
+                        n_early_late += 1
+                
+                # Mark as DELETED
+                self._node_state[pid] = 'DELETED'
+                
+            elif state == 'NOT_TO_DELETE':
+                # Wrong deletion - penalty
+                R_deletion -= self.dr_zeta
+                n_wrong_not_to_delete += 1
+                self._node_state[pid] = 'DELETED'
+                
+            elif state == 'UNMARKED':
+                # Illegal deletion - penalty
+                R_deletion -= self.dr_eta
+                n_wrong_unmarked += 1
+                self._node_state[pid] = 'DELETED'
+        
+        # Clip deletion component to prevent unbounded negative spikes
+        R_deletion = np.clip(R_deletion, -self.dr_deletion_clip, self.dr_deletion_clip)
+        
+        # Normalize by system size for consistency with global normalization
+        if self.dr_normalize_penalties:
+            R_deletion = R_deletion / (1 + prev_N)
+        
+        # ===== COMPONENT 4: Missed deadline penalty =====
+        n_missed_deadline = 0
+        R_deadline = 0.0  # Track deadline component
+        
+        for pid in prev_pids:
+            if pid in new_pids_set:  # Node still exists
+                state = self._node_state.get(pid)
+                if state == 'TO_DELETE':
+                    t_deadline = self._node_t_deadline.get(pid)
+                    if t_deadline is not None and t > t_deadline + self.dr_epsilon_time:
+                        # Deadline passed - penalty
+                        R_deadline -= self.dr_delta_neg
+                        n_missed_deadline += 1
+        
+        # Clip deadline component to prevent unbounded negative spikes
+        R_deadline = np.clip(R_deadline, -self.dr_deadline_clip, self.dr_deadline_clip)
+        
+        # Normalize by system size for consistency with global normalization
+        if self.dr_normalize_penalties:
+            R_deadline = R_deadline / (1 + prev_N)
+        
+        # Clean up deleted nodes from tracking (remove from timing dicts, keep state as DELETED)
+        for pid in deleted_pids:
+            if pid in self._node_t_marked:
+                del self._node_t_marked[pid]
+            if pid in self._node_t_deadline:
+                del self._node_t_deadline[pid]
+            # Note: _node_state[pid] kept as 'DELETED' for debugging, will be removed if pid reused
+        
+        # Compose total reward
+        R_raw = R_growth + R_unmarked + R_marking_bonus + R_deletion + R_deadline
+        
+        # Apply global normalization by system size (prevents large-N explosion)
+        if self.dr_use_global_norm:
+            R_normalized_before_tanh = R_raw / (1 + prev_N)
+            R_normalized = np.tanh(R_normalized_before_tanh)
+        elif self.dr_per_component_norm:
+            # Legacy per-component normalization
+            R_growth_norm = np.tanh(R_growth / self.dr_growth_scale)
+            R_unmarked_norm = np.tanh(R_unmarked / self.dr_unmarked_scale)
+            R_marking_norm = np.tanh(R_marking_bonus / self.dr_growth_scale)
+            R_deletion_norm = np.tanh(R_deletion / self.dr_deletion_scale)
+            R_deadline_norm = np.tanh(R_deadline / self.dr_deadline_scale)
+            R_normalized = R_growth_norm + R_unmarked_norm + R_marking_norm + R_deletion_norm + R_deadline_norm
+        else:
+            # Legacy: direct tanh
+            R_normalized = np.tanh(R_raw)
+        
+        # Store detailed components for debugging
+        self._last_delete_components = {
+            'delete_raw': float(R_raw),
+            'delete_normalized': float(R_normalized),
+            'growth_reward': float(R_growth),
+            'unmarked_penalty': float(R_unmarked),
+            'marking_bonus': float(R_marking_bonus),
+            'deletion_reward': float(R_deletion),
+            'deadline_penalty': float(R_deadline),
+            'fraction_marked': float(fraction_marked),
+            'n_marked': n_marked,
+            'exact_deadline_reward': float(self.dr_delta_pos * n_exact_deadline),
+            'early_late_penalty': float(-self.dr_delta_neg * n_early_late),
+            'wrong_not_to_delete_penalty': float(-self.dr_zeta * n_wrong_not_to_delete),
+            'wrong_unmarked_penalty': float(-self.dr_eta * n_wrong_unmarked),
+            'missed_deadline_penalty': float(-self.dr_delta_neg * n_missed_deadline),
+            'n_unmarked': n_unmarked,
+            'n_to_delete': n_to_delete,
+            'n_not_to_delete': n_not_to_delete,
+            'n_exact_deadline': n_exact_deadline,
+            'n_early_late': n_early_late,
+            'n_wrong_not_to_delete': n_wrong_not_to_delete,
+            'n_wrong_unmarked': n_wrong_unmarked,
+            'n_missed_deadline': n_missed_deadline
+        }
+        
+        # Debug logging with state verification
+        if self.current_step % 50 == 0:
+            # Verify counts match
+            total_counted = n_unmarked + n_to_delete + n_not_to_delete
+            if total_counted != prev_N:
+                print(f"⚠️  State count mismatch! Total={total_counted} but N={prev_N}")
+                print(f"   States in tracking: {len(self._node_state)} entries")
+                # Show state breakdown for debugging
+                state_breakdown = {}
+                for pid in prev_pids:
+                    s = self._node_state.get(pid, 'MISSING')
+                    state_breakdown[s] = state_breakdown.get(s, 0) + 1
+                print(f"   Breakdown: {state_breakdown}")
+            
+            # Verify persistent_id → intensity mapping is correct
+            if len(pid_to_intensity) != prev_N:
+                print(f"⚠️  Intensity mapping size mismatch! Mapped={len(pid_to_intensity)} but N={prev_N}")
+            
+            print(f"🔍 Delete Reward Debug (Step {self.current_step}): "
+                  f"N={prev_N} (Nc={Nc}) | "
+                  f"States: U={n_unmarked} NTD={n_not_to_delete} TD={n_to_delete} | "
+                  f"Marked={fraction_marked:.2f} | "
+                  f"Exact={n_exact_deadline} Early/Late={n_early_late} Wrong={n_wrong_not_to_delete + n_wrong_unmarked} Missed={n_missed_deadline} | "
+                  f"Components: growth={R_growth:+.3f} unmarked={R_unmarked:+.3f} marking={R_marking_bonus:+.3f} del={R_deletion:+.3f} ddl={R_deadline:+.3f} | "
+                  f"raw={R_raw:+.3f} norm_by_N={R_raw/(1+prev_N):+.3f} final={R_normalized:+.3f}")
+        
+        return float(R_normalized)
+    
+    def _verify_state_machine_consistency(self):
+        """
+        Verify state machine consistency for debugging.
+        
+        Checks:
+        1. All nodes with states have valid persistent IDs in topology
+        2. All timing data matches state expectations
+        3. No orphaned timing entries
+        
+        Returns:
+            tuple: (is_consistent: bool, issues: list[str])
+        """
+        issues = []
+        
+        # Get current persistent IDs from topology
+        if self.topology.graph.num_nodes() == 0:
+            return True, []
+        
+        current_pids = set()
+        if 'persistent_id' in self.topology.graph.ndata:
+            pids_tensor = self.topology.graph.ndata['persistent_id'].detach().cpu().tolist()
+            current_pids = set([int(pid) for pid in pids_tensor])
+        
+        # Check 1: All TO_DELETE nodes should have timing data
+        for pid, state in self._node_state.items():
+            if state == 'TO_DELETE':
+                if pid not in self._node_t_marked:
+                    issues.append(f"pid {pid} is TO_DELETE but missing t_marked")
+                if pid not in self._node_t_deadline:
+                    issues.append(f"pid {pid} is TO_DELETE but missing t_deadline")
+        
+        # Check 2: Timing data should only exist for TO_DELETE nodes
+        for pid in self._node_t_marked.keys():
+            state = self._node_state.get(pid)
+            if state != 'TO_DELETE':
+                issues.append(f"pid {pid} has t_marked but state is {state}")
+        
+        for pid in self._node_t_deadline.keys():
+            state = self._node_state.get(pid)
+            if state != 'TO_DELETE':
+                issues.append(f"pid {pid} has t_deadline but state is {state}")
+        
+        # Check 3: DELETED nodes shouldn't be in current topology
+        for pid, state in self._node_state.items():
+            if state == 'DELETED' and pid in current_pids:
+                issues.append(f"pid {pid} is DELETED but still in topology")
+        
+        # Check 4: All current nodes should have states (except newly spawned)
+        for pid in current_pids:
+            if pid not in self._node_state:
+                # This is OK for newly spawned nodes, just note it
+                pass
+        
+        return len(issues) == 0, issues
+    
+    def get_node_state_info(self):
+        """
+        Get current state machine information for all nodes.
+        
+        Returns:
+            dict: {
+                'states': {pid: state_string},
+                'deadlines': {pid: (t_marked, t_deadline)},
+                'summary': {state: count}
+            }
+        """
+        summary = {}
+        for state in ['UNMARKED', 'NOT_TO_DELETE', 'TO_DELETE', 'DELETED']:
+            summary[state] = sum(1 for s in self._node_state.values() if s == state)
+        
+        deadlines = {}
+        for pid in self._node_t_marked.keys():
+            deadlines[pid] = (
+                self._node_t_marked.get(pid),
+                self._node_t_deadline.get(pid)
+            )
+        
+        return {
+            'states': dict(self._node_state),
+            'deadlines': deadlines,
+            'summary': summary,
+            'current_step': self.current_step
+        }
+    
+    def _calculate_delete_reward_homeostatic(self, prev_state, new_state, actions):
+        """
+        Simplified delete reward with homeostatic node-count control (LEGACY).
+        
+        Design:
+        1. Homeostasis reward: Keep N in target band 
+        2. Marking → deletion reward: Encourage proper marking before deletion
+        3. All components normalized to [-1, 1] range
+        
+        Args:
+            prev_state: Previous state dict containing topology
+            new_state: Current state dict containing topology  
+            actions: Actions taken this step
+            
+        Returns:
+            float: delete_reward in range [-1, 1]
+        """
+        # Basic validation
+        if ('persistent_id' not in prev_state or prev_state['persistent_id'] is None or
+            'to_delete' not in prev_state or prev_state['to_delete'] is None):
+            return 0.0
+
+        prev_N = int(prev_state.get('num_nodes', 0))
+        if prev_N == 0:
+            return 0.0
+        
+        new_N = int(new_state.get('num_nodes', 0))
+
+        # Get marking flags and persistent IDs (ensure CPU copy to avoid CUDA errors)
+        prev_mark = prev_state['to_delete'] > 0.5
+        prev_pid_tensor = prev_state['persistent_id'].detach().cpu()
+        
+        if new_N > 0 and 'persistent_id' in new_state and new_state['persistent_id'] is not None:
+            new_pid = set(int(x) for x in new_state['persistent_id'].detach().cpu().tolist())
+        else:
+            new_pid = set()
+
+        # -----------------------------------------
+        # 1. Node-count homeostasis reward (target N = max_critical_nodes..delta_time*max_critical_nodes)
+        # -----------------------------------------
+        N_min = getattr(self, 'max_critical_nodes', 40)
+        delta_time = getattr(self, 'delta_time', 3)
+        N_max = delta_time * N_min 
+
+        if new_N < N_min:
+            homeo = (new_N - N_min) / N_min  # linear in [-1, 0)
+        elif N_min <= new_N <= N_max:
+            homeo = self.homeo_stable_reward  # reward steady population (configurable)
+        else:
+            homeo = -(new_N - N_max) / N_max  # linear penalty beyond band
+
+        # -----------------------------------------
+        # 2. Marking → deletion reward
+        # -----------------------------------------
+        marked_deleted = 0
+        marked_persist = 0
+        unmarked_deleted = 0
+
+        # Iterate by index to correctly pair flags with PIDs
+        for i in range(prev_N):
+            flag = bool(prev_mark[i].item())
+            pid = int(prev_pid_tensor[i].item())
+            deleted = (pid not in new_pid)
+            if flag and deleted:
+                marked_deleted += 1
+            elif flag and not deleted:
+                marked_persist += 1
+            elif (not flag) and deleted:
+                unmarked_deleted += 1
+
+        # Proportional rewards with configurable coefficients (capped to 1.0)
+        r_mark_del = self.marked_deleted_reward * min(1.0, marked_deleted / max(1, prev_N))
+        r_mark_pers = self.marked_persist_penalty * min(1.0, marked_persist / max(1, prev_N))
+        r_bad_delete = self.bad_delete_penalty * min(1.0, unmarked_deleted / max(1, prev_N))
+
+        # -----------------------------------------
+        # 3. TOTAL reward (smooth saturation via tanh)
+        # -----------------------------------------
+        total_raw = homeo + r_mark_del + r_mark_pers + r_bad_delete
+        total = np.tanh(total_raw)  # Smooth bounded to (-1, 1), preserves gradient flow
+
+        # Store detailed components for debugging/analysis
+        self._last_delete_components = {
+            'delete_raw': float(total_raw),
+            'delete_normalized': float(total),
+            'homeostasis_reward': float(homeo),
+            'mark_delete_reward': float(r_mark_del),
+            'mark_persist_penalty': float(r_mark_pers),
+            'bad_delete_penalty': float(r_bad_delete),
+            'num_deletions': int(marked_deleted + unmarked_deleted),
+            'marked_deleted': int(marked_deleted),
+            'unmarked_deleted': int(unmarked_deleted)
+        }
+
+        # Debug logging every 50 steps
+        if self.current_step % 50 == 0:
+            num_marked = int(prev_mark.sum().item()) if hasattr(prev_mark, 'sum') else 0
+            print(f"🔍 Delete Reward Debug (Step {self.current_step}): "
+                  f"N={new_N} (target: {N_min}-{N_max}) | "
+                  f"marked={num_marked}/{prev_N} | "
+                  f"H={homeo:+.3f} MD={r_mark_del:+.3f} MP={r_mark_pers:+.3f} BD={r_bad_delete:+.3f} | "
+                  f"raw={total_raw:+.3f} total={total:+.3f}")
+
+        return float(total)
+
+
+
+
+
+    def _calculate_delete_reward_homeostasis(self, prev_state, new_state, actions):
         """
         Simplified delete reward with homeostatic node-count control.
         
@@ -2386,6 +2801,7 @@ class DurotaxisEnv(gym.Env):
         # Reset previous centroid for delta distance computation (distance mode optimization)
         # Will be initialized after topology reset below
         self._prev_centroid_x = None
+        self._prev_centroid_intensity = None
         
         # Reset topology history
         self.topology_history = []
@@ -2398,6 +2814,11 @@ class DurotaxisEnv(gym.Env):
         # NEW: Reset advanced feature trackers
         self._node_age.clear()
         self._node_stagnation.clear()
+        
+        # Reset state machine tracking for delete reward
+        self._node_state.clear()
+        self._node_t_marked.clear()
+        self._node_t_deadline.clear()
         
         # Reset milestone tracking for new episode
         self._milestones_reached = set()
