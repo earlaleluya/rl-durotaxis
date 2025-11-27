@@ -391,16 +391,56 @@ class DurotaxisEnv(gym.Env):
         self.delete_reward_mode = self.delete_reward.get('mode', 'state_machine')
         
         # State machine delete reward parameters
-        self.dr_alpha = self.delete_reward.get('alpha', 1.0)
-        self.dr_beta = self.delete_reward.get('beta', 0.1)
-        self.dr_gamma = self.delete_reward.get('gamma', 0.5)
-        self.dr_delta_pos = self.delete_reward.get('delta_pos', 5.0)
-        self.dr_delta_neg = self.delete_reward.get('delta_neg', 3.0)
-        self.dr_zeta = self.delete_reward.get('zeta', 4.0)
-        self.dr_eta = self.delete_reward.get('eta', 6.0)
-        self.dr_epsilon_time = self.delete_reward.get('epsilon_time', 0.0)
+        self.dr_alpha = self.delete_reward.get('alpha', 1.0)  # DEPRECATED: old growth penalty
+        self.dr_beta = self.delete_reward.get('beta', 0.1)  # DEPRECATED: old marking bonus
+        self.dr_gamma = self.delete_reward.get('gamma', 0.5)  # Unmarked penalty coefficient
+        self.dr_delta_pos = self.delete_reward.get('delta_pos', 5.0)  # DEPRECATED: exact timing reward
+        self.dr_delta_neg = self.delete_reward.get('delta_neg', 3.0)  # DEPRECATED: early/late penalty
+        self.dr_zeta = self.delete_reward.get('zeta', 4.0)  # Wrong NTD deletion penalty
+        self.dr_eta = self.delete_reward.get('eta', 6.0)  # Wrong UNMARKED deletion penalty
+        self.dr_epsilon_time = self.delete_reward.get('epsilon_time', 0.0)  # Timing tolerance
         
-        # Optimal reward shaping parameters
+        # NEW: Gaussian soft-deadline timing parameters (Three-stage learning curriculum)
+        self.dr_sigma = self.delete_reward.get('sigma', 4.0)  # Gaussian width (softness in steps)
+        self.dr_tolerance_window = self.delete_reward.get('tolerance_window', 10)  # Wide tolerance window
+        self.dr_k1 = self.delete_reward.get('k1', 2.0)  # Max timing bonus (at exact deadline)
+        self.dr_k2 = self.delete_reward.get('k2', 0.5)  # Out-of-window penalty
+        self.dr_missed_penalty = self.delete_reward.get('missed_penalty', 2.0)  # Missed deadline penalty
+        
+        # NEW: Growth and marking rewards (smooth shaping signals)
+        self.dr_beta1 = self.delete_reward.get('beta1', 0.05)  # Growth reward coefficient
+        self.dr_growth_sigma = self.delete_reward.get('growth_sigma', 20.0)  # Gaussian width for growth
+        self.dr_beta2 = self.delete_reward.get('beta2', 0.1)  # Marking event reward coefficient
+        
+        # Normalization by Nc (prevents magnitude explosions)
+        self.dr_normalize_by_nc = self.delete_reward.get('normalize_by_nc', True)
+        
+        # Component weights (for balanced multi-component learning)
+        self.dr_w_growth = self.delete_reward.get('weight_growth', 1.0)
+        self.dr_w_unmarked = self.delete_reward.get('weight_unmarked', 1.0)
+        self.dr_w_marking = self.delete_reward.get('weight_marking', 1.0)
+        self.dr_w_deletion = self.delete_reward.get('weight_deletion', 1.0)
+        self.dr_w_deadline = self.delete_reward.get('weight_deadline', 1.0)
+        
+        # Hysteresis for marking (prevents oscillation around avg_intensity)
+        self.dr_hysteresis_epsilon = self.delete_reward.get('hysteresis_epsilon', 0.05)
+        
+        # Temperature for tanh (prevents early gradient compression)
+        self.dr_reward_temp = self.delete_reward.get('reward_temp', 2.0)
+        
+        # Adaptive timing (scale sigma and tolerance with delta_t)
+        self.dr_adaptive_timing = self.delete_reward.get('adaptive_timing', True)
+        
+        # Deletion component clipping (prevents dominance when many nodes deleted)
+        self.dr_clip_del = self.delete_reward.get('clip_deletion', 1.0)
+        
+        # Deadline component clipping (prevents unbounded missed-deadline penalties)
+        self.dr_clip_deadline = self.delete_reward.get('clip_deadline', 0.5)
+        
+        # Age threshold for forcing UNMARKED classification (prevents permanent dead zone)
+        self.dr_unmarked_age_threshold = self.delete_reward.get('unmarked_age_threshold', 10)
+        
+        # DEPRECATED: Old optimal shaping parameters (kept for backward compatibility)
         self.dr_kappa = self.delete_reward.get('kappa', 0.03)  # Progressive growth coefficient
         self.dr_phi = self.delete_reward.get('phi', 0.5)
         self.dr_deletion_clip = self.delete_reward.get('deletion_penalty_clip', 30.0)
@@ -568,6 +608,12 @@ class DurotaxisEnv(gym.Env):
         self._node_state = {}  # Maps persistent_id → state string
         self._node_t_marked = {}  # Maps persistent_id → timestep when marked as TO_DELETE
         self._node_t_deadline = {}  # Maps persistent_id → deadline timestep for deletion
+        self._removed_by_agent = {}  # Maps persistent_id → bool (tracks agent-caused deletions)
+        self._unmarked_age = {}  # Maps persistent_id → steps spent in UNMARKED state
+        self._marking_phase_started = False  # Flag to ensure marking reward fires only once per episode
+        self._removed_by_agent = {}  # Maps persistent_id → bool (tracks agent-caused deletions)
+        self._unmarked_age = {}  # Maps persistent_id → steps spent in UNMARKED state
+        self._marking_phase_started = False  # Flag to ensure marking reward fires only once per episode
         
         # Node-level reward tracking
         self.prev_node_positions = []  # Store previous node positions for movement rewards
@@ -1642,6 +1688,18 @@ class DurotaxisEnv(gym.Env):
         t = self.current_step
         delta_t = getattr(self, 'delta_time', 3)
         
+        # Adaptive timing parameters (scale with delta_t)
+        if self.dr_adaptive_timing:
+            # Tolerance window: ~30% of deadline, minimum 1 step
+            tolerance_window = max(1, int(round(delta_t * 0.3)))
+            # Sigma tied to tolerance window (not delta_t directly)
+            # This keeps Gaussian steep: 1.0 at Δt=0, ~0.6 at Δt=W, near 0 at Δt>2W
+            sigma = tolerance_window / 1.5
+        else:
+            # Use fixed config values
+            tolerance_window = self.dr_tolerance_window
+            sigma = self.dr_sigma
+        
         # Get persistent IDs
         prev_pids = prev_state['persistent_id'].detach().cpu().tolist()
         prev_pids = [int(pid) for pid in prev_pids]
@@ -1650,12 +1708,6 @@ class DurotaxisEnv(gym.Env):
         if new_N > 0 and 'persistent_id' in new_state and new_state['persistent_id'] is not None:
             new_pids = new_state['persistent_id'].detach().cpu().tolist()
             new_pids_set = set([int(pid) for pid in new_pids])
-            
-            # Initialize newly spawned nodes as UNMARKED
-            # These are nodes in new_state that weren't in prev_state
-            for pid in new_pids_set:
-                if pid not in self._node_state:
-                    self._node_state[int(pid)] = 'UNMARKED'
         
         # CRITICAL: Create persistent_id → intensity mapping
         # Node features include: [x, y, intensity, in_deg, out_deg, centrality, centroid_dist, boundary, new_node, age, stagnation]
@@ -1675,20 +1727,24 @@ class DurotaxisEnv(gym.Env):
         else:
             avg_intensity = 0.0
         
-        # Initialize new nodes as UNMARKED (explicit initialization for new spawns)
-        for pid in prev_pids:
-            if pid not in self._node_state:
-                self._node_state[pid] = 'UNMARKED'
+        # ============================================================
+        # STATE INITIALIZATION (single consolidate location)
+        # ============================================================
+        # Initialize all current persistent IDs with UNMARKED if not already tracked
+        # This handles both newly spawned nodes and first-time encounters
+        all_current_pids = set(prev_pids) | new_pids_set
+        for pid in all_current_pids:
+            self._node_state.setdefault(pid, 'UNMARKED')
         
-        # Validate state consistency: all prev_pids must have states
-        for pid in prev_pids:
-            if pid not in self._node_state:
-                # This should never happen after initialization above, but defensive check
-                print(f"⚠️  State machine ERROR: pid {pid} has no state, initializing as UNMARKED")
-                self._node_state[pid] = 'UNMARKED'
-        
-        # MARKING LOGIC: Trigger when N > Nc
+        # MARKING LOGIC: Trigger when N > Nc (with hysteresis to prevent oscillation)
         if prev_N > Nc:
+            # Hysteresis thresholds (prevents state flipping when intensity ≈ avg)
+            threshold_low = avg_intensity - self.dr_hysteresis_epsilon
+            threshold_high = avg_intensity + self.dr_hysteresis_epsilon
+            
+            # Force classification if N >> Nc (prevents permanent UNMARKED in dead zone)
+            force_classify = (prev_N > Nc + 10)  # Force when 10+ nodes above critical
+            
             for pid in prev_pids:
                 # Get current state
                 state = self._node_state.get(pid, 'UNMARKED')
@@ -1696,25 +1752,45 @@ class DurotaxisEnv(gym.Env):
                 # Get intensity for this persistent_id
                 node_intensity = pid_to_intensity.get(pid)
                 
-                # State transition rules
+                # Track age in UNMARKED state (for age-based forcing)
+                if state == 'UNMARKED':
+                    self._unmarked_age[pid] = self._unmarked_age.get(pid, 0) + 1
+                else:
+                    # Reset age when node exits UNMARKED
+                    self._unmarked_age[pid] = 0
+                
+                # Check if node has been UNMARKED too long (prevents permanent dead zone)
+                unmarked_too_long = (self._unmarked_age.get(pid, 0) >= self.dr_unmarked_age_threshold)
+                
+                # State transition rules with hysteresis
                 if state == 'TO_DELETE':
                     # TO_DELETE is immutable - do not re-mark or reset
                     pass
                 elif state == 'NOT_TO_DELETE':
-                    # Allow NOT_TO_DELETE → TO_DELETE if intensity drops
-                    if node_intensity is not None and node_intensity < avg_intensity:
+                    # Allow NOT_TO_DELETE → TO_DELETE only if intensity drops BELOW threshold_low
+                    if node_intensity is not None and node_intensity < threshold_low:
                         self._node_state[pid] = 'TO_DELETE'
                         self._node_t_marked[pid] = t
                         self._node_t_deadline[pid] = t + delta_t
                 elif state == 'UNMARKED':
-                    # UNMARKED → TO_DELETE or NOT_TO_DELETE based on intensity
+                    # UNMARKED → TO_DELETE or NOT_TO_DELETE based on intensity with hysteresis
                     if node_intensity is not None:
-                        if node_intensity < avg_intensity:
+                        if node_intensity < threshold_low:
                             self._node_state[pid] = 'TO_DELETE'
                             self._node_t_marked[pid] = t
                             self._node_t_deadline[pid] = t + delta_t
-                        else:
+                        elif node_intensity > threshold_high:
                             self._node_state[pid] = 'NOT_TO_DELETE'
+                        elif force_classify or unmarked_too_long:
+                            # Force classification when N >> Nc OR node stuck UNMARKED too long
+                            # Use avg_intensity directly (no hysteresis) to force a decision
+                            if node_intensity < avg_intensity:
+                                self._node_state[pid] = 'TO_DELETE'
+                                self._node_t_marked[pid] = t
+                                self._node_t_deadline[pid] = t + delta_t
+                            else:
+                                self._node_state[pid] = 'NOT_TO_DELETE'
+                        # else: remains UNMARKED (in dead zone, waiting for clearer signal)
         
         # Count node states (no default in get() to ensure accurate counting)
         n_unmarked = sum(1 for pid in prev_pids if self._node_state.get(pid) == 'UNMARKED')
@@ -1728,36 +1804,62 @@ class DurotaxisEnv(gym.Env):
         # Initialize component rewards
         R_growth = 0.0
         R_unmarked = 0.0
-        R_marking_bonus = 0.0
+        R_marking = 0.0
         
-        # ===== COMPONENT 1: Progressive growth encouragement =====
-        # Small linear reward for growing when N ≤ Nc (fixes small-N death spiral)
-        if prev_N <= Nc:
-            R_growth = self.dr_kappa * prev_N
+        # ============================================================
+        # 1. GROWTH REWARD (Directional Gaussian) — encourages N → Nc
+        # ============================================================
+        # Directional growth reward:
+        # - When N < Nc: positive reward (encourage growth)
+        # - When N > Nc: negative reward (encourage pruning)
+        # This creates a directional push toward Nc, not just a symmetric peak
+        growth_gaussian = np.exp(-((prev_N - Nc) ** 2) / (2 * self.dr_growth_sigma ** 2))
+        
+        if prev_N < Nc:
+            # Below critical: encourage growth
+            R_growth = self.dr_beta1 * growth_gaussian
+        elif prev_N > Nc:
+            # Above critical: encourage pruning (negative reward)
+            R_growth = -self.dr_beta1 * growth_gaussian
         else:
-            # Above threshold: small constant bonus
-            R_growth = self.dr_beta
+            # Exactly at Nc: maximum reward
+            R_growth = self.dr_beta1
         
-        # ===== COMPONENT 2: Log-scaled unmarked penalty =====
-        # Dual penalty: normalized + log-scaled (prevents explosion, maintains pressure)
-        if self.dr_use_log_scaling:
-            # Optimal: adaptive scaling across all N
-            R_unmarked = -self.dr_alpha_unmarked * (n_unmarked / max(1 + prev_N, 1))
-            R_unmarked -= self.dr_gamma_log * np.log(1 + n_unmarked)
+        # ============================================================
+        # 2. UNMARKED PENALTY (normalized by Nc) — avoids huge penalties
+        # ============================================================
+        # R_unmarked = -gamma * (U / Nc)
+        # Range: [-gamma, 0] regardless of N
+        R_unmarked = -self.dr_gamma * (n_unmarked / max(Nc, 1))
+        
+        # ============================================================
+        # 3. MARKING REWARD — bonus when marking first activates
+        # ============================================================
+        # Reward the TRANSITION from unmarked state to marked state
+        # Only give reward when marking first becomes necessary (N crosses Nc threshold)
+        # Use phase flag to ensure this fires ONLY ONCE per episode, not on every oscillation
+        
+        # Check if we should activate marking phase (N > Nc and not already started)
+        if not self._marking_phase_started and prev_N > Nc and n_marked > 0:
+            # First activation of marking - give bonus
+            marking_ratio = n_marked / max(prev_N, 1)
+            R_marking = self.dr_beta2 * marking_ratio
+            self._marking_phase_started = True  # Set flag to prevent repeated bonuses
         else:
-            # Legacy fallback
-            if self.dr_normalize_by_nc:
-                unmarked_ratio = n_unmarked / max(Nc, 1)
-                R_unmarked = -self.dr_gamma * unmarked_ratio * Nc
-            else:
-                R_unmarked = -self.dr_gamma * n_unmarked
+            R_marking = 0.0
         
-        # ===== COMPONENT 3: Continuous marking bonus =====
-        # Smooth reward for maintaining marked nodes (dense signal)
-        R_marking_bonus = self.dr_phi * fraction_marked
+        # ============================================================
+        # 4. DELETION ACTION REWARDS (Gaussian soft-deadline timing)
+        # ============================================================
+        # Use set difference to detect deletions (handles PID reordering correctly)
+        prev_pids_set = set(prev_pids)
+        deleted_pids = list(prev_pids_set - new_pids_set)
         
-        # ===== COMPONENT 3: Process deletions this timestep =====
-        deleted_pids = [pid for pid in prev_pids if pid not in new_pids_set]
+        # Mark all detected deletions as agent-caused
+        # (Simulation changes happen during topology.act(), but reward is calculated AFTER)
+        # If node disappeared, it was due to agent action or explicit topology change
+        for pid in deleted_pids:
+            self._removed_by_agent[pid] = True
         
         n_exact_deadline = 0
         n_early_late = 0
@@ -1767,127 +1869,133 @@ class DurotaxisEnv(gym.Env):
         R_deletion = 0.0  # Track deletion component
         
         for pid in deleted_pids:
+            # Only process deletions caused by agent (skip simulation-caused disappearances)
+            if not self._removed_by_agent.get(pid, False):
+                continue  # Skip non-agent deletions
+            
             state = self._node_state.get(pid, 'UNMARKED')
             
+            # CASE 1 — Deleting UNMARKED (always wrong)
+            if state == 'UNMARKED':
+                R_deletion -= self.dr_eta
+                n_wrong_unmarked += 1
+                continue
+            
+            # CASE 2 — Deleting NOT_TO_DELETE (wrong)
+            if state == 'NOT_TO_DELETE':
+                R_deletion -= self.dr_zeta
+                n_wrong_not_to_delete += 1
+                continue
+            
+            # CASE 3 — Deleting TO_DELETE (timing-sensitive with Gaussian soft-deadline)
             if state == 'TO_DELETE':
-                # Check timing with smooth Gaussian reward
                 t_deadline = self._node_t_deadline.get(pid, t)
+                time_diff = abs(t - t_deadline)
                 
-                if self.dr_use_smooth_deadline:
-                    # Smooth Gaussian: reward = delta_pos × exp(-[(t - deadline)² / (2σ²)])
-                    # σ controls width: smaller σ = stricter timing requirement
-                    time_diff = t - t_deadline
-                    gaussian_reward = self.dr_delta_pos * np.exp(-(time_diff ** 2) / (2 * self.dr_sigma_deadline ** 2))
-                    R_deletion += gaussian_reward
-                    
-                    # Count as "exact" if within tolerance for logging
-                    if abs(time_diff) <= self.dr_epsilon_time:
+                # Gaussian soft-deadline timing reward (using adaptive sigma)
+                # R_gauss = exp(-Δ² / 2σ²)
+                gaussian_reward = np.exp(-(time_diff ** 2) / (2 * sigma ** 2))
+                
+                # Apply tolerance window (using adaptive tolerance)
+                if time_diff <= tolerance_window:
+                    # Inside window: positive reward scaled by Gaussian
+                    R_deletion += self.dr_k1 * gaussian_reward
+                    # Count as "exact" if very close for logging
+                    if time_diff <= self.dr_epsilon_time:
                         n_exact_deadline += 1
                     else:
                         n_early_late += 1
                 else:
-                    # Legacy binary reward
-                    if abs(t - t_deadline) <= self.dr_epsilon_time:
-                        R_deletion += self.dr_delta_pos
-                        n_exact_deadline += 1
-                    else:
-                        R_deletion -= self.dr_delta_neg
-                        n_early_late += 1
-                
-                # Mark as DELETED
-                self._node_state[pid] = 'DELETED'
-                
-            elif state == 'NOT_TO_DELETE':
-                # Wrong deletion - penalty
-                R_deletion -= self.dr_zeta
-                n_wrong_not_to_delete += 1
-                self._node_state[pid] = 'DELETED'
-                
-            elif state == 'UNMARKED':
-                # Illegal deletion - penalty
-                R_deletion -= self.dr_eta
-                n_wrong_unmarked += 1
-                self._node_state[pid] = 'DELETED'
+                    # Outside window: small penalty
+                    R_deletion -= self.dr_k2
+                    n_early_late += 1
         
-        # Clip deletion component to prevent unbounded negative spikes
-        R_deletion = np.clip(R_deletion, -self.dr_deletion_clip, self.dr_deletion_clip)
+        # Clip deletion reward to prevent dominance when many nodes deleted
+        R_deletion = np.clip(R_deletion, -self.dr_clip_del, +self.dr_clip_del)
         
-        # Normalize by system size for consistency with global normalization
-        if self.dr_normalize_penalties:
-            R_deletion = R_deletion / (1 + prev_N)
-        
-        # ===== COMPONENT 4: Missed deadline penalty =====
+        # ============================================================
+        # 5. MISSED DEADLINE CHECK
+        # ============================================================
         n_missed_deadline = 0
-        R_deadline = 0.0  # Track deadline component
+        R_deadline = 0.0  # Track missed deadline component
         
         for pid in prev_pids:
             if pid in new_pids_set:  # Node still exists
                 state = self._node_state.get(pid)
                 if state == 'TO_DELETE':
                     t_deadline = self._node_t_deadline.get(pid)
-                    if t_deadline is not None and t > t_deadline + self.dr_epsilon_time:
-                        # Deadline passed - penalty
-                        R_deadline -= self.dr_delta_neg
+                    if t_deadline is not None and t > t_deadline:
+                        # Only penalize if node is deletable by agent (not simulation-removed)
+                        # If node exists and is TO_DELETE past deadline, it's the agent's fault
+                        R_deadline -= self.dr_missed_penalty
                         n_missed_deadline += 1
         
-        # Clip deadline component to prevent unbounded negative spikes
-        R_deadline = np.clip(R_deadline, -self.dr_deadline_clip, self.dr_deadline_clip)
+        # Clip deadline penalty to prevent dominance when many nodes are late
+        R_deadline = np.clip(R_deadline, -self.dr_clip_deadline, +self.dr_clip_deadline)
         
-        # Normalize by system size for consistency with global normalization
-        if self.dr_normalize_penalties:
-            R_deadline = R_deadline / (1 + prev_N)
-        
-        # Clean up deleted nodes from tracking (remove from timing dicts, keep state as DELETED)
+        # Clean up deleted nodes from tracking (fully remove to prevent PID reuse contamination)
         for pid in deleted_pids:
-            if pid in self._node_t_marked:
-                del self._node_t_marked[pid]
-            if pid in self._node_t_deadline:
-                del self._node_t_deadline[pid]
-            # Note: _node_state[pid] kept as 'DELETED' for debugging, will be removed if pid reused
+            # Remove from all tracking dictionaries
+            self._node_t_marked.pop(pid, None)
+            self._node_t_deadline.pop(pid, None)
+            self._node_state.pop(pid, None)  # Fully delete state (not just mark as DELETED)
+            self._removed_by_agent.pop(pid, None)  # Clean up agent-deletion tracking
+            self._unmarked_age.pop(pid, None)  # Clean up age tracking
         
-        # Compose total reward
-        R_raw = R_growth + R_unmarked + R_marking_bonus + R_deletion + R_deadline
+        # ============================================================
+        # COMPOSE REWARD WITH WEIGHTED SUM (NO PER-COMPONENT NORMALIZATION)
+        # ============================================================
+        # Use raw component values directly - no individual normalization
+        # This preserves gradient information and prevents triple saturation
+        #
+        # Component ranges (with balanced parameters ~0.5):
+        #   R_growth:   [0, beta1]           ≈ [0, 0.5]
+        #   R_unmarked: [-gamma, 0]          ≈ [-0.5, 0]
+        #   R_marking:  [0, beta2]           ≈ [0, 0.5]
+        #   R_deletion: [-clip_del, +clip_del]  clipped to prevent dominance
+        #   R_deadline: [-missed_penalty*n, 0]  depends on missed deadlines
+        #
+        # Final range after weighted sum: typically [-3, +3]
+        # Hard clipping preserves rich reward structure and interaction effects
         
-        # Apply global normalization by system size (prevents large-N explosion)
-        if self.dr_use_global_norm:
-            R_normalized_before_tanh = R_raw / (1 + prev_N)
-            R_normalized = np.tanh(R_normalized_before_tanh)
-        elif self.dr_per_component_norm:
-            # Legacy per-component normalization
-            R_growth_norm = np.tanh(R_growth / self.dr_growth_scale)
-            R_unmarked_norm = np.tanh(R_unmarked / self.dr_unmarked_scale)
-            R_marking_norm = np.tanh(R_marking_bonus / self.dr_growth_scale)
-            R_deletion_norm = np.tanh(R_deletion / self.dr_deletion_scale)
-            R_deadline_norm = np.tanh(R_deadline / self.dr_deadline_scale)
-            R_normalized = R_growth_norm + R_unmarked_norm + R_marking_norm + R_deletion_norm + R_deadline_norm
-        else:
-            # Legacy: direct tanh
-            R_normalized = np.tanh(R_raw)
+        R_raw = (
+            self.dr_w_growth * R_growth +
+            self.dr_w_unmarked * R_unmarked +
+            self.dr_w_marking * R_marking +
+            self.dr_w_deletion * R_deletion +
+            self.dr_w_deadline * R_deadline
+        )
+        
+        # ============================================================
+        # FINAL OUTPUT WITH HARD CLIPPING (preserves reward structure)
+        # ============================================================
+        # Use hard clipping instead of tanh to preserve multi-component interaction effects
+        # This allows RL to see rich reward structure: e.g., R_growth=+1, R_unmarked=-1
+        # With tanh, these would cancel to 0; with clip, agent sees both components
+        R_final = np.clip(R_raw, -1.0, +1.0)
         
         # Store detailed components for debugging
+        n_deleted = len(deleted_pids)
         self._last_delete_components = {
             'delete_raw': float(R_raw),
-            'delete_normalized': float(R_normalized),
+            'delete_normalized': float(R_final),
             'growth_reward': float(R_growth),
             'unmarked_penalty': float(R_unmarked),
-            'marking_bonus': float(R_marking_bonus),
+            'marking_reward': float(R_marking),
             'deletion_reward': float(R_deletion),
             'deadline_penalty': float(R_deadline),
             'fraction_marked': float(fraction_marked),
             'n_marked': n_marked,
-            'exact_deadline_reward': float(self.dr_delta_pos * n_exact_deadline),
-            'early_late_penalty': float(-self.dr_delta_neg * n_early_late),
-            'wrong_not_to_delete_penalty': float(-self.dr_zeta * n_wrong_not_to_delete),
-            'wrong_unmarked_penalty': float(-self.dr_eta * n_wrong_unmarked),
-            'missed_deadline_penalty': float(-self.dr_delta_neg * n_missed_deadline),
-            'n_unmarked': n_unmarked,
-            'n_to_delete': n_to_delete,
-            'n_not_to_delete': n_not_to_delete,
+            'n_deleted': n_deleted,
+            # Counts only (not recomputed penalties - avoid double counting)
             'n_exact_deadline': n_exact_deadline,
             'n_early_late': n_early_late,
             'n_wrong_not_to_delete': n_wrong_not_to_delete,
             'n_wrong_unmarked': n_wrong_unmarked,
-            'n_missed_deadline': n_missed_deadline
+            'n_missed_deadline': n_missed_deadline,
+            'n_unmarked': n_unmarked,
+            'n_to_delete': n_to_delete,
+            'n_not_to_delete': n_not_to_delete
         }
         
         # Debug logging with state verification
@@ -1910,13 +2018,14 @@ class DurotaxisEnv(gym.Env):
             
             print(f"🔍 Delete Reward Debug (Step {self.current_step}): "
                   f"N={prev_N} (Nc={Nc}) | "
+                  f"Timing: σ={sigma:.1f} W={tolerance_window} ({'adaptive' if self.dr_adaptive_timing else 'fixed'}) | "
                   f"States: U={n_unmarked} NTD={n_not_to_delete} TD={n_to_delete} | "
                   f"Marked={fraction_marked:.2f} | "
-                  f"Exact={n_exact_deadline} Early/Late={n_early_late} Wrong={n_wrong_not_to_delete + n_wrong_unmarked} Missed={n_missed_deadline} | "
-                  f"Components: growth={R_growth:+.3f} unmarked={R_unmarked:+.3f} marking={R_marking_bonus:+.3f} del={R_deletion:+.3f} ddl={R_deadline:+.3f} | "
-                  f"raw={R_raw:+.3f} norm_by_N={R_raw/(1+prev_N):+.3f} final={R_normalized:+.3f}")
+                  f"Del={n_deleted} (Exact={n_exact_deadline} Early/Late={n_early_late} Wrong={n_wrong_not_to_delete + n_wrong_unmarked}) Missed={n_missed_deadline} | "
+                  f"Raw: g={R_growth:+.3f} u={R_unmarked:+.3f} m={R_marking:+.3f} d={R_deletion:+.3f} ddl={R_deadline:+.3f} | "
+                  f"sum={R_raw:+.3f} → clip={R_final:+.3f}")
         
-        return float(R_normalized)
+        return float(R_final)
     
     def _verify_state_machine_consistency(self):
         """
@@ -2819,6 +2928,9 @@ class DurotaxisEnv(gym.Env):
         self._node_state.clear()
         self._node_t_marked.clear()
         self._node_t_deadline.clear()
+        self._removed_by_agent.clear()  # Reset agent-deletion tracking
+        self._unmarked_age.clear()  # Reset UNMARKED age tracking
+        self._marking_phase_started = False  # Reset marking phase flag
         
         # Reset milestone tracking for new episode
         self._milestones_reached = set()
