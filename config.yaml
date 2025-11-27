@@ -16,7 +16,7 @@ environment:
   
   # Node and topology limits
   init_num_nodes: 70
-  max_critical_nodes: 40  
+  max_critical_nodes: 30  
   state_space_multiplier: 2.0  # Observation capacity: K = multiplier × max_critical_nodes
   threshold_critical_nodes: 400
   max_steps: 1000
