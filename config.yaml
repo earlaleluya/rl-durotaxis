@@ -304,7 +304,7 @@ trainer:
   # Resume training
   resume_training:
     enabled: true
-    checkpoint_path: "training_results/run0043/succ_model_batch24.pt"
+    checkpoint_path: "training_results/run0044/succ_model_batch23.pt"
     resume_from_best: false
     reset_optimizer: false
     reset_episode_count: true
