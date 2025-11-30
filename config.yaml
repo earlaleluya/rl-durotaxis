@@ -18,12 +18,11 @@ environment:
   init_num_nodes: 70
   max_critical_nodes: 40  
   state_space_multiplier: 2.0  # Observation capacity: K = multiplier × max_critical_nodes
-  threshold_critical_nodes: 400
+  threshold_critical_nodes: 500
   max_steps: 1000
   
   # Simulation parameters
   delta_time: 3
-  delta_intensity: 2.5
   consecutive_left_moves_limit: 30
   
   # Visualization
@@ -33,10 +32,9 @@ environment:
   # ============================================================================
   # REWARD MODES (Special Modes for Ablation Studies)
   # ============================================================================
-  # Normal mode (all three disabled): Delete + Spawn + Distance
-  # Special modes: Enable ONE or MORE for ablation studies
+  # Normal mode (both disabled): Delete + Distance
+  # Special modes: Enable ONE for ablation studies
   simple_delete_only_mode: false
-  simple_spawn_only_mode: false
   centroid_distance_only_mode: false
   include_termination_rewards: false
   
@@ -47,48 +45,160 @@ environment:
   # Makes priority explicit in the task reward, not just critic loss weights
   reward_weights:
     delete_weight: 1.0         
-    distance_weight: 0.001       
+    distance_weight: 1.0 #  0.001       
     termination_weight: 0.01
   
   # ============================================================================
   # CORE REWARD COMPONENTS 
   # ============================================================================
   
-  # Delete Reward (Simplified Homeostatic Design)
-  # Three-component system optimized for simplicity and interpretability:
-  #   1. Homeostasis: Linear feedback to maintain N in [N_min, N_max] band
-  #      - N < N_min: linear penalty (encourages growth)
-  #      - N_min ≤ N ≤ N_max: stable reward (optimal range)
-  #      - N > N_max: linear penalty (discourages runaway growth)
-  #   2. Marking rewards: Encourage proper mark-then-delete workflow
-  #      - Marked + deleted: positive reward (correct behavior)
-  #      - Marked + persists: small penalty (marking without action)
-  #      - Unmarked + deleted: large penalty (improper deletion)
-  #   3. Total clipping: All rewards clipped to [-1, 1] range
+  # Delete Reward (State Machine Design)
+  # Node state transitions: UNMARKED → NOT_TO_DELETE → TO_DELETE → DELETED
+  # Encourages growing beyond Nc (max_critical_nodes) and optimal deletion timing
   #
-  # Key parameters:
-  #   - N_min = max_critical_nodes (from environment config)
-  #   - N_max = delta_time × N_min (adaptive band width)
+  # Key behaviors:
+  #   1. Growth incentive: penalize UNMARKED nodes when N ≤ Nc
+  #   2. Marking trigger: when N > Nc, mark nodes based on intensity vs average
+  #   3. Timing constraint: TO_DELETE nodes must be deleted at t + delta_time
+  #   4. State immutability: TO_DELETE nodes cannot be re-marked or reset
+  #
+  # Reward components:
+  #   - Growth encouragement: penalty for N ≤ Nc to push beyond threshold
+  #   - Unmarked penalty: force agent to trigger marking by growing
+  #   - Exact deadline reward: bonus for deleting at correct timestep
+  #   - Early/late penalty: discourage premature or delayed deletion
+  #   - Wrong deletion penalty: prevent deleting NOT_TO_DELETE or UNMARKED nodes
   delete_reward:
-    # Homeostasis: reward for stable population in [N_min, N_max] band
-    homeostasis_stable_reward: 0.3
+    # Mode selection: 'homeostatic' (old) or 'state_machine' (new)
+    mode: 'state_machine'
     
+    # ========== STATE MACHINE MODE PARAMETERS ==========
+    # Growth encouragement (push N > Nc)
+    alpha: 1.0                      # Penalty weight when N ≤ Nc
+    beta: 0.1                       # Bonus when N > Nc (marking activated)
+    
+    # Unmarked node penalty (force marking)
+    gamma: 0.5                      # Penalty per UNMARKED node
+    
+    # ========== GAUSSIAN SOFT-DEADLINE TIMING REWARD ==========
+    # Three-stage learning curriculum:
+    #   Stage 1: Delete near deadline (± wide tolerance) - early training
+    #   Stage 2: Improve precision gradually - middle training  
+    #   Stage 3: Delete exactly at deadline - late training
+    # No harsh penalties early on - smooth gradient for learning
+    
+    # Gaussian timing parameters
+    sigma: 4.0                      # Softness of deadline timing (in timesteps)
+                                    # σ=4.0 means reward drops to ~60% at ±4 steps from deadline
+                                    # Larger σ = more forgiving early learning
+    tolerance_window: 10            # Wide tolerance window (steps)
+                                    # If |t - deadline| ≤ W: positive reward (scaled by Gaussian)
+                                    # If |t - deadline| > W: small penalty
+    k1: 0.5                         # Max timing bonus (at exact deadline)
+    k2: 0.5                         # Penalty for deletion outside tolerance window
+    
+    # Wrong deletion penalties
+    zeta: 0.5                       # Penalty for deleting NOT_TO_DELETE node
+    eta: 0.5                        # Penalty for deleting UNMARKED node
+    missed_penalty: 0.5             # Penalty for missed deadline (TO_DELETE node past deadline)
+    
+    # ========== GROWTH AND MARKING REWARDS ==========
+    # Smooth shaping signals for learning progression
+    
+    # Growth reward (Gaussian centered at Nc - encourages N ≈ Nc)
+    beta1: 0.5                      # Growth reward coefficient
+                                    # R_growth = beta1 * exp(-[(N-Nc)²/(2σ²)])
+                                    # Maximum at N=Nc, decreases on both sides
+    growth_sigma: 20.0              # Gaussian width for growth reward
+                                    # Larger σ = more tolerant of deviations from Nc
+                                    # σ=20 means reward drops to ~60% at N=Nc±20
+    
+    # Marking reward (bonus when marking activates)
+    beta2: 0.5                      # Marking event reward coefficient
+                                    # R_marking = beta2 * (TD + NTD) / N when N > Nc
+                                    # Explicit reward for triggering marking phase
+    
+    # Hysteresis for marking logic (prevents oscillation)
+    hysteresis_epsilon: 0.05        # Margin around avg_intensity for stable marking
+                                    # intensity < avg - ε → TO_DELETE
+                                    # intensity > avg + ε → NOT_TO_DELETE
+                                    # Prevents state flipping when intensity ≈ avg
+    
+    # ========== PENALTY NORMALIZATION ==========
+    # Prevents magnitude explosions with large N
+    
+    # Unmarked penalty (normalized by Nc, not N)
+    gamma: 0.5                      # Unmarked penalty coefficient
+                                    # R_unmarked = -gamma * (U / Nc)
+                                    # Range: [-gamma, 0] regardless of N
+    
+    # Global normalization method
+    normalize_by_nc: true           # Use single tanh normalization at end
+                                    # Raw components summed → tanh(sum / T)
+                                    # NO per-component normalization (preserves gradients)
+    
+    # Temperature scaling for tanh (prevents early gradient compression)
+    reward_temp: 2.0                # Scale R_raw before tanh: tanh(R_raw / T)
+                                    # T=1.0 → standard tanh (compresses at |R|>3)
+                                    # T=2.0 → preserves differences in [-3,+3] range
+                                    # T=3.0 → even more forgiving
+    
+    # ========== ADVANCED STABILITY FEATURES ==========
+    # Prevent dominance and instability issues
+    
+    # Adaptive timing (scale sigma and tolerance with delta_t)
+    adaptive_timing: true           # If true: sigma = delta_t/2, tolerance = delta_t/3
+                                    # Ensures learning difficulty constant regardless of deadline length
+                                    # If false: use fixed sigma and tolerance_window values above
+    
+    # Deletion component clipping (prevents dominance)
+    clip_deletion: 1.0              # Clip R_deletion to [-clip_del, +clip_del]
+                                    # Prevents deletion reward from dominating when many nodes deleted
+                                    # Recommended: 1.0 (same scale as other components)
+    
+    # Deadline component clipping (prevents unbounded penalties)
+    clip_deadline: 0.5              # Clip R_deadline to [-clip_deadline, +clip_deadline]
+                                    # Prevents missed-deadline penalties from overwhelming other components
+                                    # Recommended: 0.5 (smaller than deletion since it's purely penalty)
+    
+    # UNMARKED age threshold (prevents permanent dead zone)
+    unmarked_age_threshold: 10      # Force classification after this many steps in UNMARKED
+                                    # Prevents nodes from staying UNMARKED forever in hysteresis dead zone
+                                    # Lower = more aggressive forcing, Higher = more patient
+    
+    # ========== COMPONENT WEIGHTS ==========
+    # Balance between different reward signals (all components normalized to [-1,+1])
+    # Equal weights = equal learning importance
+    weight_growth: 1.0              # Weight for growth reward
+    weight_unmarked: 1.0            # Weight for unmarked penalty
+    weight_marking: 1.0             # Weight for marking reward
+    weight_deletion: 1.0            # Weight for deletion timing reward
+    weight_deadline: 1.0            # Weight for missed deadline penalty
     # Marking rewards (proportional to fraction of prev_N, capped to 1.0)
     marked_deleted_reward: 0.6      # Reward for deleting marked nodes
     marked_persist_penalty: -0.2    # Penalty for marked nodes that persist
     bad_delete_penalty: -0.8        # Penalty for deleting unmarked nodes
   
-  # Distance Reward (Centroid movement toward goal)
+  # Distance Reward (Intensity-based centroid movement)
+  # Measures centroid's substrate intensity increase (ΔI_centroid)
+  # Goal: Reward agent for spawning on higher intensity substrate
   distance_mode:
     use_delta_distance: true
     distance_reward_scale: 5.0
     
+    # Intensity-based distance reward
+    target_delta_intensity: 5.0        # Target intensity increase per step
+                                       # Reward = 0 at ΔI = target (threshold)
+                                       # Reward > 0 only when ΔI > target
+    
     # Substrate-aware normalization (bounds distance reward to [-1, 1])
     substrate_aware_scaling: true      # Use substrate gradient for scaling
     use_tanh_normalization: true       # Use tanh (true) or softsign (false)
-    target_delta_x: 2.5              # Expected good step size for tuning
-    tanh_scale: 1.4722                # atanh(0.9) = (approx.) 1.4722 for sensitivity tuning
-    gradient_cap: null                # Optional: cap gradient for exponential substrates (e.g., 10.0)
+    tanh_scale: 2.5                    # Scale factor: c = tanh_scale × target_delta_intensity
+                                       # This ensures tanh(target_delta_intensity / c) = tanh(1) ≈ 0.76
+                                       # For threshold at target: set c = target_delta_intensity (tanh(1)=0.76)
+                                       # For zero at target: use shifted tanh or adjust calculation
+    gradient_cap: null                 # Optional: cap gradient for exponential substrates (e.g., 10.0)
     
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
@@ -143,10 +253,10 @@ actor_critic:
   # Action parameter bounds
   action_parameter_bounds:
     delete_ratio: [0.0, 0.7]
-    gamma: [0.5, 1.0]
-    alpha: [0.5, 1.0]
+    gamma: [0.5, 5.0]
+    alpha: [0.5, 3.0]
     noise: [0.05, 0.10]
-    theta: [-0.3491, 0.3491]  # -20 to 20 deg
+    theta: [-0.1745, 0.1745]  # -10 to 10 deg
   
   # Value function components
   value_components:
@@ -185,10 +295,10 @@ trainer:
   
   # Resume training
   resume_training:
-    enabled: false
-    checkpoint_path: ""
+    enabled: true
+    checkpoint_path: "training_results/run0043/succ_model_batch24.pt"
     resume_from_best: false
-    reset_optimizer: true
+    reset_optimizer: false
     reset_episode_count: true
   
   # Model selection
@@ -263,9 +373,9 @@ trainer:
   # Component weights (for multi-head value function)
   # Normalized to sum to 1.0 for balanced critic head learning
   component_weights:
-    total_reward: 0.4
-    delete_reward: 0.4
-    distance_reward: 0.1
+    total_reward: 0.3
+    delete_reward: 0.3
+    distance_reward: 0.3
     termination_reward: 0.1
   
   # Policy loss weights

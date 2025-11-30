@@ -14,8 +14,8 @@ Usage:
     python deploy.py --substrate_type linear --m 0.05 --b 1.0 \
                      --substrate_width 100 --substrate_height 40 \
                      --deterministic --max_episodes 3 --max_steps 1000 \
-                     --max_critical_nodes 40 --threshold_critical_nodes 400 \
-                     --model_path ./training_results/run0041/succ_model_batch39.pt \
+                     --max_critical_nodes 30 --threshold_critical_nodes 400 \
+                     --model_path ./training_results/run0043/succ_model_batch24.pt \
                      --init-nodes 10 
     
     # Without visualization, custom substrate size
