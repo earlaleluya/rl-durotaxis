@@ -3002,13 +3002,17 @@ class DurotaxisTrainer:
         # Ensure entropy loss is always a tensor
         if entropy_losses:
             # Phase 3: Exclude component_coefficients dict from summation (metadata only)
-            total_entropy_loss = sum(v for k, v in entropy_losses.items() if k != 'component_coefficients')
+            loss_values = [v for k, v in entropy_losses.items() if k != 'component_coefficients']
+            if loss_values:
+                total_entropy_loss = sum(loss_values)
+            else:
+                total_entropy_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         else:
-            total_entropy_loss = torch.tensor(0.0, device=self.device)
+            total_entropy_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
             
         # Ensure it's a tensor, not a scalar
         if not isinstance(total_entropy_loss, torch.Tensor):
-            total_entropy_loss = torch.tensor(total_entropy_loss, device=self.device)
+            total_entropy_loss = torch.tensor(float(total_entropy_loss), dtype=torch.float32, device=self.device)
         
         # Guard against NaN/Inf in entropy loss
         if not torch.isfinite(total_entropy_loss).all():
@@ -3166,7 +3170,7 @@ class DurotaxisTrainer:
             for h in hybrid_policy_losses:
                 entropy_loss = h['entropy_loss']
                 if not isinstance(entropy_loss, torch.Tensor):
-                    entropy_loss = torch.tensor(entropy_loss, device=self.device)
+                    entropy_loss = torch.tensor(float(entropy_loss), dtype=torch.float32, device=self.device)
                 entropy_losses_list.append(entropy_loss)
                 # Also aggregate raw entropy values
                 raw_entropy_list.append(h.get('raw_entropy', 0.0))
@@ -3475,7 +3479,7 @@ class DurotaxisTrainer:
             for h in hybrid_policy_losses:
                 entropy_loss = h['entropy_loss']
                 if not isinstance(entropy_loss, torch.Tensor):
-                    entropy_loss = torch.tensor(entropy_loss, device=self.device)
+                    entropy_loss = torch.tensor(float(entropy_loss), dtype=torch.float32, device=self.device)
                 entropy_losses_list.append(entropy_loss)
                 # Also aggregate raw entropy values
                 raw_entropy_list.append(h.get('raw_entropy', 0.0))
@@ -4648,6 +4652,9 @@ class DurotaxisTrainer:
             'best_model_metrics': self.best_model_metrics.copy() if isinstance(self.best_model_metrics, dict) else {},
             'best_model_filename': self.best_model_filename,
             'episode_history': self.episode_history.copy() if isinstance(self.episode_history, list) else [],
+            # Phase 3: Component performance tracking
+            'component_performance_history': self.component_performance_history,
+            'component_improvement_rates': self.component_improvement_rates,
         }
         
         filepath = os.path.join(self.run_dir, filename)
@@ -4724,6 +4731,19 @@ class DurotaxisTrainer:
             else:
                 self.start_episode = 0
                 print(f"   ⚠️ Episode count reset to 0 (as configured)")
+            
+            # Phase 3: Load performance tracking (backward compatible)
+            if 'component_performance_history' in checkpoint:
+                self.component_performance_history = checkpoint['component_performance_history']
+                print(f"   ✅ Loaded component performance history")
+            else:
+                self.component_performance_history = {comp: [] for comp in self.component_names}
+            
+            if 'component_improvement_rates' in checkpoint:
+                self.component_improvement_rates = checkpoint['component_improvement_rates']
+                print(f"   ✅ Loaded component improvement rates")
+            else:
+                self.component_improvement_rates = {comp: 0.0 for comp in self.component_names}
             
             # Load training history
             if 'episode_rewards' in checkpoint:
@@ -4807,6 +4827,19 @@ class DurotaxisTrainer:
             self.best_total_reward = checkpoint['best_reward']
         if 'component_weights' in checkpoint:
             self.component_weights = checkpoint['component_weights']
+        
+        # Phase 3: Load performance tracking (backward compatible)
+        if 'component_performance_history' in checkpoint:
+            self.component_performance_history = checkpoint['component_performance_history']
+        else:
+            # Initialize with empty history if not in checkpoint (older checkpoints)
+            self.component_performance_history = {comp: [] for comp in self.component_names}
+        
+        if 'component_improvement_rates' in checkpoint:
+            self.component_improvement_rates = checkpoint['component_improvement_rates']
+        else:
+            # Initialize with zero rates if not in checkpoint
+            self.component_improvement_rates = {comp: 0.0 for comp in self.component_names}
             
         print(f"📂 Loaded: {filename} (Run #{checkpoint.get('run_number', 'unknown')})")
         return True
