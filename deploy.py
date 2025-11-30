@@ -355,11 +355,14 @@ class DurotaxisDeployment:
                     # Get substrate intensity at centroid position
                     intensity = env.substrate.get_intensity((cx, cy))
                     
-                    # Compute R_magnitude using Hill equation
-                    # Hill equation: R = gamma * (1.0 / (1.0 + (alpha / intensity)^2)) + noise
+                    # Compute R_magnitude using Hill equation from topology (consistent with spawn behavior)
                     if 'continuous_actions' in output:
-                        intensity_val = max(float(intensity), 1e-6)  # Avoid division by zero
-                        R_magnitude = gamma * (1.0 / (1.0 + (alpha / intensity_val)**2)) + noise_param
+                        R_magnitude = env.topology.compute_hill_equation_at_position(
+                            position=(cx, cy),
+                            gamma=gamma,
+                            alpha=alpha,
+                            noise=noise_param
+                        )
                         
                         # Compute spawn location (sx, sy) from centroid using R_magnitude and theta
                         import numpy as np

@@ -200,6 +200,14 @@ environment:
                                        # For zero at target: use shifted tanh or adjust calculation
     gradient_cap: null                 # Optional: cap gradient for exponential substrates (e.g., 10.0)
     
+    # Exponential urgency term: r_urgency = λ_e * exp(-α * d_t²)
+    # Encourages faster progress by rewarding proximity to goal
+    exponential_urgency_enabled: true # Enable urgency bonus (default: false)
+    lambda_exp: 0.3                    # Urgency weight (how much bonus to add)
+    alpha_exp: 0.001                   # Gaussian width (smaller = wider range, larger = steeper falloff)
+                                       # Example: α=0.001 gives significant bonus up to d_t ≈ 30
+                                       # Example: α=0.01 gives significant bonus up to d_t ≈ 10
+    
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
       enabled: false

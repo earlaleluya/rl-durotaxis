@@ -576,6 +576,13 @@ class DurotaxisEnv(gym.Env):
         # For shifted threshold (reward=0 at target), we subtract target from delta before scaling
         self._dist_tanh_scale = float(distance_mode_cfg.get('tanh_scale', 2.5))
         self._dist_gradient_cap = distance_mode_cfg.get('gradient_cap', None)
+        
+        # Exponential urgency term: λ_e * exp(-α * d_t²)
+        # Encourages faster progress toward goal by adding urgency based on distance remaining
+        self._dist_exp_enabled = distance_mode_cfg.get('exponential_urgency_enabled', False)
+        self._dist_lambda_exp = float(distance_mode_cfg.get('lambda_exp', 0.3))  # Urgency weight
+        self._dist_alpha_exp = float(distance_mode_cfg.get('alpha_exp', 0.001))  # Gaussian width
+        self._last_urgency_bonus = 0.0  # Initialize for safe access (set in _calculate_distance_reward)
 
         self.current_step = 0
         self.current_episode = 0
@@ -1157,13 +1164,17 @@ class DurotaxisEnv(gym.Env):
             if parts:
                 delete_details = f" [{' '.join(parts)}]"
         
+        # Get Hill equation value for logging (uniform actions)
+        hill_r = getattr(self.topology, '_last_hill_r', 0.0)
+        
         print(
             f"📊 Ep{self.current_episode:2d} Step{self.current_step:3d}: "
             f"N={new_state['num_nodes']:2d} E={new_state['num_edges']:2d} | "
             f"R={scalar_reward:+6.3f} (D:{delete_r:+4.3f}{delete_details} Dist:{distance_r:+4.3f} Term:{termination_r:+4.3f}) | "
             f"C={centroid_x:5.1f}{centroid_direction} ({centroid_y:5.1f}){boundary_warning}{recovery_flag} | "
             f"Actions: dr={action_params['delete_ratio']:.3f} γ={action_params['gamma']:.2f} "
-            f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f}"
+            f"α={action_params['alpha']:.2f} n={action_params['noise']:.3f} θ={action_params['theta']:.3f} "
+            f"R_t={hill_r:.3f}"
         )
         
         # Auto-render after each step to ensure visualization is always updated
@@ -1518,30 +1529,38 @@ class DurotaxisEnv(gym.Env):
     
     def _calculate_distance_reward(self, prev_state, new_state):
         """
-        Calculate distance reward based on centroid intensity change.
+        Calculate distance reward based on centroid intensity change with optional exponential urgency.
         
         Intensity-based reward: Measures centroid's substrate intensity increase (∆I)
         - Goal: Reward agent for spawning on higher intensity substrate
         - Uniform actions (alpha, gamma, noise) → measure via centroid ∆I
         - Reward shaping: Zero reward at target threshold, positive only when exceeding
         
-        Reward formula:
+        Base reward formula:
             ∆I = centroid_intensity_t - centroid_intensity_{t-1}
             s = ∆I - target_delta_intensity  (shifted: 0 at target)
             c = tanh_scale × target_delta_intensity
-            r = tanh(s / c)
+            r_intensity = tanh(s / c)
+        
+        Optional exponential urgency term (encourages faster progress):
+            d_t = goal_x - centroid_x  (distance remaining to goal)
+            r_urgency = λ_e * exp(-α * d_t²)
+            
+        Combined reward:
+            r_total = r_intensity + r_urgency
         
         This ensures:
-            - ∆I < target → r < 0 (penalty for underperformance)
-            - ∆I = target → r = 0 (neutral at threshold)
-            - ∆I > target → r > 0 (reward for exceeding expectations)
+            - ∆I < target → r_intensity < 0 (penalty for underperformance)
+            - ∆I = target → r_intensity = 0 (neutral at threshold)
+            - ∆I > target → r_intensity > 0 (reward for exceeding expectations)
+            - Closer to goal → r_urgency higher (urgency bonus)
         
         Args:
             prev_state: Previous state dict containing topology
             new_state: Current state dict containing topology
             
         Returns:
-            float: Distance reward, in range (-1, 1) with substrate-aware mode
+            float: Distance reward, in range (-1, 1) with substrate-aware mode (higher with urgency)
         """
         num_nodes = new_state['num_nodes']
         centroid_x = 0.0
@@ -1614,9 +1633,28 @@ class DurotaxisEnv(gym.Env):
                     phi_prev = self._phi_centroid_distance_potential(prev_state)
                     phi_new = self._phi_centroid_distance_potential(new_state)
                     distance_reward += self._pbrs_centroid_coeff * (self._pbrs_gamma * phi_new - phi_prev)
+            
+            # ADD EXPONENTIAL URGENCY TERM (optional)
+            # Encourages faster progress by adding bonus based on proximity to goal
+            # r_urgency = λ_e * exp(-α * d_t²)
+            # where d_t = distance remaining to goal
+            if self._dist_exp_enabled:
+                goal_x = float(getattr(self, 'goal_x', self.substrate.width - 1))
+                distance_to_goal = goal_x - centroid_x
+                
+                # Gaussian urgency: highest near goal, decays with distance
+                # α controls width: smaller α = wider range, larger α = steeper falloff
+                urgency_bonus = self._dist_lambda_exp * np.exp(-self._dist_alpha_exp * (distance_to_goal ** 2))
+                distance_reward += urgency_bonus
+                
+                # Store for logging
+                self._last_urgency_bonus = urgency_bonus
+            else:
+                self._last_urgency_bonus = 0.0
         else:
             # Fallback: no previous data (first step)
             distance_reward = 0.0
+            self._last_urgency_bonus = 0.0
         
         # Update previous centroid for next step
         self._prev_centroid_x = centroid_x

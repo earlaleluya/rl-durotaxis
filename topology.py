@@ -98,6 +98,7 @@ class Topology:
         
         self.fig = None  # Store figure reference
         self.ax = None   # Store axes reference
+        self._last_hill_r = 0.0  # Store last computed Hill equation value for logging
 
 
 
@@ -425,6 +426,8 @@ class Topology:
                 raise RuntimeError("graph.ndata must contain 'pos' tensor before calling spawn().")
             
             r = self._hill_equation(curr_node_id, gamma, alpha, noise)
+            # Store for logging (uniform actions mean same r for all spawns)
+            self._last_hill_r = float(r)
             # Get current node position (detach and move to CPU for numpy operation)
             curr_pos = self.graph.ndata['pos'][curr_node_id].detach().cpu().numpy()
             # Compute new node position
@@ -593,6 +596,35 @@ class Topology:
             node_intensity = 1.0
 
         return float(gamma) * (1.0 / (1.0 + (float(alpha) / node_intensity)**2)) + float(noise)
+    
+    def compute_hill_equation_at_position(self, position, gamma, alpha, noise):
+        """
+        Computes the Hill equation value for an arbitrary position.
+        
+        This is useful for computing spawn distances at locations not corresponding
+        to existing nodes (e.g., centroid position for visualization/logging).
+        
+        Args:
+            position (tuple or np.ndarray): 2D coordinates [x, y]
+            gamma (float): The maximum response or scaling factor
+            alpha (float): The affinity constant or threshold parameter
+            noise (float): An additive noise term to introduce stochasticity
+            
+        Returns:
+            float: The computed Hill equation value for the specified position
+        """
+        intensity = self.substrate.get_intensity(position)
+        
+        # Guard against zero or non-finite intensities
+        try:
+            intensity = float(intensity)
+        except Exception:
+            intensity = 1.0
+        
+        if not np.isfinite(intensity) or intensity <= 1e-6:
+            intensity = 1.0
+        
+        return float(gamma) * (1.0 / (1.0 + (float(alpha) / intensity)**2)) + float(noise)
 
 
 
