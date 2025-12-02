@@ -338,7 +338,16 @@ class Topology:
     def spawn_by_persistent_id(self, persistent_id: int, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0):
         """
         Spawn using a stable persistent_id. Safely maps to current node_id at call-time.
-        Returns the new node_id or None if the parent doesn't exist.
+        
+        Args:
+            persistent_id: Stable persistent ID of the parent node
+            gamma: Hill equation scaling factor
+            alpha: Hill equation affinity constant
+            noise: Noise scaling factor for stochastic displacement
+            theta: [DEPRECATED] No longer used; kept for API compatibility
+            
+        Returns:
+            int or None: ID of the newly spawned node, or None if parent doesn't exist
         """
         node_id = self.persistent_id_to_node_id(persistent_id)
         if node_id is None:
@@ -394,8 +403,20 @@ class Topology:
 
     def spawn(self, curr_node_id, gamma=5.0, alpha=2.0, noise=0.5, theta=0.0):
         """
-        Spawns a new node from curr_node_id in the direction theta, at a distance determined by the Hill equation.
-        Adds the new node to the graph and connects curr_node_id to the new node.
+        Spawns a new node from curr_node_id using directional Hill equation.
+        
+        The spawn direction and distance are determined by the Hill equation combined
+        with stochastic noise, eliminating the need for the theta parameter.
+        
+        Args:
+            curr_node_id: ID of the parent node
+            gamma: Hill equation scaling factor (max response)
+            alpha: Hill equation affinity constant (threshold)
+            noise: Noise scaling factor for stochastic displacement
+            theta: [DEPRECATED] No longer used; kept for API compatibility
+        
+        Returns:
+            int or None: ID of the newly spawned node, or None if spawn failed
         """
         try:
             # DEBUG: Log entry point (detailed start line)
@@ -425,13 +446,22 @@ class Topology:
             if 'pos' not in self.graph.ndata:
                 raise RuntimeError("graph.ndata must contain 'pos' tensor before calling spawn().")
             
-            r = self._hill_equation(curr_node_id, gamma, alpha, noise)
-            # Store for logging (uniform actions mean same r for all spawns)
-            self._last_hill_r = float(r)
             # Get current node position (detach and move to CPU for numpy operation)
             curr_pos = self.graph.ndata['pos'][curr_node_id].detach().cpu().numpy()
-            # Compute new node position
-            x, y = curr_pos[0] + r * np.cos(theta), curr_pos[1] + r * np.sin(theta)
+            
+            # Get persistent_id for deterministic random seeding
+            persistent_id = None
+            if 'persistent_id' in self.graph.ndata:
+                try:
+                    persistent_id = int(self.graph.ndata['persistent_id'][curr_node_id].item())
+                except Exception:
+                    persistent_id = None
+            
+            # Compute directional displacement using new Hill function (eliminates theta)
+            R_x, R_y = self.compute_hill_directional(curr_pos, gamma, alpha, noise, persistent_id)
+            
+            # Compute new node position using directional displacement
+            x, y = curr_pos[0] + R_x, curr_pos[1] + R_y
 
             # Keep spawned nodes inside substrate bounds to avoid instant termination
             if hasattr(self.substrate, 'width') and hasattr(self.substrate, 'height'):
@@ -596,6 +626,66 @@ class Topology:
             node_intensity = 1.0
 
         return float(gamma) * (1.0 / (1.0 + (float(alpha) / node_intensity)**2)) + float(noise)
+    
+    def compute_hill_directional(self, position, gamma, alpha, noise, persistent_id=None):
+        """
+        Computes directional spawn displacement (R_x, R_y) using Hill equation with stochastic noise.
+        
+        This replaces the theta-based directional computation with a noise-driven approach
+        where the direction and magnitude are both influenced by random sampling.
+        
+        Args:
+            position (tuple or np.ndarray): 2D coordinates [x, y] of the parent node
+            gamma (float): Hill equation scaling factor (max response)
+            alpha (float): Hill equation affinity constant (threshold parameter)
+            noise (float): Noise scaling factor for stochastic displacement
+            persistent_id (int, optional): Node's persistent ID for deterministic seeding
+            
+        Returns:
+            tuple: (R_x, R_y) - 2D displacement vector for spawning
+        """
+        # Get substrate intensity at position
+        intensity = self.substrate.get_intensity(position)
+        
+        # Guard against zero or non-finite intensities
+        try:
+            intensity = float(intensity)
+        except Exception:
+            intensity = 1.0
+        
+        if not np.isfinite(intensity) or intensity <= 1e-6:
+            intensity = 1.0
+        
+        # Compute average tube length using Hill equation
+        aveTubeLength = float(gamma) * (1.0 / (1.0 + (float(alpha) / intensity)**2))
+        
+        # Generate deterministic random noise based on persistent_id
+        # This ensures reproducibility for the same node across runs
+        if persistent_id is not None:
+            seed = int(persistent_id) % (2**32)  # Ensure valid seed range
+        else:
+            seed = np.random.randint(0, 2**32)
+        
+        rng = np.random.default_rng(seed)
+        noise_samples = rng.normal(loc=0.0, scale=1.0, size=3)
+        noise_r, noise_x, noise_y = noise_samples
+        
+        # Compute magnitude with noise
+        R_magnitude = aveTubeLength + float(noise) * noise_r
+        
+        # CRITICAL: Ensure non-negative magnitude to prevent position inversion
+        # When noise_r is large and negative, R_magnitude can become negative,
+        # causing (1 + 2*R_magnitude) to be negative and spawns to move in wrong direction
+        R_magnitude = max(0.0, R_magnitude)
+        
+        # Compute directional components with noise-scaled displacement
+        R_x = noise_x * (1.0 + 2.0 * R_magnitude)
+        R_y = noise_y * (1.0 + 2.0 * R_magnitude)
+        
+        # Store magnitude for logging (backward compatibility with _last_hill_r)
+        self._last_hill_r = float(R_magnitude)
+        
+        return (R_x, R_y)
     
     def compute_hill_equation_at_position(self, position, gamma, alpha, noise):
         """

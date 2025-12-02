@@ -1397,7 +1397,7 @@ class DurotaxisTrainer:
         if not batched_output or sum(node_counts) == 0:
             # Handle empty batch case
             empty_output = {
-                'continuous_actions': torch.empty(0, 5, device=self.device),
+                'continuous_actions': torch.empty(0, 1, device=self.device),
                 'continuous_log_probs': torch.empty(0, device=self.device),
                 'total_log_probs': torch.empty(0, device=self.device),
                 'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
@@ -1412,7 +1412,7 @@ class DurotaxisTrainer:
             if num_nodes == 0:
                 # Empty graph
                 output = {
-                    'continuous_actions': torch.empty(0, 5, device=self.device),
+                    'continuous_actions': torch.empty(0, 1, device=self.device),
                     'continuous_log_probs': torch.empty(0, device=self.device),
                     'total_log_probs': torch.empty(0, device=self.device),
                     'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
@@ -1424,14 +1424,14 @@ class DurotaxisTrainer:
                 output = {}
                 
                 # DELETE RATIO ARCHITECTURE:
-                # - continuous_actions: [batch_size, 5] -> extract [5] for this graph
+                # - continuous_actions: [batch_size, 1] -> extract [1] for this graph
                 # - continuous_log_probs: [batch_size] -> extract scalar for this graph (NOT per-node!)
                 # - total_log_probs: [batch_size] -> extract scalar for this graph
                 
                 if 'continuous_actions' in batched_output and batched_output['continuous_actions'].shape[0] > i:
                     output['continuous_actions'] = batched_output['continuous_actions'][i]
                 else:
-                    output['continuous_actions'] = torch.empty(0, 5, device=self.device)
+                    output['continuous_actions'] = torch.empty(0, 1, device=self.device)
                 
                 # Log probs are per-graph (scalars), not per-node!
                 for key in ['continuous_log_probs', 'total_log_probs']:
@@ -2611,9 +2611,10 @@ class DurotaxisTrainer:
                           for k, v in output['value_predictions'].items()})
             
             # Extract actions and log probs (DELETE RATIO ARCHITECTURE)
-            # Network now outputs single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+            # Network now outputs single global continuous action: [delete_ratio] only
+            # Spawn parameters (gamma, alpha, noise) are fixed in config.yaml
             if 'continuous_actions' in output:
-                continuous_actions = output['continuous_actions']  # Shape: [5]
+                continuous_actions = output['continuous_actions']  # Shape: [1] (delete_ratio only)
                 log_probs = output['continuous_log_probs']  # Shape: scalar
                 
                 actions_taken.append({
@@ -2648,10 +2649,18 @@ class DurotaxisTrainer:
                     gamma = self.stage_1_fixed_spawn_params['gamma']
                     alpha = self.stage_1_fixed_spawn_params['alpha']
                     noise = self.stage_1_fixed_spawn_params['noise']
-                    theta = self.stage_1_fixed_spawn_params['theta']
+                    theta = self.stage_1_fixed_spawn_params.get('theta', 0.0)
                 else:
-                    # Use network's continuous output (indices 1-4)
-                    gamma, alpha, noise, theta = self.network.get_spawn_parameters(output)
+                    # Get fixed spawn parameters from environment's policy agent (config-based)
+                    if hasattr(self.env, 'policy_agent') and hasattr(self.env.policy_agent, 'fixed_spawn_params'):
+                        gamma, alpha, noise = self.env.policy_agent.fixed_spawn_params
+                    else:
+                        # Fallback to config defaults
+                        spawn_config = self.config_loader.get_environment_config().get('spawn_parameters', {})
+                        gamma = spawn_config.get('gamma', 5.0)
+                        alpha = spawn_config.get('alpha', 2.0)
+                        noise = spawn_config.get('noise', 0.5)
+                    theta = 0.0  # Theta removed from architecture
                 
                 # Execute spawn/delete actions
                 for node_id, action_type in topology_actions.items():
@@ -3093,10 +3102,10 @@ class DurotaxisTrainer:
                 all_continuous_actions.append(action_dict['continuous'])
         
         if all_continuous_actions:
-            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 1] from list of [1] tensors
         else:
             # Handle empty actions case
-            batched_continuous_actions = torch.empty(0, 5, device=self.device)
+            batched_continuous_actions = torch.empty(0, 1, device=self.device)
         
         # Step 4: Single batched re-evaluation (🚀 MUCH FASTER!)
         if batched_states['num_nodes'] > 0:
@@ -3369,10 +3378,10 @@ class DurotaxisTrainer:
                 all_continuous_actions.append(action_dict['continuous'])
         
         if all_continuous_actions:
-            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 1] from list of [1] tensors
         else:
             # Handle empty actions case
-            batched_continuous_actions = torch.empty(0, 5, device=self.device)
+            batched_continuous_actions = torch.empty(0, 1, device=self.device)
         
         # Step 4: Single batched re-evaluation (🚀 MUCH FASTER!)
         if batched_states['num_nodes'] > 0:
