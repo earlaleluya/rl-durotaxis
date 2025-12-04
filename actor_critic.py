@@ -336,7 +336,7 @@ class HybridActorCritic(nn.Module):
     Delete Ratio Strategy:
     - Actor outputs one action for the entire graph (not per-node)
     - delete_ratio determines fraction of leftmost nodes to delete
-    - Remaining nodes spawn with global parameters (gamma, alpha, noise, theta)
+    - Remaining nodes spawn with global parameters (gamma, alpha, noise)
     - Critic evaluates graph-level state values
     """
     
@@ -420,6 +420,15 @@ class HybridActorCritic(nn.Module):
             action_bounds_config.get('theta', [-0.5236, 0.5236])
         ]
         self.register_buffer('action_bounds', torch.tensor(bounds_list, dtype=torch.float32))
+        
+        # Load fixed spawn parameters from config (used in deployment)
+        env_config = config_loader.get_environment_config()
+        spawn_params = env_config.get('spawn_parameters', {})
+        self.fixed_spawn_params = (
+            float(spawn_params.get('gamma', 5.0)),
+            float(spawn_params.get('alpha', 2.0)),
+            float(spawn_params.get('noise', 0.5))
+        )
         
         self.apply(self._init_weights)
         
