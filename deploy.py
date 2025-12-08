@@ -6,16 +6,17 @@ This script allows you to load a trained delete ratio model and run it on custom
 substrates with configurable parameters for evaluation and demonstration purposes.
 
 Delete Ratio Architecture:
-- Single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+- Single global continuous action: [delete_ratio] (1D action space)
+- Spawn parameters (gamma, alpha, noise) are fixed from config.yaml
 - Sorts nodes by x-position, deletes leftmost fraction
-- Applies global spawn parameters to remaining nodes
+- Applies global spawn parameters to remaining nodes with directional Hill function
 
 Usage:
     python deploy.py --substrate_type linear --m 0.05 --b 1.0 \
-                     --substrate_width 100 --substrate_height 40 \
+                     --substrate_width 600 --substrate_height 600 \
                      --deterministic --max_episodes 3 --max_steps 1000 \
-                     --max_critical_nodes 30 --threshold_critical_nodes 400 \
-                     --model_path ./training_results/run0043/succ_model_batch24.pt \
+                     --max_critical_nodes 40 --threshold_critical_nodes 400 \
+                     --model_path ./training_results/run0047/succ_model_batch19.pt \
                      --init-nodes 10 
     
     # Without visualization, custom substrate size
@@ -119,9 +120,10 @@ class DurotaxisDeployment:
             num_layers=encoder_config.get('num_layers', 4)
         ).to(self.device)
         
-        # Create actor-critic network
+        # Create actor-critic network with proper constructor signature
         self.network = HybridActorCritic(
             encoder=self.encoder,
+            config_path=self.config_path,
             hidden_dim=actor_critic_config.get('hidden_dim', 128),
             value_components=actor_critic_config.get('value_components', self.component_names),
             dropout_rate=actor_critic_config.get('dropout_rate', 0.1)
@@ -223,24 +225,30 @@ class DurotaxisDeployment:
                 bbox_height = float(graph_features[10])
                 intensity = env.substrate.get_intensity((cx, cy))
                 
-                # Initial state has no actions yet, so parameters are 0
-                centroid_data.append({
-                    'episode': episode_num if episode_num is not None else 0,
-                    'step': 0,
-                    'num_nodes': num_nodes_feature,
-                    'cx': cx,
-                    'cy': cy,
-                    'intensity': float(intensity),
-                    'bbox_height': bbox_height,
-                    'bbox_width': bbox_width,
-                    'delete_ratio': 0.0,
-                    'gamma': 0.0,
-                    'alpha': 0.0,
-                    'noise': 0.0,
-                    'R_magnitude': 0.0,
-                    'theta': 0.0,
-                    'intensity_spawn': float(intensity)
-                })
+                # Record each node at initial state
+                node_positions = env.topology.graph.ndata['pos'].cpu().numpy()
+                persistent_ids = env.topology.graph.ndata['persistent_id'].cpu().numpy() if 'persistent_id' in env.topology.graph.ndata else list(range(len(node_positions)))
+                
+                for i in range(len(node_positions)):
+                    node_x, node_y = float(node_positions[i][0]), float(node_positions[i][1])
+                    centroid_data.append({
+                        'episode': episode_num if episode_num is not None else 0,
+                        'step': 0,
+                        'num_nodes': num_nodes_feature,
+                        'cx': cx,
+                        'cy': cy,
+                        'intensity': float(intensity),
+                        'bbox_height': bbox_height,
+                        'bbox_width': bbox_width,
+                        'delete_ratio': 0.0,
+                        'node_id': int(persistent_ids[i]),
+                        'node_x': node_x,
+                        'node_y': node_y,
+                        'action': '',  # No action at initial state
+                        'spawn_node_id': '',
+                        'spawn_node_x': '',
+                        'spawn_node_y': ''
+                    })
         
         while not done and step_count < max_steps:
             # Get current state with age/stagnation tracking from environment
@@ -274,6 +282,16 @@ class DurotaxisDeployment:
             # Store predictions
             episode_values.append(output['value_predictions'])
             
+            # Initialize action parameters with default values (will be overwritten if actions exist)
+            delete_ratio = 0.0
+            gamma = 0.0
+            alpha = 0.0
+            noise_param = 0.0
+            topology_actions = {}      # Maps node_id -> action_type ('spawn' or 'delete')
+            node_pid_to_action = {}    # Maps persistent_id -> action_type (for logging after deletions)
+            nodes_before_action = {}   # Maps persistent_id -> (x, y) before actions (for deleted nodes)
+            spawn_tracking = {}        # Maps parent_persistent_id -> (spawned_node_id, spawn_x, spawn_y)
+            
             # Extract and execute delete ratio actions
             if 'continuous_actions' in output:
                 continuous_actions = output['continuous_actions']
@@ -299,13 +317,35 @@ class DurotaxisDeployment:
                 gamma = float(spawn_params[0])
                 alpha = float(spawn_params[1])
                 noise_param = float(spawn_params[2])
-                theta = float(spawn_params[3])
+                
+                # Capture ALL node states BEFORE any modifications (for logging deleted nodes)
+                # Build mapping: persistent_id -> (action_type, node_x, node_y)
+                node_pid_to_action = {}
+                nodes_before_action = {}  # Maps persistent_id -> (x, y) for nodes before actions
+                
+                for node_id, action_type in topology_actions.items():
+                    if node_id < env.topology.graph.num_nodes():
+                        node_pid = int(env.topology.graph.ndata['persistent_id'][node_id].item()) if 'persistent_id' in env.topology.graph.ndata else node_id
+                        node_pos = env.topology.graph.ndata['pos'][node_id].cpu().numpy()
+                        node_pid_to_action[node_pid] = action_type
+                        nodes_before_action[node_pid] = (float(node_pos[0]), float(node_pos[1]))
+                
+                # Track spawn actions for logging: maps parent_persistent_id -> (spawned_node_id, spawn_x, spawn_y)
+                spawn_tracking = {}
                 
                 for node_id, action_type in topology_actions.items():
                     try:
+                        # Get persistent_id before any modifications
+                        parent_pid = int(env.topology.graph.ndata['persistent_id'][node_id].item()) if 'persistent_id' in env.topology.graph.ndata else node_id
+                        
                         if action_type == 'spawn':
-                            env.topology.spawn(node_id, gamma=spawn_params[0], alpha=spawn_params[1], 
-                                             noise=spawn_params[2], theta=spawn_params[3])
+                            spawned_node_id = env.topology.spawn(node_id, gamma=spawn_params[0], alpha=spawn_params[1], 
+                                             noise=spawn_params[2])
+                            if spawned_node_id is not None:
+                                # Get the spawned node's position and persistent_id
+                                spawn_pos = env.topology.graph.ndata['pos'][spawned_node_id].cpu().numpy()
+                                spawn_pid = int(env.topology.graph.ndata['persistent_id'][spawned_node_id].item()) if 'persistent_id' in env.topology.graph.ndata else spawned_node_id
+                                spawn_tracking[parent_pid] = (spawn_pid, float(spawn_pos[0]), float(spawn_pos[1]))
                             if verbose:
                                 print(f"   Step {step_count+1}: Spawned from node {node_id} (γ={spawn_params[0]:.3f}, α={spawn_params[1]:.3f})")
                         elif action_type == 'delete':
@@ -355,42 +395,77 @@ class DurotaxisDeployment:
                     # Get substrate intensity at centroid position
                     intensity = env.substrate.get_intensity((cx, cy))
                     
-                    # Compute R_magnitude using Hill equation
-                    # Hill equation: R = gamma * (1.0 / (1.0 + (alpha / intensity)^2)) + noise
-                    if 'continuous_actions' in output:
-                        intensity_val = max(float(intensity), 1e-6)  # Avoid division by zero
-                        R_magnitude = gamma * (1.0 / (1.0 + (alpha / intensity_val)**2)) + noise_param
-                        
-                        # Compute spawn location (sx, sy) from centroid using R_magnitude and theta
-                        import numpy as np
-                        sx = cx + R_magnitude * np.cos(theta)
-                        sy = cy + R_magnitude * np.sin(theta)
-                        
-                        # Get substrate intensity at spawn location
-                        intensity_spawn = env.substrate.get_intensity((sx, sy))
-                    else:
-                        R_magnitude = 0.0
-                        sx = cx
-                        sy = cy
-                        intensity_spawn = intensity
+                    # Record each node with its action
+                    node_positions = env.topology.graph.ndata['pos'].cpu().numpy()
+                    persistent_ids = env.topology.graph.ndata['persistent_id'].cpu().numpy() if 'persistent_id' in env.topology.graph.ndata else list(range(len(node_positions)))
                     
-                    centroid_data.append({
-                        'episode': episode_num if episode_num is not None else 0,
-                        'step': step_count + 1,  # Log as next step since actions were executed
-                        'num_nodes': num_nodes_feature,
-                        'cx': cx,
-                        'cy': cy,
-                        'intensity': float(intensity),
-                        'bbox_height': bbox_height,
-                        'bbox_width': bbox_width,
-                        'delete_ratio': delete_ratio if 'continuous_actions' in output else 0.0,
-                        'gamma': gamma if 'continuous_actions' in output else 0.0,
-                        'alpha': alpha if 'continuous_actions' in output else 0.0,
-                        'noise': noise_param if 'continuous_actions' in output else 0.0,
-                        'R_magnitude': R_magnitude,
-                        'theta': theta if 'continuous_actions' in output else 0.0,
-                        'intensity_spawn': float(intensity_spawn)
-                    })
+                    # First, log all nodes that still exist (survived or were spawned)
+                    for i in range(len(node_positions)):
+                        node_x, node_y = float(node_positions[i][0]), float(node_positions[i][1])
+                        node_pid = int(persistent_ids[i])
+                        
+                        # Determine action for this node using persistent_id
+                        action_str = ''
+                        spawn_node_id_val = ''
+                        spawn_node_x_val = ''
+                        spawn_node_y_val = ''
+                        
+                        if node_pid in node_pid_to_action:
+                            action_type = node_pid_to_action[node_pid]
+                            if action_type == 'spawn':
+                                action_str = 'spawn'
+                                # Check if spawn was tracked
+                                if node_pid in spawn_tracking:
+                                    spawn_pid, spawn_x, spawn_y = spawn_tracking[node_pid]
+                                    spawn_node_id_val = int(spawn_pid)
+                                    spawn_node_x_val = spawn_x
+                                    spawn_node_y_val = spawn_y
+                            # Note: 'delete' won't appear here since deleted nodes are gone
+                        
+                        centroid_data.append({
+                            'episode': episode_num if episode_num is not None else 0,
+                            'step': step_count + 1,
+                            'num_nodes': num_nodes_feature,
+                            'cx': cx,
+                            'cy': cy,
+                            'intensity': float(intensity),
+                            'bbox_height': bbox_height,
+                            'bbox_width': bbox_width,
+                            'delete_ratio': delete_ratio,
+                            'node_id': node_pid,
+                            'node_x': node_x,
+                            'node_y': node_y,
+                            'action': action_str,
+                            'spawn_node_id': spawn_node_id_val,
+                            'spawn_node_x': spawn_node_x_val,
+                            'spawn_node_y': spawn_node_y_val
+                        })
+                    
+                    # Second, log deleted nodes using the saved positions from before deletion
+                    for node_pid, action_type in node_pid_to_action.items():
+                        if action_type == 'delete':
+                            # Get the position from before deletion
+                            if node_pid in nodes_before_action:
+                                node_x, node_y = nodes_before_action[node_pid]
+                                
+                                centroid_data.append({
+                                    'episode': episode_num if episode_num is not None else 0,
+                                    'step': step_count + 1,
+                                    'num_nodes': num_nodes_feature,
+                                    'cx': cx,
+                                    'cy': cy,
+                                    'intensity': float(intensity),
+                                    'bbox_height': bbox_height,
+                                    'bbox_width': bbox_width,
+                                    'delete_ratio': delete_ratio,
+                                    'node_id': node_pid,
+                                    'node_x': node_x,
+                                    'node_y': node_y,
+                                    'action': 'delete',
+                                    'spawn_node_id': '',
+                                    'spawn_node_x': '',
+                                    'spawn_node_y': ''
+                                })
             
             if verbose:
                 total_reward = reward_components.get('total_reward', 0.0)
@@ -653,52 +728,37 @@ class DurotaxisDeployment:
         
         # 3. Spawn parameters statistics per episode
         spawn_params_stats = []
+        
+        # Get fixed spawn parameters from config (same for all episodes)
+        env_config = self.config_loader.get_environment_config()
+        spawn_params_config = env_config.get('spawn_parameters', {})
+        fixed_gamma = float(spawn_params_config.get('gamma', 5.0))
+        fixed_alpha = float(spawn_params_config.get('alpha', 2.0))
+        fixed_noise = float(spawn_params_config.get('noise', 0.5))
+        
         for ep_idx, ep_stats in enumerate(episode_stats):
             actions_per_step = ep_stats.get('actions_per_step', [])
             
             if actions_per_step:
-                # Extract spawn parameters (gamma, alpha, noise, theta) from continuous actions
-                # Continuous actions: [delete_ratio, gamma, alpha, noise, theta]
-                gamma_values = []
-                alpha_values = []
-                noise_values = []
-                theta_values = []
-                
-                for action_dict in actions_per_step:
-                    cont_actions = action_dict.get('continuous', [])
-                    if len(cont_actions) >= 5:
-                        gamma_values.append(float(cont_actions[1]))
-                        alpha_values.append(float(cont_actions[2]))
-                        noise_values.append(float(cont_actions[3]))
-                        theta_values.append(float(cont_actions[4]))
-                
-                # Compute statistics
+                # Spawn parameters are fixed from config, not varying per episode
+                # Record the fixed values used throughout the episode
                 episode_entry = {
                     'episode': ep_idx,
                     'parameters': {
                         'gamma': {
-                            'mean': float(np.mean(gamma_values)) if gamma_values else 0.0,
-                            'std': float(np.std(gamma_values)) if gamma_values else 0.0,
-                            'min': float(np.min(gamma_values)) if gamma_values else 0.0,
-                            'max': float(np.max(gamma_values)) if gamma_values else 0.0
+                            'value': fixed_gamma,
+                            'fixed': True,
+                            'note': 'Fixed from config.yaml'
                         },
                         'alpha': {
-                            'mean': float(np.mean(alpha_values)) if alpha_values else 0.0,
-                            'std': float(np.std(alpha_values)) if alpha_values else 0.0,
-                            'min': float(np.min(alpha_values)) if alpha_values else 0.0,
-                            'max': float(np.max(alpha_values)) if alpha_values else 0.0
+                            'value': fixed_alpha,
+                            'fixed': True,
+                            'note': 'Fixed from config.yaml'
                         },
                         'noise': {
-                            'mean': float(np.mean(noise_values)) if noise_values else 0.0,
-                            'std': float(np.std(noise_values)) if noise_values else 0.0,
-                            'min': float(np.min(noise_values)) if noise_values else 0.0,
-                            'max': float(np.max(noise_values)) if noise_values else 0.0
-                        },
-                        'theta': {
-                            'mean': float(np.mean(theta_values)) if theta_values else 0.0,
-                            'std': float(np.std(theta_values)) if theta_values else 0.0,
-                            'min': float(np.min(theta_values)) if theta_values else 0.0,
-                            'max': float(np.max(theta_values)) if theta_values else 0.0
+                            'value': fixed_noise,
+                            'fixed': True,
+                            'note': 'Fixed from config.yaml'
                         }
                     }
                 }
@@ -791,7 +851,12 @@ class DurotaxisDeployment:
         """
         Save centroid trajectory data to CSV file.
         
-        Creates a CSV file with columns: episode, step, cx, cy, intensity
+        Creates a CSV file with per-node records including:
+        - episode, step, num_nodes, cx, cy, intensity, bbox_height, bbox_width
+        - delete_ratio: action parameter
+        - node_id, node_x, node_y: current node's persistent_id and position
+        - action: 'spawn', 'delete', or empty string
+        - spawn_node_id, spawn_node_x, spawn_node_y: spawned node details (if action='spawn')
         
         Args:
             episode_stats: List of per-episode statistics

@@ -2,9 +2,9 @@
 Delete Ratio Actor-Critic Network for Durotaxis Environment
 
 This module implements a decoupled actor-critic architecture that handles:
-1. Single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+1. Single global continuous action: [delete_ratio]
    - delete_ratio: fraction of leftmost nodes to delete (0.0 to 0.5)
-   - gamma, alpha, noise, theta: spawn parameters applied to all non-deleted nodes
+   - Spawn parameters (gamma, alpha, noise) are fixed constants from config.yaml
 2. Multi-component value estimation for different reward components
 3. Graph neural network integration via GraphInputEncoder
 4. Pre-trained ResNet backbone for enhanced feature extraction and stability
@@ -85,17 +85,18 @@ def _safe_masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor
 
 class Actor(nn.Module):
     """
-    The Actor network for the Hybrid Actor-Critic agent.
-    Outputs a SINGLE GLOBAL continuous action vector: [delete_ratio, gamma, alpha, noise, theta]
+    The Actor network for the Delete Ratio Actor-Critic agent.
+    Outputs a SINGLE GLOBAL continuous action: [delete_ratio]
     
     Architecture:
     - Processes all nodes through ResNet backbone
     - Aggregates node features (mean pooling)
-    - Outputs single continuous action for the entire graph
+    - Outputs single continuous action (delete_ratio) for the entire graph
     
     Delete Ratio Strategy:
     - delete_ratio ∈ [0.0, 0.5]: fraction of leftmost nodes to delete
-    - Remaining nodes spawn with parameters (gamma, alpha, noise, theta)
+    - Spawn parameters (gamma, alpha, noise) are fixed constants from config
+    - All remaining nodes spawn with the same fixed parameters
     """
     def __init__(self, encoder_out_dim, hidden_dim, continuous_dim, dropout_rate,
                  pretrained_weights='imagenet',
@@ -134,7 +135,7 @@ class Actor(nn.Module):
         )
         
         # Single continuous action head for global parameters
-        # Output: [delete_ratio, gamma, alpha, noise, theta]
+        # Output: [delete_ratio] (single continuous action)
         self.continuous_mu_head = nn.Linear(hidden_dim, continuous_dim)
         self.continuous_logstd_head = nn.Linear(hidden_dim, continuous_dim)
         
@@ -227,9 +228,9 @@ class Actor(nn.Module):
             global_features = torch.nan_to_num(global_features, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # --- Single Global Continuous Action ---
-        # Output: [delete_ratio, gamma, alpha, noise, theta]
-        continuous_mu = self.continuous_mu_head(global_features).squeeze(0)  # [continuous_dim]
-        continuous_logstd = self.continuous_logstd_head(global_features).squeeze(0)  # [continuous_dim]
+        # Output: [delete_ratio] only (spawn parameters now fixed in config)
+        continuous_mu = self.continuous_mu_head(global_features).squeeze(0)  # [1]
+        continuous_logstd = self.continuous_logstd_head(global_features).squeeze(0)  # [1]
         
         # Tighter clamping for numerical stability (prevent exp overflow in distributions)
         continuous_mu = torch.clamp(continuous_mu, -10.0, 10.0)
@@ -329,12 +330,13 @@ class HybridActorCritic(nn.Module):
     Delete Ratio Actor-Critic network for the durotaxis environment.
     
     This class orchestrates the GraphInputEncoder, Actor, and Critic modules
-    to produce a single global continuous action vector: [delete_ratio, gamma, alpha, noise, theta].
+    to produce a single global continuous action vector: [delete_ratio].
+    Spawn parameters are fixed constants from config.yaml.
     
     Delete Ratio Strategy:
     - Actor outputs one action for the entire graph (not per-node)
     - delete_ratio determines fraction of leftmost nodes to delete
-    - Remaining nodes spawn with global parameters (gamma, alpha, noise, theta)
+    - Remaining nodes spawn with global parameters (gamma, alpha, noise)
     - Critic evaluates graph-level state values
     """
     
@@ -361,7 +363,7 @@ class HybridActorCritic(nn.Module):
         
         self.encoder = encoder
         self.hidden_dim = config.get('hidden_dim', 128)
-        self.continuous_dim = config.get('continuous_dim', 5)  # [delete_ratio, gamma, alpha, noise, theta]
+        self.continuous_dim = 1  # Only delete_ratio (spawn params fixed in config)
         self.dropout_rate = config.get('dropout_rate', 0.1)
 
         # Value components configuration
@@ -399,7 +401,8 @@ class HybridActorCritic(nn.Module):
         self._validate_value_heads()
         
         # Parameter bounds for continuous actions from config
-        # New action space: [delete_ratio, gamma, alpha, noise, theta]
+        # New action space: [delete_ratio] only
+        # Spawn parameters (gamma, alpha, noise) are fixed in config.yaml
         action_bounds_config = config.get('action_parameter_bounds', {
             'delete_ratio': [0.0, 0.5],
             'gamma': [0.5, 15.0],
@@ -417,6 +420,15 @@ class HybridActorCritic(nn.Module):
             action_bounds_config.get('theta', [-0.5236, 0.5236])
         ]
         self.register_buffer('action_bounds', torch.tensor(bounds_list, dtype=torch.float32))
+        
+        # Load fixed spawn parameters from config (used in deployment)
+        env_config = config_loader.get_environment_config()
+        spawn_params = env_config.get('spawn_parameters', {})
+        self.fixed_spawn_params = (
+            float(spawn_params.get('gamma', 5.0)),
+            float(spawn_params.get('alpha', 2.0)),
+            float(spawn_params.get('noise', 0.5))
+        )
         
         self.apply(self._init_weights)
         
@@ -587,7 +599,7 @@ class HybridActorCritic(nn.Module):
             Dictionary containing:
             - continuous_mu: Mean of continuous action distribution [5]
             - continuous_std: Std of continuous action distribution [5]
-            - continuous_actions: Sampled or deterministic actions [delete_ratio, gamma, alpha, noise, theta]
+            - continuous_actions: Sampled or deterministic actions [delete_ratio]
             - value_predictions: Dict of value estimates for each component
             - encoder_out: Graph and node embeddings
         """
@@ -627,7 +639,8 @@ class HybridActorCritic(nn.Module):
         node_tokens = encoder_out[1:]
         
         # === ACTOR and CRITIC FORWARD PASS ===
-        # Actor now outputs SINGLE GLOBAL continuous action: [delete_ratio, gamma, alpha, noise, theta]
+        # Actor now outputs SINGLE GLOBAL continuous action: [delete_ratio]
+        # Spawn parameters are fixed constants from config
         continuous_mu, continuous_logstd = self.actor(node_tokens, graph_token)
         value_predictions, graph_value_features = self.critic(graph_token)
 
@@ -674,7 +687,7 @@ class HybridActorCritic(nn.Module):
     def _apply_bounds(self, actions: torch.Tensor) -> torch.Tensor:
         """
         Apply parameter bounds to continuous actions.
-        Action space: [delete_ratio, gamma, alpha, noise, theta]
+        Action space: [delete_ratio] (spawn params fixed in config)
         """
         bounded_actions = actions.clone()
         
@@ -710,7 +723,8 @@ class HybridActorCritic(nn.Module):
                         action_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Evaluate given continuous actions (used for policy updates).
-        Delete ratio architecture: Only continuous actions [delete_ratio, gamma, alpha, noise, theta]
+        Delete ratio architecture: Only continuous action [delete_ratio]
+        Spawn parameters (gamma, alpha, noise) are fixed constants from config
         """
         if cached_output is not None:
             output = cached_output
@@ -781,7 +795,7 @@ class HybridActorCritic(nn.Module):
         Convert network output to topology-compatible action format using delete ratio strategy.
         
         Args:
-            output: Network output containing continuous_actions [delete_ratio, gamma, alpha, noise, theta]
+            output: Network output containing continuous_actions [delete_ratio] (single action)
             node_positions: List of (node_id, is_leftmost_marker) tuples where:
                 - is_leftmost_marker = 1.0 means node should be deleted (is in leftmost k positions)
                 - is_leftmost_marker = 0.0 means node should spawn (not in leftmost k positions)
@@ -825,54 +839,65 @@ class HybridActorCritic(nn.Module):
         
         return actions
     
-    def get_spawn_parameters(self, output: Dict[str, torch.Tensor]) -> Tuple[float, float, float, float]:
+    def get_spawn_parameters(self, output: Dict[str, torch.Tensor]) -> Tuple[float, float, float]:
         """
-        Get spawn parameters from global action vector.
-        
-        Args:
-            output: Network output containing continuous_actions [delete_ratio, gamma, alpha, noise, theta]
+        Get spawn parameters from configuration (no longer from network output).
         
         Returns:
-            Tuple of (gamma, alpha, noise, theta) for spawning
+            Tuple of (gamma, alpha, noise) - fixed constants from config
+            Note: theta is removed as it's not used in the refactored architecture
         """
-        if 'continuous_actions' not in output:
-            return (1.0, 1.0, 0.5, 0.0)
-        
-        params = output['continuous_actions']
-        # Extract spawn parameters: indices [1, 2, 3, 4] = [gamma, alpha, noise, theta]
-        return (params[1].item(), params[2].item(), params[3].item(), params[4].item())
+        # Return fixed spawn parameters from config
+        # These are loaded in HybridPolicyAgent __init__
+        return self.fixed_spawn_params
 
 
 class HybridPolicyAgent:
     """
     Agent wrapper for the Delete Ratio Actor-Critic network.
     
-    Converts network output (single global action) into topology operations:
+    Converts network output (single global action: delete_ratio) into topology operations:
     - Sorts nodes by x-position
     - Deletes leftmost nodes based on delete_ratio
-    - Spawns from remaining nodes using global spawn parameters
+    - Spawns from remaining nodes using FIXED spawn parameters from config
     """
     
-    def __init__(self, topology, state_extractor, hybrid_network: HybridActorCritic):
+    def __init__(self, topology, state_extractor, hybrid_network: HybridActorCritic, config_loader=None):
         self.topology = topology
         self.state_extractor = state_extractor
         self.network = hybrid_network
         
+        # Load fixed spawn parameters from config
+        if config_loader is not None:
+            env_config = config_loader.get_environment_config()
+            spawn_params = env_config.get('spawn_parameters', {})
+            self.fixed_spawn_params = (
+                float(spawn_params.get('gamma', 5.0)),
+                float(spawn_params.get('alpha', 2.0)),
+                float(spawn_params.get('noise', 0.5))
+            )
+        else:
+            # Fallback defaults if no config provided
+            self.fixed_spawn_params = (5.0, 2.0, 0.5)
+        
+        print(f"  ✅ Fixed spawn parameters: gamma={self.fixed_spawn_params[0]:.2f}, "
+              f"alpha={self.fixed_spawn_params[1]:.2f}, noise={self.fixed_spawn_params[2]:.2f}")
+        
         # Store last action parameters for logging/analysis
         self.last_continuous_actions = None
-        self.last_spawn_params = None
+        self.last_spawn_params = self.fixed_spawn_params  # Always use fixed params
         
     @torch.no_grad()
     def get_actions_and_values(self, deterministic: bool = False,
                               action_mask: Optional[torch.Tensor] = None) -> Tuple[Dict[int, str], 
-                                                                         Tuple[float, float, float, float], 
+                                                                         Tuple[float, float, float], 
                                                                          Dict[str, torch.Tensor]]:
         """
         Get actions, spawn parameters, and value predictions using delete ratio strategy.
         
         Returns:
             - actions: Dict mapping node_id to action ('spawn' or 'delete')
-            - spawn_params: Single tuple (gamma, alpha, noise, theta) used for ALL spawns
+            - spawn_params: Fixed tuple (gamma, alpha, noise) from config (used for ALL spawns)
             - value_predictions: Dict of value predictions
         """
         state = self.state_extractor.get_state_features(include_substrate=True)
@@ -881,12 +906,12 @@ class HybridPolicyAgent:
             # Get device from network's action_bounds
             device = self.network.action_bounds.device
             empty_values = {component: torch.tensor(0.0, device=device) for component in self.network.value_components}
-            return {}, (1.0, 1.0, 0.5, 0.0), empty_values
+            return {}, self.fixed_spawn_params, empty_values
         
         output = self.network(state, deterministic=deterministic, action_mask=action_mask)
         
-        # Store continuous actions for logging
-        self.last_continuous_actions = output['continuous_actions']  # [5] tensor (single global action)
+        # Store continuous actions for logging (only delete_ratio now)
+        self.last_continuous_actions = output['continuous_actions']  # [1] tensor (delete_ratio)
         
         # OPTIMIZATION 1: Use argpartition for O(n) selection instead of O(n log n) sort
         # Get node x-positions directly from node features
@@ -923,8 +948,8 @@ class HybridPolicyAgent:
         
         actions = self.network.get_topology_actions(output, node_positions)
         
-        # Get single global spawn parameters (same for all spawning nodes)
-        spawn_params = self.network.get_spawn_parameters(output)
+        # Get single global spawn parameters from config (fixed constants)
+        spawn_params = self.fixed_spawn_params
         
         return actions, spawn_params, output['value_predictions']
     
@@ -971,12 +996,13 @@ class HybridPolicyAgent:
                 if node_id < self.topology.graph.num_nodes():
                     self.topology.graph.ndata['to_delete'][node_id] = 1.0
         
-        # Execute spawn actions (ALL use the same global spawn parameters)
+        # Execute spawn actions (ALL use the same global spawn parameters from config)
         # Use persistent_ids to handle index shifting via topology helper
-        gamma, alpha, noise, theta = spawn_params_global
+        gamma, alpha, noise = spawn_params_global  # Fixed params from config (no theta)
         for persistent_id, original_node_id in spawn_persistent_ids.items():
             try:
-                new_id = self.topology.spawn_by_persistent_id(persistent_id, gamma=gamma, alpha=alpha, noise=noise, theta=theta)
+                # theta=0.0 is default in spawn method signature
+                new_id = self.topology.spawn_by_persistent_id(persistent_id, gamma=gamma, alpha=alpha, noise=noise, theta=0.0)
                 if new_id is None:
                     print(f"⚠️  Spawn skipped: persistent_id={persistent_id} no longer exists")
             except Exception as e:

@@ -21,8 +21,15 @@ environment:
   threshold_critical_nodes: 500
   max_steps: 1000
   
+  # Fixed spawn parameters (no longer learned by policy)
+  # These constants are used for all spawn operations
+  spawn_parameters:
+    gamma: 5.0    # Hill equation scaling factor (spawned offspring distance)
+    alpha: 2.0    # Hill equation affinity constant
+    noise: 0.5    # Additive noise term for stochasticity
+  
   # Simulation parameters
-  delta_time: 3
+  delta_time: 1
   consecutive_left_moves_limit: 30
   
   # Visualization
@@ -45,8 +52,8 @@ environment:
   # Makes priority explicit in the task reward, not just critic loss weights
   reward_weights:
     delete_weight: 1.0         
-    distance_weight: 1.0 #  0.001       
-    termination_weight: 0.01
+    distance_weight: 0.2     
+    termination_weight: 0.1
   
   # ============================================================================
   # CORE REWARD COMPONENTS 
@@ -200,6 +207,14 @@ environment:
                                        # For zero at target: use shifted tanh or adjust calculation
     gradient_cap: null                 # Optional: cap gradient for exponential substrates (e.g., 10.0)
     
+    # Exponential urgency term: r_urgency = λ_e * exp(-α * d_t²)
+    # Encourages faster progress by rewarding proximity to goal
+    exponential_urgency_enabled: true # Enable urgency bonus (default: false)
+    lambda_exp: 0.3                    # Urgency weight (how much bonus to add)
+    alpha_exp: 0.001                   # Gaussian width (smaller = wider range, larger = steeper falloff)
+                                       # Example: α=0.001 gives significant bonus up to d_t ≈ 30
+                                       # Example: α=0.01 gives significant bonus up to d_t ≈ 10
+    
     # PBRS: Potential-Based Reward Shaping (optional)
     pbrs:
       enabled: false
@@ -295,8 +310,8 @@ trainer:
   
   # Resume training
   resume_training:
-    enabled: true
-    checkpoint_path: "training_results/run0043/succ_model_batch24.pt"
+    enabled: false
+    checkpoint_path: ""
     resume_from_best: false
     reset_optimizer: false
     reset_episode_count: true
@@ -375,8 +390,8 @@ trainer:
   component_weights:
     total_reward: 0.3
     delete_reward: 0.3
-    distance_reward: 0.3
-    termination_reward: 0.1
+    distance_reward: 0.2
+    termination_reward: 0.2
   
   # Policy loss weights
   policy_loss_weights:

@@ -712,6 +712,15 @@ class DurotaxisTrainer:
             'termination_reward'
         ]
         
+        # Phase 3: Component performance tracking for adaptive weighting & entropy
+        self.component_performance_history = {
+            comp: [] for comp in self.component_names
+        }
+        self.component_improvement_rates = {
+            comp: 0.0 for comp in self.component_names
+        }
+        self.performance_window = 20  # Episodes to track for trend analysis
+        
         # Create network
         encoder_config = self.config_loader.get_encoder_config()
         actor_critic_config = self.config_loader.get_actor_critic_config()
@@ -1388,7 +1397,7 @@ class DurotaxisTrainer:
         if not batched_output or sum(node_counts) == 0:
             # Handle empty batch case
             empty_output = {
-                'continuous_actions': torch.empty(0, 5, device=self.device),
+                'continuous_actions': torch.empty(0, 1, device=self.device),
                 'continuous_log_probs': torch.empty(0, device=self.device),
                 'total_log_probs': torch.empty(0, device=self.device),
                 'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
@@ -1403,7 +1412,7 @@ class DurotaxisTrainer:
             if num_nodes == 0:
                 # Empty graph
                 output = {
-                    'continuous_actions': torch.empty(0, 5, device=self.device),
+                    'continuous_actions': torch.empty(0, 1, device=self.device),
                     'continuous_log_probs': torch.empty(0, device=self.device),
                     'total_log_probs': torch.empty(0, device=self.device),
                     'value_predictions': {k: torch.tensor(0.0, device=self.device) for k in self.component_names}
@@ -1415,14 +1424,14 @@ class DurotaxisTrainer:
                 output = {}
                 
                 # DELETE RATIO ARCHITECTURE:
-                # - continuous_actions: [batch_size, 5] -> extract [5] for this graph
+                # - continuous_actions: [batch_size, 1] -> extract [1] for this graph
                 # - continuous_log_probs: [batch_size] -> extract scalar for this graph (NOT per-node!)
                 # - total_log_probs: [batch_size] -> extract scalar for this graph
                 
                 if 'continuous_actions' in batched_output and batched_output['continuous_actions'].shape[0] > i:
                     output['continuous_actions'] = batched_output['continuous_actions'][i]
                 else:
-                    output['continuous_actions'] = torch.empty(0, 5, device=self.device)
+                    output['continuous_actions'] = torch.empty(0, 1, device=self.device)
                 
                 # Log probs are per-graph (scalars), not per-node!
                 for key in ['continuous_log_probs', 'total_log_probs']:
@@ -1662,12 +1671,48 @@ class DurotaxisTrainer:
         
         return self.adaptive_continuous_weight
     
+    def compute_component_adaptive_entropy_coefficients(self, episode: int) -> Dict[str, float]:
+        """
+        Phase 3: Compute component-specific entropy coefficients based on performance trends.
+        Components with slow improvement get higher entropy (more exploration).
+        
+        Args:
+            episode: Current episode number
+            
+        Returns:
+            Dictionary mapping component names to entropy coefficients
+        """
+        base_coeff = self.compute_adaptive_entropy_coefficient(episode)
+        
+        # Component-specific adjustments based on improvement rate
+        component_coeffs = {}
+        
+        for comp in self.component_names:
+            improvement_rate = self.component_improvement_rates.get(comp, 0.0)
+            
+            # Boost entropy for slow-improving components (needs more exploration)
+            # Reduce entropy for fast-improving components (can exploit more)
+            if improvement_rate < -0.01:  # Declining performance
+                boost_factor = 2.0  # Double entropy for exploration
+            elif improvement_rate < 0.01:  # Stagnant performance
+                boost_factor = 1.5  # 50% more entropy
+            elif improvement_rate < 0.05:  # Slow improvement
+                boost_factor = 1.2  # 20% more entropy
+            elif improvement_rate > 0.10:  # Fast improvement
+                boost_factor = 0.8  # 20% less entropy (exploit)
+            else:  # Moderate improvement
+                boost_factor = 1.0  # Base entropy
+            
+            component_coeffs[comp] = base_coeff * boost_factor
+        
+        return component_coeffs
+    
     def compute_enhanced_entropy_loss(self, eval_output: Dict[str, torch.Tensor], episode: int) -> Dict[str, torch.Tensor]:
         """
-        Enhanced entropy regularization for continuous action space (delete ratio architecture)
+        Phase 3: Enhanced entropy regularization with component-aware adaptive coefficients.
         
         Implements:
-        1. Adaptive entropy scheduling (high→low over training)
+        1. Component-specific entropy scheduling based on performance trends
         2. Minimum entropy protection against policy collapse
         3. Continuous action space specific weighting
         
@@ -1680,15 +1725,16 @@ class DurotaxisTrainer:
         """
         entropy_losses = {}
         
-        # Get adaptive entropy coefficient
-        entropy_coeff = self.compute_adaptive_entropy_coefficient(episode)
+        # Phase 3: Get component-specific entropy coefficients
+        component_coeffs = self.compute_component_adaptive_entropy_coefficients(episode)
+        avg_coeff = sum(component_coeffs.values()) / len(component_coeffs)
         
         if 'entropy' in eval_output:
             # Combined entropy for continuous actions
             total_entropy = eval_output['entropy'].mean()
             
             # Main entropy regularization (encourage exploration)
-            entropy_loss = -entropy_coeff * total_entropy
+            entropy_loss = -avg_coeff * total_entropy
             
             # Minimum entropy protection (prevent complete collapse)
             if total_entropy < self.min_entropy_threshold:
@@ -1703,8 +1749,8 @@ class DurotaxisTrainer:
             # Continuous entropy only (delete ratio architecture)
             continuous_entropy = eval_output['continuous_entropy'].mean()
             
-            # Continuous actions benefit from moderate entropy for parameter tuning
-            continuous_loss = -entropy_coeff * self.continuous_entropy_weight * continuous_entropy
+            # Phase 3: Use average component coefficient for continuous actions
+            continuous_loss = -avg_coeff * self.continuous_entropy_weight * continuous_entropy
             entropy_losses['continuous'] = continuous_loss
             
             # Monitor continuous entropy collapse
@@ -1715,7 +1761,39 @@ class DurotaxisTrainer:
             else:
                 entropy_losses['total'] = continuous_loss
         
+        # Store component coefficients for logging
+        entropy_losses['component_coefficients'] = component_coeffs
+        
         return entropy_losses
+    
+    def update_component_performance_tracking(self, episode_rewards: Dict[str, float]) -> None:
+        """
+        Phase 3: Update component performance history and compute improvement rates.
+        
+        Args:
+            episode_rewards: Dictionary of reward values for the current episode
+        """
+        for comp in self.component_names:
+            if comp in episode_rewards:
+                # Add to history
+                self.component_performance_history[comp].append(episode_rewards[comp])
+                
+                # Keep only recent window
+                if len(self.component_performance_history[comp]) > self.performance_window:
+                    self.component_performance_history[comp].pop(0)
+                
+                # Compute improvement rate (linear regression slope)
+                if len(self.component_performance_history[comp]) >= 5:
+                    history = self.component_performance_history[comp]
+                    n = len(history)
+                    x = np.arange(n)
+                    y = np.array(history)
+                    
+                    # Simple linear regression: slope = covariance(x,y) / variance(x)
+                    slope = np.cov(x, y)[0, 1] / (np.var(x) + 1e-8)
+                    self.component_improvement_rates[comp] = float(slope)
+                else:
+                    self.component_improvement_rates[comp] = 0.0
     
     def normalize_component_weights(self) -> None:
         """Normalize component weights to sum to 1 for balanced contribution"""
@@ -2533,9 +2611,10 @@ class DurotaxisTrainer:
                           for k, v in output['value_predictions'].items()})
             
             # Extract actions and log probs (DELETE RATIO ARCHITECTURE)
-            # Network now outputs single global continuous action: [delete_ratio, gamma, alpha, noise, theta]
+            # Network now outputs single global continuous action: [delete_ratio] only
+            # Spawn parameters (gamma, alpha, noise) are fixed in config.yaml
             if 'continuous_actions' in output:
-                continuous_actions = output['continuous_actions']  # Shape: [5]
+                continuous_actions = output['continuous_actions']  # Shape: [1] (delete_ratio only)
                 log_probs = output['continuous_log_probs']  # Shape: scalar
                 
                 actions_taken.append({
@@ -2570,10 +2649,18 @@ class DurotaxisTrainer:
                     gamma = self.stage_1_fixed_spawn_params['gamma']
                     alpha = self.stage_1_fixed_spawn_params['alpha']
                     noise = self.stage_1_fixed_spawn_params['noise']
-                    theta = self.stage_1_fixed_spawn_params['theta']
+                    theta = self.stage_1_fixed_spawn_params.get('theta', 0.0)
                 else:
-                    # Use network's continuous output (indices 1-4)
-                    gamma, alpha, noise, theta = self.network.get_spawn_parameters(output)
+                    # Get fixed spawn parameters from environment's policy agent (config-based)
+                    if hasattr(self.env, 'policy_agent') and hasattr(self.env.policy_agent, 'fixed_spawn_params'):
+                        gamma, alpha, noise = self.env.policy_agent.fixed_spawn_params
+                    else:
+                        # Fallback to config defaults
+                        spawn_config = self.config_loader.get_environment_config().get('spawn_parameters', {})
+                        gamma = spawn_config.get('gamma', 5.0)
+                        alpha = spawn_config.get('alpha', 2.0)
+                        noise = spawn_config.get('noise', 0.5)
+                    theta = 0.0  # Theta removed from architecture
                 
                 # Execute spawn/delete actions
                 for node_id, action_type in topology_actions.items():
@@ -2772,8 +2859,22 @@ class DurotaxisTrainer:
                                   eval_output: Dict[str, torch.Tensor], 
                                   advantage: float, episode: int = 0, 
                                   old_mu: Optional[torch.Tensor] = None, 
-                                  old_std: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """Compute policy loss for continuous actions (delete ratio architecture) with PPO clipping"""
+                                  old_std: Optional[torch.Tensor] = None,
+                                  component_advantages: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+        """Compute policy loss for continuous actions (delete ratio architecture) with PPO clipping
+        
+        Args:
+            old_log_probs_dict: Old action log probabilities
+            eval_output: Current evaluation output from network
+            advantage: Combined advantage (fallback, used if component_advantages is None)
+            episode: Current episode number
+            old_mu: Old distribution means (for KL divergence)
+            old_std: Old distribution stds (for KL divergence)
+            component_advantages: Dict of per-component advantages for gradient decomposition
+        
+        Returns:
+            Dict with policy loss, entropy loss, and PPO metrics
+        """
         policy_losses = {}
         
         # Extract base weights and clipping
@@ -2842,11 +2943,49 @@ class DurotaxisTrainer:
             # Clip fraction: fraction of ratios that were clipped (device-agnostic)
             clip_fraction_continuous = ((ratio_continuous - clipped_ratio_continuous).abs() > 1e-6).float()
             
-            # PPO surrogate objective
-            surr1 = ratio_continuous * advantage
-            surr2 = clipped_ratio_continuous * advantage
-            
-            continuous_loss_raw = -torch.min(surr1, surr2)
+            # === COMPONENT-SPECIFIC POLICY GRADIENTS (Phase 1 Enhancement) ===
+            # If component advantages provided, compute separate loss per component
+            if component_advantages is not None and self.enable_learnable_weights:
+                # Compute policy loss for each component separately
+                component_losses = {}
+                
+                for component in self.component_names:
+                    if component in component_advantages:
+                        comp_adv = component_advantages[component]
+                        
+                        # PPO surrogate objective for this component
+                        comp_surr1 = ratio_continuous * comp_adv
+                        comp_surr2 = clipped_ratio_continuous * comp_adv
+                        comp_loss = -torch.min(comp_surr1, comp_surr2)
+                        
+                        component_losses[component] = comp_loss
+                
+                # Combine component losses with learned weights
+                # Get current component weights (normalized)
+                if hasattr(self, 'learnable_component_weights'):
+                    with torch.no_grad():
+                        comp_weights = torch.softmax(self.learnable_component_weights.base_weights, dim=0)
+                else:
+                    # Fallback to config weights
+                    comp_weights = torch.tensor(
+                        [self.component_weights.get(comp, 0.25) for comp in self.component_names],
+                        device=self.device
+                    )
+                
+                # Weighted sum of component losses
+                continuous_loss_raw = torch.tensor(0.0, device=self.device)
+                for i, component in enumerate(self.component_names):
+                    if component in component_losses:
+                        continuous_loss_raw += comp_weights[i] * component_losses[component]
+                
+                # Store component losses for logging
+                policy_losses['component_losses'] = {k: v.item() if isinstance(v, torch.Tensor) else v 
+                                                     for k, v in component_losses.items()}
+            else:
+                # Traditional approach: single combined advantage
+                surr1 = ratio_continuous * advantage
+                surr2 = clipped_ratio_continuous * advantage
+                continuous_loss_raw = -torch.min(surr1, surr2)
         
         # === POLICY LOSS (DELETE RATIO ARCHITECTURE - CONTINUOUS ONLY) ===
         # No need for adaptive gradient scaling since we only have continuous actions now
@@ -2871,13 +3010,18 @@ class DurotaxisTrainer:
         
         # Ensure entropy loss is always a tensor
         if entropy_losses:
-            total_entropy_loss = sum(entropy_losses.values())
+            # Phase 3: Exclude component_coefficients dict from summation (metadata only)
+            loss_values = [v for k, v in entropy_losses.items() if k != 'component_coefficients']
+            if loss_values:
+                total_entropy_loss = sum(loss_values)
+            else:
+                total_entropy_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         else:
-            total_entropy_loss = torch.tensor(0.0, device=self.device)
+            total_entropy_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
             
         # Ensure it's a tensor, not a scalar
         if not isinstance(total_entropy_loss, torch.Tensor):
-            total_entropy_loss = torch.tensor(total_entropy_loss, device=self.device)
+            total_entropy_loss = torch.tensor(float(total_entropy_loss), dtype=torch.float32, device=self.device)
         
         # Guard against NaN/Inf in entropy loss
         if not torch.isfinite(total_entropy_loss).all():
@@ -2906,7 +3050,13 @@ class DurotaxisTrainer:
                      returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
                      old_log_probs: List[Dict], continuous_mu: List[torch.Tensor], 
                      continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
-        """Update policy using PPO with efficient batched re-evaluation and enhanced entropy"""
+        """Update policy using PPO with efficient batched re-evaluation and enhanced entropy
+        
+        Phase 1 Enhancement: Component-specific policy gradients
+        Instead of combining advantages before computing loss, we compute separate losses
+        per component and combine with learned weights. This gives each reward component
+        direct gradient influence on the policy.
+        """
         if not states or not actions:
             return {}
         
@@ -2952,10 +3102,10 @@ class DurotaxisTrainer:
                 all_continuous_actions.append(action_dict['continuous'])
         
         if all_continuous_actions:
-            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 1] from list of [1] tensors
         else:
             # Handle empty actions case
-            batched_continuous_actions = torch.empty(0, 5, device=self.device)
+            batched_continuous_actions = torch.empty(0, 1, device=self.device)
         
         # Step 4: Single batched re-evaluation (🚀 MUCH FASTER!)
         if batched_states['num_nodes'] > 0:
@@ -2989,13 +3139,21 @@ class DurotaxisTrainer:
             # === HYBRID POLICY LOSS (DELETE RATIO ARCHITECTURE) ===
             advantage = total_advantages[i]
             
+            # Extract component-specific advantages for this sample (Phase 1 Enhancement)
+            component_advantages_i = {}
+            for component in self.component_names:
+                if component in advantages:
+                    component_advantages_i[component] = advantages[component][i]
+            
             # Compute hybrid policy loss with continuous-only handling
             # Pass old distribution parameters for proper KL divergence
+            # Pass component advantages for gradient decomposition (Phase 1)
             old_mu = continuous_mu[i] if i < len(continuous_mu) else None
             old_std = continuous_std[i] if i < len(continuous_std) else None
             
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
-                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std
+                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std,
+                component_advantages=component_advantages_i  # Phase 1: component-specific gradients
             )
             
             hybrid_policy_losses.append(hybrid_loss_dict)
@@ -3021,7 +3179,7 @@ class DurotaxisTrainer:
             for h in hybrid_policy_losses:
                 entropy_loss = h['entropy_loss']
                 if not isinstance(entropy_loss, torch.Tensor):
-                    entropy_loss = torch.tensor(entropy_loss, device=self.device)
+                    entropy_loss = torch.tensor(float(entropy_loss), dtype=torch.float32, device=self.device)
                 entropy_losses_list.append(entropy_loss)
                 # Also aggregate raw entropy values
                 raw_entropy_list.append(h.get('raw_entropy', 0.0))
@@ -3060,6 +3218,16 @@ class DurotaxisTrainer:
             total_value_loss = torch.tensor(0.0, device=self.device)
         
         losses['total_value_loss'] = total_value_loss.item()
+        
+        # Log component-specific policy losses (Phase 1 monitoring)
+        if hybrid_policy_losses and 'component_losses' in hybrid_policy_losses[0]:
+            # Average component losses across batch
+            for component in self.component_names:
+                comp_loss_values = [h['component_losses'].get(component, 0.0) 
+                                   for h in hybrid_policy_losses 
+                                   if 'component_losses' in h and component in h['component_losses']]
+                if comp_loss_values:
+                    losses[f'policy_loss_{component}'] = sum(comp_loss_values) / len(comp_loss_values)
         
         # === TOTAL LOSS AND OPTIMIZATION ===
         # Value loss weight (reduced to prevent destabilization)
@@ -3160,7 +3328,11 @@ class DurotaxisTrainer:
                                         returns: Dict[str, torch.Tensor], advantages: Dict[str, torch.Tensor],
                                         old_log_probs: List[Dict], old_values: Dict[str, torch.Tensor], 
                                         continuous_mu: List[torch.Tensor], continuous_std: List[torch.Tensor], episode: int = 0) -> Dict[str, float]:
-        """Update policy using PPO with value clipping for stable critic updates"""
+        """Update policy using PPO with value clipping for stable critic updates
+        
+        Phase 1 Enhancement: Component-specific policy gradients
+        Computes separate policy losses per reward component for richer learning signals.
+        """
         if not states or not actions:
             return {}
         
@@ -3206,10 +3378,10 @@ class DurotaxisTrainer:
                 all_continuous_actions.append(action_dict['continuous'])
         
         if all_continuous_actions:
-            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 5] from list of [5] tensors
+            batched_continuous_actions = torch.stack(all_continuous_actions, dim=0)  # [batch_size, 1] from list of [1] tensors
         else:
             # Handle empty actions case
-            batched_continuous_actions = torch.empty(0, 5, device=self.device)
+            batched_continuous_actions = torch.empty(0, 1, device=self.device)
         
         # Step 4: Single batched re-evaluation (🚀 MUCH FASTER!)
         if batched_states['num_nodes'] > 0:
@@ -3243,13 +3415,21 @@ class DurotaxisTrainer:
             # === HYBRID POLICY LOSS (DELETE RATIO ARCHITECTURE) ===
             advantage = total_advantages[i]
             
+            # Extract component-specific advantages for this sample (Phase 1 Enhancement)
+            component_advantages_i = {}
+            for component in self.component_names:
+                if component in advantages:
+                    component_advantages_i[component] = advantages[component][i]
+            
             # Compute hybrid policy loss with continuous-only handling
             # Pass old distribution parameters for proper KL divergence
+            # Pass component advantages for gradient decomposition (Phase 1)
             old_mu = continuous_mu[i] if i < len(continuous_mu) else None
             old_std = continuous_std[i] if i < len(continuous_std) else None
             
             hybrid_loss_dict = self.compute_hybrid_policy_loss(
-                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std
+                old_log_probs_dict, eval_output, advantage, episode, old_mu, old_std,
+                component_advantages=component_advantages_i  # Phase 1: component-specific gradients
             )
             
             hybrid_policy_losses.append(hybrid_loss_dict)
@@ -3308,7 +3488,7 @@ class DurotaxisTrainer:
             for h in hybrid_policy_losses:
                 entropy_loss = h['entropy_loss']
                 if not isinstance(entropy_loss, torch.Tensor):
-                    entropy_loss = torch.tensor(entropy_loss, device=self.device)
+                    entropy_loss = torch.tensor(float(entropy_loss), dtype=torch.float32, device=self.device)
                 entropy_losses_list.append(entropy_loss)
                 # Also aggregate raw entropy values
                 raw_entropy_list.append(h.get('raw_entropy', 0.0))
@@ -3657,6 +3837,13 @@ class DurotaxisTrainer:
             component_reward = sum(r.get(component, 0.0) for r in rewards)
             self.episode_rewards[component].append(component_reward)
         
+        # Phase 3: Update component performance tracking for adaptive weighting & entropy
+        episode_rewards_dict = {
+            comp: sum(r.get(comp, 0.0) for r in rewards)
+            for comp in self.component_names
+        }
+        self.update_component_performance_tracking(episode_rewards_dict)
+        
         window = self.moving_avg_window
         robust_ma = robust_moving_average(self.episode_rewards['total_reward'], window)
         self.smoothed_rewards.append(robust_ma)
@@ -3995,6 +4182,13 @@ class DurotaxisTrainer:
                     dominant_comp = max(self.component_weights.items(), key=lambda x: x[1])[0]
                     dominant_weight = self.component_weights[dominant_comp]
                     
+                    # Phase 3: Show component improvement trends
+                    improvement_info = " | Trends:"
+                    for comp in ['delete_reward', 'distance_reward', 'termination_reward']:
+                        rate = self.component_improvement_rates.get(comp, 0.0)
+                        trend_symbol = "↑" if rate > 0.05 else "↓" if rate < -0.01 else "→"
+                        improvement_info += f" {comp[:4]}:{trend_symbol}"
+                    
                     # Build substrate info
                     substrate_info = ""
                     if self.substrate_type == 'random':
@@ -4011,7 +4205,7 @@ class DurotaxisTrainer:
                     current_lr = self.lr_scheduler.get_last_lr()[0] if hasattr(self, 'lr_scheduler') else self.optimizer.param_groups[0]['lr']
                     print(f"Batch {batch_count:3d} | R: {batch_stats['avg_reward']:6.3f} (MA: {recent_reward:6.3f}, Best: {best_so_far:6.3f}) | "
                           f"Loss: {total_loss:7.4f} | Entropy: {entropy_loss:7.4f} | LR: {current_lr:.2e} | Episodes: {batch_stats['num_episodes']:2d} | "
-                          f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){substrate_info}{recovery_info}")
+                          f"Success: {batch_stats['success_rate']:.2f} | Focus: {dominant_comp[:8]}({dominant_weight:.3f}){improvement_info}{substrate_info}{recovery_info}")
                 
                 # ==========================================
                 # PHASE 5: MODEL SELECTION & CHECKPOINTING
@@ -4467,6 +4661,9 @@ class DurotaxisTrainer:
             'best_model_metrics': self.best_model_metrics.copy() if isinstance(self.best_model_metrics, dict) else {},
             'best_model_filename': self.best_model_filename,
             'episode_history': self.episode_history.copy() if isinstance(self.episode_history, list) else [],
+            # Phase 3: Component performance tracking
+            'component_performance_history': self.component_performance_history,
+            'component_improvement_rates': self.component_improvement_rates,
         }
         
         filepath = os.path.join(self.run_dir, filename)
@@ -4543,6 +4740,19 @@ class DurotaxisTrainer:
             else:
                 self.start_episode = 0
                 print(f"   ⚠️ Episode count reset to 0 (as configured)")
+            
+            # Phase 3: Load performance tracking (backward compatible)
+            if 'component_performance_history' in checkpoint:
+                self.component_performance_history = checkpoint['component_performance_history']
+                print(f"   ✅ Loaded component performance history")
+            else:
+                self.component_performance_history = {comp: [] for comp in self.component_names}
+            
+            if 'component_improvement_rates' in checkpoint:
+                self.component_improvement_rates = checkpoint['component_improvement_rates']
+                print(f"   ✅ Loaded component improvement rates")
+            else:
+                self.component_improvement_rates = {comp: 0.0 for comp in self.component_names}
             
             # Load training history
             if 'episode_rewards' in checkpoint:
@@ -4626,6 +4836,19 @@ class DurotaxisTrainer:
             self.best_total_reward = checkpoint['best_reward']
         if 'component_weights' in checkpoint:
             self.component_weights = checkpoint['component_weights']
+        
+        # Phase 3: Load performance tracking (backward compatible)
+        if 'component_performance_history' in checkpoint:
+            self.component_performance_history = checkpoint['component_performance_history']
+        else:
+            # Initialize with empty history if not in checkpoint (older checkpoints)
+            self.component_performance_history = {comp: [] for comp in self.component_names}
+        
+        if 'component_improvement_rates' in checkpoint:
+            self.component_improvement_rates = checkpoint['component_improvement_rates']
+        else:
+            # Initialize with zero rates if not in checkpoint
+            self.component_improvement_rates = {comp: 0.0 for comp in self.component_names}
             
         print(f"📂 Loaded: {filename} (Run #{checkpoint.get('run_number', 'unknown')})")
         return True
