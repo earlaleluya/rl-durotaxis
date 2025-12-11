@@ -231,23 +231,26 @@ class DurotaxisDeployment:
                 
                 for i in range(len(node_positions)):
                     node_x, node_y = float(node_positions[i][0]), float(node_positions[i][1])
+                    node_intensity = env.substrate.get_intensity((node_x, node_y))
                     centroid_data.append({
                         'episode': episode_num if episode_num is not None else 0,
                         'step': 0,
                         'num_nodes': num_nodes_feature,
                         'cx': cx,
                         'cy': cy,
-                        'intensity': float(intensity),
+                        'center_intensity': float(intensity),
                         'bbox_height': bbox_height,
                         'bbox_width': bbox_width,
                         'delete_ratio': 0.0,
                         'node_id': int(persistent_ids[i]),
                         'node_x': node_x,
                         'node_y': node_y,
+                        'node_intensity': float(node_intensity),
                         'action': '',  # No action at initial state
                         'spawn_node_id': '',
                         'spawn_node_x': '',
-                        'spawn_node_y': ''
+                        'spawn_node_y': '',
+                        'spawn_node_intensity': ''
                     })
         
         while not done and step_count < max_steps:
@@ -345,7 +348,9 @@ class DurotaxisDeployment:
                                 # Get the spawned node's position and persistent_id
                                 spawn_pos = env.topology.graph.ndata['pos'][spawned_node_id].cpu().numpy()
                                 spawn_pid = int(env.topology.graph.ndata['persistent_id'][spawned_node_id].item()) if 'persistent_id' in env.topology.graph.ndata else spawned_node_id
-                                spawn_tracking[parent_pid] = (spawn_pid, float(spawn_pos[0]), float(spawn_pos[1]))
+                                spawn_x, spawn_y = float(spawn_pos[0]), float(spawn_pos[1])
+                                spawn_intensity = env.substrate.get_intensity((spawn_x, spawn_y))
+                                spawn_tracking[parent_pid] = (spawn_pid, spawn_x, spawn_y, float(spawn_intensity))
                             if verbose:
                                 print(f"   Step {step_count+1}: Spawned from node {node_id} (γ={spawn_params[0]:.3f}, α={spawn_params[1]:.3f})")
                         elif action_type == 'delete':
@@ -403,12 +408,14 @@ class DurotaxisDeployment:
                     for i in range(len(node_positions)):
                         node_x, node_y = float(node_positions[i][0]), float(node_positions[i][1])
                         node_pid = int(persistent_ids[i])
+                        node_intensity = env.substrate.get_intensity((node_x, node_y))
                         
                         # Determine action for this node using persistent_id
                         action_str = ''
                         spawn_node_id_val = ''
                         spawn_node_x_val = ''
                         spawn_node_y_val = ''
+                        spawn_node_intensity_val = ''
                         
                         if node_pid in node_pid_to_action:
                             action_type = node_pid_to_action[node_pid]
@@ -416,10 +423,11 @@ class DurotaxisDeployment:
                                 action_str = 'spawn'
                                 # Check if spawn was tracked
                                 if node_pid in spawn_tracking:
-                                    spawn_pid, spawn_x, spawn_y = spawn_tracking[node_pid]
+                                    spawn_pid, spawn_x, spawn_y, spawn_intensity = spawn_tracking[node_pid]
                                     spawn_node_id_val = int(spawn_pid)
                                     spawn_node_x_val = spawn_x
                                     spawn_node_y_val = spawn_y
+                                    spawn_node_intensity_val = spawn_intensity
                             # Note: 'delete' won't appear here since deleted nodes are gone
                         
                         centroid_data.append({
@@ -428,17 +436,19 @@ class DurotaxisDeployment:
                             'num_nodes': num_nodes_feature,
                             'cx': cx,
                             'cy': cy,
-                            'intensity': float(intensity),
+                            'center_intensity': float(intensity),
                             'bbox_height': bbox_height,
                             'bbox_width': bbox_width,
                             'delete_ratio': delete_ratio,
                             'node_id': node_pid,
                             'node_x': node_x,
                             'node_y': node_y,
+                            'node_intensity': float(node_intensity),
                             'action': action_str,
                             'spawn_node_id': spawn_node_id_val,
                             'spawn_node_x': spawn_node_x_val,
-                            'spawn_node_y': spawn_node_y_val
+                            'spawn_node_y': spawn_node_y_val,
+                            'spawn_node_intensity': spawn_node_intensity_val
                         })
                     
                     # Second, log deleted nodes using the saved positions from before deletion
@@ -447,6 +457,7 @@ class DurotaxisDeployment:
                             # Get the position from before deletion
                             if node_pid in nodes_before_action:
                                 node_x, node_y = nodes_before_action[node_pid]
+                                node_intensity = env.substrate.get_intensity((node_x, node_y))
                                 
                                 centroid_data.append({
                                     'episode': episode_num if episode_num is not None else 0,
@@ -454,17 +465,19 @@ class DurotaxisDeployment:
                                     'num_nodes': num_nodes_feature,
                                     'cx': cx,
                                     'cy': cy,
-                                    'intensity': float(intensity),
+                                    'center_intensity': float(intensity),
                                     'bbox_height': bbox_height,
                                     'bbox_width': bbox_width,
                                     'delete_ratio': delete_ratio,
                                     'node_id': node_pid,
                                     'node_x': node_x,
                                     'node_y': node_y,
+                                    'node_intensity': float(node_intensity),
                                     'action': 'delete',
                                     'spawn_node_id': '',
                                     'spawn_node_x': '',
-                                    'spawn_node_y': ''
+                                    'spawn_node_y': '',
+                                    'spawn_node_intensity': ''
                                 })
             
             if verbose:
@@ -852,11 +865,13 @@ class DurotaxisDeployment:
         Save centroid trajectory data to CSV file.
         
         Creates a CSV file with per-node records including:
-        - episode, step, num_nodes, cx, cy, intensity, bbox_height, bbox_width
+        - episode, step, num_nodes, cx, cy, center_intensity, bbox_height, bbox_width
         - delete_ratio: action parameter
         - node_id, node_x, node_y: current node's persistent_id and position
         - action: 'spawn', 'delete', or empty string
+        - node_intensity: substrate intensity at the node's position
         - spawn_node_id, spawn_node_x, spawn_node_y: spawned node details (if action='spawn')
+        - spawn_node_intensity: substrate intensity at spawned node's position (if action='spawn')
         
         Args:
             episode_stats: List of per-episode statistics

@@ -29,7 +29,7 @@ environment:
     noise: 0.5    # Additive noise term for stochasticity
   
   # Simulation parameters
-  delta_time: 1
+  delta_time: 2
   consecutive_left_moves_limit: 30
   
   # Visualization
